@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+*service-account*.json
+*credentials*.json
+.claude/
+
+# raw attendance data has real worker names -- local dev only, never pushed
+source/

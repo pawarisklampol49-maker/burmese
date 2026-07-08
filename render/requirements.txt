@@ -1,0 +1,6 @@
+flask
+gunicorn
+pandas
+gspread==6.2.1
+google-auth
+google-api-python-client
