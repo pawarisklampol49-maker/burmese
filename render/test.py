@@ -186,8 +186,10 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     _KNOWN_SHIFT_TEAM (confirmed business facts, e.g. shift "FSOCE" -> team
     "FSOCE") is applied as a last resort when even that learning can't
     resolve a row (e.g. an entire tab where every row for that shift name
-    has a broken lookup, with no valid example left to learn from). If
-    either date column is a sentinel, it's recovered from
+    has a broken lookup, with no valid example left to learn from); after
+    that, the shift name itself is used as team. A row with NEITHER team
+    nor shift name has nothing to attribute a station to at all -- dropped,
+    not thrown on. If either date column is a sentinel, it's recovered from
     the other; if both are, or if they parse to genuinely different dates,
     _clean_raw throws rather than guessing. Same-day rows with two different
     teams (double shift / OT past
@@ -305,11 +307,13 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
         still_missing = df["team"].isna()
         df.loc[still_missing, "team"] = shift[still_missing]
 
-        if df["team"].isna().any():
-            raise ValueError(
-                f"{int(df['team'].isna().sum())} row(s) have no team and no shift name either -- "
-                f"nothing to fall back to -- stop, ask"
-            )
+        # A row with NEITHER team nor shift name has nothing to attribute a
+        # station to at all -- same shape as the CYD placeholder rows
+        # (confirmed live: BTS 'Jul 26' had 3 such rows), so it's dropped
+        # rather than blocking the whole tab.
+        keep = df["team"].notna()
+        if not keep.all():
+            df, d1, d2, shift = df[keep], d1[keep], d2[keep], shift[keep]
 
     out = pd.DataFrame({
         "name": df["ค้นหา"],
@@ -626,15 +630,13 @@ def _test_team_learned_from_shift_name():
     out2 = _clean_raw(_rows_to_raw_df([header, unlearnable_row]))
     assert out2.iloc[0]["team"] == "Ghost Shift"
 
-    # only a row missing BOTH team and shift name has nothing to fall back
-    # to -- that still throws
+    # a row missing BOTH team and shift name has nothing to attribute a
+    # station to at all -- dropped, not thrown on (confirmed live: BTS
+    # 'Jul 26' had 3 such rows)
     no_shift_row = ["9 Jul 26", "fay", "09:00", "", "2026-07-09", "SITE", "SH-8", ""]
-    try:
-        _clean_raw(_rows_to_raw_df([header, no_shift_row]))
-    except ValueError as e:
-        assert "nothing to fall back to" in str(e)
-    else:
-        raise AssertionError("expected ValueError when both team and shift name are missing")
+    real_row = ["9 Jul 26", "gus", "09:00", "Inbound", "2026-07-09", "SITE", "SH-7", "IB"]
+    out3 = _clean_raw(_rows_to_raw_df([header, no_shift_row, real_row]))
+    assert list(out3["name"]) == ["gus"]
     print("_test_team_learned_from_shift_name passed")
 
 

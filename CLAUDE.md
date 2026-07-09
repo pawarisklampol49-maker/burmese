@@ -394,6 +394,13 @@ Real bugs found and fixed while building this:
     name *differs* from the shift name (like FSOCE was originally assumed
     to, though it turned out identical) -- still covered by
     `_test_team_learned_from_shift_name`.
+  - `[SOCE 2026]_Daily name list_BTS`, tab `Jul 26`: 3 rows had neither team
+    nor shift name -- nothing left to attribute a station to at all, same
+    shape as the CYD placeholder rows. Per explicit user instruction,
+    changed the final "nothing to fall back to" case from throwing to
+    dropping the row, consistent with how the CYD case is already handled.
+    Covered by the "no shift name either" case in
+    `_test_team_learned_from_shift_name`.
   - `APIError: [503]: The service is currently unavailable.` -- Google's
     Sheets/Drive APIs themselves, not our code, and increasingly likely to
     surface as real vendor files/tabs grow (many more read/write calls per
