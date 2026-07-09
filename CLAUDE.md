@@ -379,6 +379,21 @@ Real bugs found and fixed while building this:
     overrides a value the general learning already filled in ("map only if
     it doesn't exist yet"). Covered by
     `_test_fsoce_hardcoded_fallback_when_unlearnable`.
+  - Generalized the hardcode into `_KNOWN_SHIFT_TEAM` (a plain dict, e.g.
+    `{"FSOCE": "FSOCE"}`) so a new confirmed shift-name -> team fact from
+    the user is a dict entry, not a code change -- prompted by
+    `[SOCE 2026]_Daily name list_PPO`, tab `Jul 26` hitting a second
+    unlearnable shift name (`HIGHVALUE`) right after FSOCE.
+  - Then generalized once more per the user's explicit instruction: if a
+    team is still unresolved after data-driven learning AND
+    `_KNOWN_SHIFT_TEAM` both miss, fall back to using the shift name itself
+    as team, rather than throwing to ask every single time -- some teams
+    are genuinely named after their shift. Only a row missing BOTH team and
+    shift name (nothing left to fall back to at all) still throws. This
+    means `_KNOWN_SHIFT_TEAM` is now only needed for cases where the team
+    name *differs* from the shift name (like FSOCE was originally assumed
+    to, though it turned out identical) -- still covered by
+    `_test_team_learned_from_shift_name`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no
