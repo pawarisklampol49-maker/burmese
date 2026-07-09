@@ -368,6 +368,17 @@ Real bugs found and fixed while building this:
     teams across unrelated, already-complete rows). Still throws if a
     *needed* shift name maps to more than one team, or has no valid example
     anywhere in the tab. Covered by `_test_team_learned_from_shift_name`.
+  - Regression from the above, found immediately on the next live run:
+    `[SOCE 2026]_Daily name list_BTS`, tab `Mar 26` had 275 rows with shift
+    name "FSOCE" and no team, and *zero* valid FSOCE examples anywhere in
+    that tab to learn from -- the general mechanism alone threw, when the
+    original narrower fix (team="FSOCE" for shift name "FSOCE", a confirmed
+    business fact, not a guess) would have resolved it instantly. Restored
+    that hardcoded rule as an explicit last-resort fallback, applied only to
+    rows the data-driven learning still couldn't resolve -- it never
+    overrides a value the general learning already filled in ("map only if
+    it doesn't exist yet"). Covered by
+    `_test_fsoce_hardcoded_fallback_when_unlearnable`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no

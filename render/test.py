@@ -164,14 +164,18 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     strings (e.g. "#N/A", "#REF!"), not blank cells -- confirmed live in team
     and in either date column, across different vendor files; see
     _SHEETS_ERROR_SENTINELS. team is itself a spreadsheet lookup from shift
-    name and can break the same way; when missing, it's backfilled by
+    name and can break the same way; when missing, it's first backfilled by
     learning shift name -> team from whichever OTHER rows in the same tab
-    already have both populated (e.g. "FSOCE " with a trailing space vs
-    "FSOCE" without is a data-entry split of one shift name -- stripped
-    before learning, so one variant's valid rows recover the other's broken
-    ones). A shift name mapping to more than one distinct team, or with no
-    valid example anywhere in the tab, isn't guessed -- still throws. If
-    either date column is a sentinel, it's recovered from
+    already have both populated (a shift name mapping to more than one
+    distinct team, among rows that actually need it, isn't guessed -- still
+    throws). "FSOCE " with a trailing space vs "FSOCE" without is a
+    data-entry split of one shift name (stripped before learning, so one
+    variant's valid rows can recover the other's broken ones) -- and team=
+    "FSOCE" for shift name "FSOCE" is additionally a confirmed, locked
+    business fact applied as a last resort when even that learning can't
+    resolve a row (e.g. an entire tab where every FSOCE row's lookup is
+    broken, with no valid example left to learn from). If either date
+    column is a sentinel, it's recovered from
     the other; if both are, or if they parse to genuinely different dates,
     _clean_raw throws rather than guessing. Same-day rows with two different
     teams (double shift / OT past
@@ -249,15 +253,12 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
     shift = df["shift name"].str.strip()
     # team is itself a spreadsheet lookup from shift name, and can break the
-    # same way as everything else (#N/A, blank). Rather than one hardcoded
-    # shift-name special case (the original FSOCE fix -- subsumed here once
-    # shift names are stripped, since "FSOCE " and "FSOCE" both normalize to
-    # the same key), learn shift name -> team from whichever OTHER rows in
-    # THIS tab already have both, but only for shift names that actually
-    # have a row needing backfill -- a shift name is free to appear with
-    # more than one team elsewhere in real data as long as nothing missing
-    # depends on it. Ambiguous (multiple teams for a NEEDED shift name) or
-    # entirely unlearnable (no valid example at all) still throws.
+    # same way as everything else (#N/A, blank). Learn shift name -> team
+    # from whichever OTHER rows in THIS tab already have both, but only for
+    # shift names that actually have a row needing backfill -- a shift name
+    # is free to appear with more than one team elsewhere in real data as
+    # long as nothing missing depends on it. Ambiguous (multiple teams for a
+    # NEEDED shift name) still throws.
     missing_team = df["team"].isna()
     if missing_team.any():
         needed = set(shift[missing_team])
@@ -272,6 +273,17 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
         backfilled = shift[missing_team].map(shift_to_team).astype(df["team"].dtype)
         df.loc[missing_team, "team"] = backfilled
+
+        # Confirmed, locked business fact (see CLAUDE.md): shift name
+        # "FSOCE" (stripped) IS team "FSOCE" -- a data-entry/lookup-formula
+        # split, not a guess. Applied only as a last resort, to rows the
+        # data-driven learning above still couldn't resolve (e.g. an entire
+        # tab where every FSOCE row's team lookup is broken, leaving no
+        # valid example anywhere to learn from) -- never overrides a value
+        # the general learning already filled in.
+        still_missing = df["team"].isna()
+        df.loc[still_missing & (shift == "FSOCE"), "team"] = "FSOCE"
+
         if df["team"].isna().any():
             unresolved = sorted(shift[df["team"].isna()].unique())
             raise ValueError(
@@ -601,6 +613,24 @@ def _test_team_learned_from_shift_name():
     print("_test_team_learned_from_shift_name passed")
 
 
+def _test_fsoce_hardcoded_fallback_when_unlearnable():
+    """Confirmed live: [SOCE 2026]_Daily name list_BTS, tab 'Mar 26' -- every
+    single FSOCE row in the tab had a broken team lookup, so there was no
+    valid example anywhere to learn from and the general mechanism alone
+    threw. team="FSOCE" for shift name "FSOCE" is a confirmed, locked
+    business fact (not a guess), so it must still resolve here as a last
+    resort -- without this, the earlier generalization actually regressed
+    the original, narrower FSOCE fix."""
+    header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    rows = [
+        ["9 Mar 26", "amy", "09:00", "FSOCE", "2026-03-09", "SITE", "SH-1", ""],
+        ["9 Mar 26", "ben", "09:00", "FSOCE ", "2026-03-09", "SITE", "SH-2", ""],
+    ]
+    out = _clean_raw(_rows_to_raw_df([header] + rows))
+    assert (out.set_index("name")["team"] == "FSOCE").all()
+    print("_test_fsoce_hardcoded_fallback_when_unlearnable passed")
+
+
 def _test_sheets_error_sentinels_general():
     """The sentinel normalization isn't specific to one column/value -- any
     known Excel/Sheets error string, in either date column or in team,
@@ -667,6 +697,7 @@ def _run_tests():
     _test_corrupted_date_header_repaired()
     _test_duplicate_header_row_dropped()
     _test_team_learned_from_shift_name()
+    _test_fsoce_hardcoded_fallback_when_unlearnable()
     df = _synthetic()
     c, _ = showup_block(df)
     assert c.loc["1-5", "Mar"] == 6 and c.loc["6-10", "Mar"] == 1 and c.loc["11-15", "Mar"] == 1
