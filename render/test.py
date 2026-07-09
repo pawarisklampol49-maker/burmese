@@ -76,6 +76,42 @@ def _clear_sheets_errors(s: pd.Series) -> pd.Series:
     return s.where(~s.isin(_SHEETS_ERROR_SENTINELS), pd.NA)
 
 
+def _repair_date_header_positions(header: list) -> list:
+    """A วันที่ header cell can itself be a broken-formula artifact -- but as
+    a stray value like a bare row number, not one of _SHEETS_ERROR_SENTINELS
+    (confirmed live: BTS 'May 26' had "49" where the first วันที่ should be,
+    while the column's actual DATA underneath was still real dates). The
+    underlying column ORDER is unaffected, only that one cell's text -- the
+    locked convention (CLAUDE.md's Input section) is that the two วันที่
+    columns are always exactly one before ค้นหา and one after 'shift name',
+    and neither of those two anchor names has ever been seen corrupted.
+    Only ever consulted as a fallback (see _find_header_row/_resolve_header)
+    when strict name-matching has already failed for a row -- never touches
+    an already-working header, and the caller still requires the resulting
+    columns to actually parse as dates, so a wrong guess here still throws
+    rather than silently producing bad data."""
+    if "ค้นหา" not in header or "shift name" not in header:
+        return header
+    header = list(header)
+    name_idx = header.index("ค้นหา")
+    shift_idx = header.index("shift name")
+    if name_idx - 1 >= 0:
+        header[name_idx - 1] = "วันที่"
+    if shift_idx + 1 < len(header):
+        header[shift_idx + 1] = "วันที่"
+    return header
+
+
+def _mangled_header_candidates(row: list):
+    """Header candidates for one row, in order of trust: the literal
+    (dupe-mangled) header first, then a position-repaired version as a
+    fallback. Shared by _find_header_row and _resolve_header so row
+    detection and header construction can never disagree about which
+    candidate matched."""
+    yield _mangle_dupe_cols(row)
+    yield _mangle_dupe_cols(_repair_date_header_positions(row))
+
+
 def _find_header_row(rows: list, max_scan: int = 5) -> int:
     """Some vendor exports have a title/banner row above the real header
     (seen live: a merged note + 'OPS ID' + a wall of blank cells) -- others
@@ -83,12 +119,23 @@ def _find_header_row(rows: list, max_scan: int = 5) -> int:
     (dupe-mangled) columns are a superset of what _clean_raw needs, rather
     than assuming row 0 is always the header."""
     for i, row in enumerate(rows[:max_scan]):
-        if _REQUIRED_RAW_COLUMNS <= set(_mangle_dupe_cols(row)):
-            return i
+        for mangled in _mangled_header_candidates(row):
+            if _REQUIRED_RAW_COLUMNS <= set(mangled):
+                return i
     raise ValueError(
         f"couldn't find a header row containing {sorted(_REQUIRED_RAW_COLUMNS)} "
         f"in the first {max_scan} rows -- schema drift, or a banner deeper than expected"
     )
+
+
+def _resolve_header(row: list) -> list:
+    """The actual mangled header for a row already confirmed by
+    _find_header_row -- same strict-then-position-repaired precedence, kept
+    as one shared function so it can't disagree with how the row was found."""
+    for mangled in _mangled_header_candidates(row):
+        if _REQUIRED_RAW_COLUMNS <= set(mangled):
+            return mangled
+    raise ValueError("header row no longer matches on rebuild -- internal inconsistency")
 
 
 def _rows_to_raw_df(rows: list) -> pd.DataFrame:
@@ -97,7 +144,7 @@ def _rows_to_raw_df(rows: list) -> pd.DataFrame:
     if not rows:
         raise ValueError("empty sheet -- no header row")
     header_idx = _find_header_row(rows)
-    header = _mangle_dupe_cols(rows[header_idx])
+    header = _resolve_header(rows[header_idx])
     data = [r + [""] * (len(header) - len(r)) for r in rows[header_idx + 1:]]
     return pd.DataFrame(data, columns=header).replace("", pd.NA)
 
@@ -434,6 +481,32 @@ def _test_ref_date_fallback():
     print("_test_ref_date_fallback passed")
 
 
+def _test_corrupted_date_header_repaired():
+    """Confirmed live: [SOCE 2026]_Daily name list_BTS, tab 'May 26' -- the
+    header's first วันที่ cell had a stray value ("49") instead of the
+    column name, while the data underneath was still real dates. Name-match
+    alone can't find a header row (only one literal 'วันที่' survives), so
+    it must recover via position relative to ค้นหา/'shift name', then still
+    require the recovered column's data to actually parse as dates."""
+    header = ["49", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team",
+              "กะ", "เวลาเข้า-ออกงาน"]
+    row = ["9 May 26", "amy", "09:00", "Inbound", "2026-05-09", "SITE", "SH-1", "IB", "K1", "09:00-17:00"]
+    out = _clean_raw(_rows_to_raw_df([header, row]))
+    assert len(out) == 1 and out.iloc[0]["date"] == pd.Timestamp(2026, 5, 9)
+
+    # position-repair must still throw if the recovered column isn't
+    # actually dates -- not a silent guess
+    bad_row = ["not a date", "ben", "09:00", "Inbound", "2026-05-10", "SITE", "SH-2", "IB",
+               "K1", "09:00-17:00"]
+    try:
+        _clean_raw(_rows_to_raw_df([header, bad_row]))
+    except Exception:
+        pass
+    else:
+        raise AssertionError("expected a parse failure, not a silent guess")
+    print("_test_corrupted_date_header_repaired passed")
+
+
 def _test_sheets_error_sentinels_general():
     """The sentinel normalization isn't specific to one column/value -- any
     known Excel/Sheets error string, in either date column or in team,
@@ -497,6 +570,7 @@ def _run_tests():
     _test_sheets_error_sentinels_general()
     _test_blank_placeholder_row_dropped()
     _test_garbled_clockin_tolerated()
+    _test_corrupted_date_header_repaired()
     df = _synthetic()
     c, _ = showup_block(df)
     assert c.loc["1-5", "Mar"] == 6 and c.loc["6-10", "Mar"] == 1 and c.loc["11-15", "Mar"] == 1

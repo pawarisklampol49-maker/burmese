@@ -327,6 +327,23 @@ Real bugs found and fixed while building this:
     a row with a real time; the raw string is still preserved as-is in the
     `clockin` output column regardless. Covered by
     `_test_garbled_clockin_tolerated`.
+  - `[SOCE 2026]_Daily name list_BTS`, tab `May 26`: the header's first
+    วันที่ cell had a stray value (`"49"`) instead of the column name, while
+    the actual data underneath was still real dates -- confirmed by the
+    user reading the live sheet. Pure name-matching couldn't find a header
+    row at all (only one literal `วันที่` survives, so mangling never
+    produces the expected `วันที่`/`วันที่.1` pair). User proposed
+    column-position matching as a first-class strategy; scoped it narrower
+    than "position first everywhere" -- `_find_header_row`/`_resolve_header`
+    now try strict name-matching first (unchanged, zero risk to any
+    already-working file) and only fall back to `_repair_date_header_positions`
+    when that fails, which recovers the two วันที่ columns by their locked
+    position relative to `ค้นหา`/`shift name` (columns that have never shown
+    corruption). Not a blind position override: the recovered columns still
+    have to actually parse as dates downstream, or it throws -- "if the data
+    still matches, use it" is enforced structurally by the existing strict
+    date parsing, not a separate check. Covered by
+    `_test_corrupted_date_header_repaired`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no
