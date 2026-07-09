@@ -47,6 +47,16 @@ Open the **Central** Drive folder. Inside it, one spreadsheet per year, named ju
 3. You can also check `https://<the Render URL>/health` in a browser — if that doesn't load at all, the service itself is down (not a data problem), and that's a developer question.
 4. When escalating to the developer, copy the exact error message from n8n's execution log — it's specific on purpose.
 
+## Before the current developer's company account is deactivated
+
+This system is designed to keep working even after the person who built it (and their company Google account) leaves — but only if these are done *before* that account is deactivated:
+
+1. **GCP project**: the service account (the robot identity everything authenticates as) lives inside a Google Cloud project. Add a second Owner to that project — a generic company account, IT's account, or the next operator's own account — via Google Cloud Console → **IAM & Admin → IAM → Grant Access**. Once this is done, the project survives the original creator's account being gone; nothing about the service account, its key, or any Drive sharing needs to change.
+2. **Render**: add a second team member/owner to the Render account or team, so the deployed service isn't locked to one person's login.
+3. **GitHub**: add a second collaborator/owner to the repository, same reasoning.
+
+None of this touches the service account's key, the `SYNC_TOKEN`, or any file sharing already set up — those keep working regardless of whose Gmail is active. This is purely about making sure a human can still *administer* things (redeploy, check logs, rotate the key someday) after the original operator is gone.
+
 ## Glossary
 
 - **Department**: one of SOCN, SOCE, SOCW, FSOCW — the four groups this whole system tracks.

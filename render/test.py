@@ -92,7 +92,10 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw[raw["ค้นหา"].notna()].copy()
     df["team"] = df["team"].replace("#N/A", pd.NA)
 
-    d1 = pd.to_datetime(df["วันที่"], format="%d %b %y", errors="raise")
+    # วันที่'s display format varies by source (local CSV export: "01 Jun 26";
+    # live Sheets data seen in production: "1-Jan-26", no leading zero, hyphens)
+    # -- infer per-element rather than pin to one sample's format.
+    d1 = pd.to_datetime(df["วันที่"], format="mixed", dayfirst=True, errors="raise")
     d2 = pd.to_datetime(df["วันที่.1"], format="%Y-%m-%d", errors="raise")
     if not (d1 == d2).all():
         raise ValueError("วันที่ and วันที่.1 disagree on date for some rows -- stop, ask which is the show-up date")

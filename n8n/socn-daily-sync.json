@@ -25,11 +25,11 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://REPLACE-WITH-YOUR-RENDER-SERVICE.onrender.com/sync",
+        "url": "https://burmese-8ere.onrender.com/sync",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {
-          "timeout": 120000
+          "timeout": 180000
         }
       },
       "id": "http-request-1",
@@ -45,7 +45,10 @@
           "id": "",
           "name": "SOCN Sync Token"
         }
-      }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 30000
     }
   ],
   "connections": {

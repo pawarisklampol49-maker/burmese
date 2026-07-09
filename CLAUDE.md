@@ -212,6 +212,27 @@ Real bugs found and fixed while building this:
     with `_month_label()` derived from the month string itself, since this
     automation exists specifically to handle months/years beyond that range.
 
+Deployed 2026-07-08 to Render (`https://burmese-8ere.onrender.com`), pushed
+to `github.com/pawarisklampol49-maker/burmese` (main branch; `render/` as
+Render's configured Root Directory; `source/` gitignored -- real worker
+names, never pushed). First live `/sync` call correctly threw "no raw vendor
+spreadsheets found" -- confirms auth/env vars are fine, the gap was raw files
+not yet shared with the service account (a one-time per-file action, tracked
+in the runbook).
+
+Considered and rejected: moving Drive discovery into n8n (OAuth-based, like
+the user's separate unrelated "Resolve Monthly File IDs" workflow) to avoid
+the service-account sharing step. Rejected because it would still need some
+authorized identity to actually read file contents via gspread (sharing
+doesn't disappear, only discovery would move), and trades a simple
+per-file-share action for JS Code-node logic a non-technical successor can't
+maintain. Real constraint behind the ask: the user's company Gmail will be
+deactivated after handoff. Resolved without an architecture change -- the
+service account's identity/key and all Drive sharing are already independent
+of any human Google login; the only actual risk is GCP *project* ownership,
+covered in docs/RUNBOOK.md's pre-handoff checklist (add a second Owner on
+the GCP project, Render, and GitHub before the account is deactivated).
+
 ## Testing & secrets
 
 - Everything locally runnable. Flag any env change; the user tests locally.
