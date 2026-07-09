@@ -147,10 +147,32 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
     unrecoverable = d1.isna() & d2.isna()
     if unrecoverable.any():
+        # Confirmed live: [SOCE 2026]_Daily name list_CYD, tab Feb 26 -- 2
+        # rows have a name but every other field (date, team, shift,
+        # clock-in, Shift_id) genuinely blank. Not a broken formula, and not
+        # a real show-up (no date to attribute one to) -- a roster
+        # placeholder, same shape as the already-dropped fully-blank trailer
+        # rows, just with a name surviving the ค้นหา.notna() filter. Only
+        # drop when EVERYTHING else is also blank; a row missing just the
+        # date while team/shift/clock-in are populated looks like a real
+        # worked shift with an unknown date, which is a genuine gap worth
+        # stopping for, not silently discarding.
+        placeholder = (
+            unrecoverable
+            & df["team"].isna()
+            & df["shift name"].isna()
+            & df["เข้างาน"].isna()
+            & df["Shift_id"].isna()
+        )
+        if placeholder.any():
+            keep = ~placeholder
+            df, d1, d2, unrecoverable = df[keep], d1[keep], d2[keep], unrecoverable[keep]
+
+    if unrecoverable.any():
         names = df.loc[unrecoverable, "ค้นหา"].head(5).tolist()
         raise ValueError(
             f"{int(unrecoverable.sum())} row(s) have no usable date in either วันที่ or วันที่.1 "
-            f"(both broken/blank) -- stop, ask. First workers: {names}"
+            f"but other fields are populated -- stop, ask. First workers: {names}"
         )
 
     mismatch = d1 != d2
@@ -421,9 +443,32 @@ def _test_sheets_error_sentinels_general():
     print("_test_sheets_error_sentinels_general passed")
 
 
+def _test_blank_placeholder_row_dropped():
+    """Confirmed live: [SOCE 2026]_Daily name list_CYD, tab 'Feb 26' -- 2
+    rows have a name but every other field genuinely blank (no date, no
+    team, no shift, no clock-in, no Shift_id). Not a real show-up (no date
+    to attribute one to) -- dropped, same as the already-dropped fully-blank
+    trailer rows. A row missing only the date, with other fields populated,
+    must still throw (real gap, not a placeholder)."""
+    header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    placeholder_row = ["", "CYD 11502 THAE THAE", "", "", "", "SITE", "", ""]
+    real_row = ["9 Jul 26", "zoe", "09:00", "Inbound", "2026-07-09", "SITE", "SH-9", "IB"]
+    out = _clean_raw(_rows_to_raw_df([header, placeholder_row, real_row]))
+    assert len(out) == 1 and out.iloc[0]["name"] == "zoe"
+
+    partial_row = ["", "carol", "09:00", "Inbound", "", "SITE", "SH-3", "IB"]
+    try:
+        _clean_raw(_rows_to_raw_df([header, partial_row]))
+        raise AssertionError("expected ValueError -- other fields populated, not a placeholder")
+    except ValueError as e:
+        assert "other fields are populated" in str(e)
+    print("_test_blank_placeholder_row_dropped passed")
+
+
 def _run_tests():
     _test_ref_date_fallback()
     _test_sheets_error_sentinels_general()
+    _test_blank_placeholder_row_dropped()
     df = _synthetic()
     c, _ = showup_block(df)
     assert c.loc["1-5", "Mar"] == 6 and c.loc["6-10", "Mar"] == 1 and c.loc["11-15", "Mar"] == 1

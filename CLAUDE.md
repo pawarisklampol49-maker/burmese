@@ -305,6 +305,16 @@ Real bugs found and fixed while building this:
     disagree without either being a known sentinel -- that last case is a
     genuine data ambiguity, not something to silently resolve, so it still
     stops and asks. Covered by `_test_sheets_error_sentinels_general`.
+  - The same CYD/Feb 26 tab also had 2 rows where **every** field was blank
+    except ค้นหา (name) -- confirmed live by the user checking the actual
+    sheet. Not a broken formula, and not a real show-up (no date to
+    attribute one to) -- a roster placeholder that only survived the
+    `ค้นหา.notna()` filter because it has a name. `_clean_raw` now drops a
+    row with an unrecoverable date ONLY when every other field (team, shift
+    name, clock-in, Shift_id) is also blank; a row missing just the date
+    while other fields are populated still throws (a real worked shift with
+    an unknown date is a genuine gap, not a placeholder to silently
+    discard). Covered by `_test_blank_placeholder_row_dropped`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no
