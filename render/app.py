@@ -157,7 +157,10 @@ def run_sync() -> dict:
             values = ws.get_all_values()
             if not values:
                 continue
-            clean = engine.load_raw_from_values(values)
+            try:
+                clean = engine.load_raw_from_values(values)
+            except Exception as e:
+                raise ValueError(f"'{title}' tab '{ws.title}' (dept={dept}, vendor={vendor}): {e}") from e
             clean["department"], clean["vendor"] = dept, vendor
             years = pd.to_datetime(clean["date"]).dt.year.astype(str)
             for yr in years.unique():
