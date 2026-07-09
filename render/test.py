@@ -61,6 +61,35 @@ def _mangle_dupe_cols(header: list) -> list:
     return out
 
 
+_REQUIRED_RAW_COLUMNS = {"วันที่", "ค้นหา", "วันที่.1", "team", "เข้างาน", "shift name", "Shift_id"}
+
+
+def _find_header_row(rows: list, max_scan: int = 5) -> int:
+    """Some vendor exports have a title/banner row above the real header
+    (seen live: a merged note + 'OPS ID' + a wall of blank cells) -- others
+    (the originally-validated BTS file) don't. Scan for the row whose
+    (dupe-mangled) columns are a superset of what _clean_raw needs, rather
+    than assuming row 0 is always the header."""
+    for i, row in enumerate(rows[:max_scan]):
+        if _REQUIRED_RAW_COLUMNS <= set(_mangle_dupe_cols(row)):
+            return i
+    raise ValueError(
+        f"couldn't find a header row containing {sorted(_REQUIRED_RAW_COLUMNS)} "
+        f"in the first {max_scan} rows -- schema drift, or a banner deeper than expected"
+    )
+
+
+def _rows_to_raw_df(rows: list) -> pd.DataFrame:
+    """rows: list of row-lists (all strings, header position not yet known).
+    Locates the real header row, builds the raw (uncleaned) frame for _clean_raw."""
+    if not rows:
+        raise ValueError("empty sheet -- no header row")
+    header_idx = _find_header_row(rows)
+    header = _mangle_dupe_cols(rows[header_idx])
+    data = [r + [""] * (len(header) - len(r)) for r in rows[header_idx + 1:]]
+    return pd.DataFrame(data, columns=header).replace("", pd.NA)
+
+
 def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     """Clean one raw monthly attendance export -> (name, date, month, team,
     clockin, shift_name, shift_id) frame. The engine (_prepare) only ever
@@ -84,8 +113,7 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     time-of-day) -- the original เข้างาน string (not the parsed time used
     only for that tie-break) is kept in the output as `clockin`.
     """
-    required = {"วันที่", "ค้นหา", "วันที่.1", "team", "เข้างาน", "shift name", "Shift_id"}
-    missing = required - set(raw.columns)
+    missing = _REQUIRED_RAW_COLUMNS - set(raw.columns)
     if missing:
         raise ValueError(f"missing required raw columns: {sorted(missing)}")
 
@@ -126,23 +154,19 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_raw(path: str) -> pd.DataFrame:
-    """Load one raw monthly attendance CSV -> clean (name, date, team) frame. See _clean_raw."""
-    raw = pd.read_csv(path, dtype=str)
-    return _clean_raw(raw)
+    """Load one raw monthly attendance CSV -> clean (name, date, team) frame. See _clean_raw
+    and _rows_to_raw_df (header row isn't always row 0 -- some vendor exports have a title
+    banner above it). keep_default_na=False so a CSV and a live Sheet behave identically
+    going into _clean_raw (which does its own explicit NA/#N/A normalization)."""
+    rows = pd.read_csv(path, dtype=str, header=None, keep_default_na=False).values.tolist()
+    return _clean_raw(_rows_to_raw_df(rows))
 
 
 def load_raw_from_values(values: list) -> pd.DataFrame:
     """Load one raw monthly attendance worksheet tab (gspread worksheet.get_all_values()
-    output: header row + data rows, everything a string) -> clean (name, date, team) frame.
-    See _clean_raw. Google Sheets rows are stripped of trailing blank cells and don't get
-    pandas' automatic dupe-column suffixing, so both are reproduced here before cleaning.
-    """
-    if not values:
-        raise ValueError("empty worksheet -- no header row")
-    header = _mangle_dupe_cols(values[0])
-    rows = [r + [""] * (len(header) - len(r)) for r in values[1:]]
-    raw = pd.DataFrame(rows, columns=header).replace("", pd.NA)
-    return _clean_raw(raw)
+    output: rows of strings, header row not yet known) -> clean (name, date, team) frame.
+    See _clean_raw and _rows_to_raw_df."""
+    return _clean_raw(_rows_to_raw_df(values))
 
 
 # ---------------------------------------------------------------- core engine
