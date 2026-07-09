@@ -18,6 +18,7 @@ Config (env vars, set in Render's dashboard -- never commit these):
 import json
 import os
 import re
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -26,10 +27,30 @@ import pandas as pd
 from flask import Flask, jsonify, request
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from gspread.exceptions import APIError
 
 import test as engine
 
 app = Flask(__name__)
+
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _retry(fn, *args, max_tries: int = 4, base_delay: float = 2.0, **kwargs):
+    """Google's Sheets/Drive APIs occasionally return a transient 429/5xx
+    under load -- confirmed live (503) once a sync started touching many
+    vendor files/tabs in one run. Retries with exponential backoff instead
+    of failing the whole /sync call outright; anything else (auth, 404,
+    permission) is a real problem and re-raises immediately, not retried."""
+    for attempt in range(max_tries):
+        try:
+            return fn(*args, **kwargs)
+        except (APIError, HttpError) as e:
+            status = e.code if isinstance(e, APIError) else e.status_code
+            if status not in _RETRYABLE_STATUS or attempt == max_tries - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -84,10 +105,10 @@ def _list_raw_candidates(drive) -> list:
              f'and name contains "{RAW_TITLE_SEARCH_TERM}" and trashed=false')
     files, page_token = [], None
     while True:
-        resp = drive.files().list(
+        resp = _retry(drive.files().list(
             q=query, pageSize=1000, pageToken=page_token,
             fields="nextPageToken, files(id, name)",
-        ).execute()
+        ).execute)
         files.extend(resp["files"])
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -104,7 +125,7 @@ def _find_central(gc: gspread.Client, folder_id: str, year: str) -> gspread.Spre
     that's the one manual step per new year: duplicate last year's central
     sheet (or create a blank one), title it exactly the year, share it with
     the service account as Editor. See docs/RUNBOOK.md."""
-    matches = gc.list_spreadsheet_files(title=year, folder_id=folder_id)
+    matches = _retry(gc.list_spreadsheet_files, title=year, folder_id=folder_id)
     if len(matches) > 1:
         raise ValueError(f"{len(matches)} spreadsheets titled '{year}' in the central folder -- ambiguous")
     if not matches:
@@ -114,7 +135,7 @@ def _find_central(gc: gspread.Client, folder_id: str, year: str) -> gspread.Spre
             f"the folder). Create '{year}' there manually (e.g. duplicate last year's sheet) and "
             f"share it with the service account as Editor, then re-run"
         )
-    return gc.open_by_key(matches[0]["id"])
+    return _retry(gc.open_by_key, matches[0]["id"])
 
 
 def _to_raw_tab(df: pd.DataFrame) -> pd.DataFrame:
@@ -128,11 +149,12 @@ def _write_df(spreadsheet: gspread.Spreadsheet, tab: str, df: pd.DataFrame, raw:
     raw=False (Sheets' USER_ENTERED mode) is for the numeric summary tabs, so
     counts/percentages land as real numbers instead of text Sheets flags with
     a leading apostrophe."""
-    ws = spreadsheet.worksheet(tab) if tab in [w.title for w in spreadsheet.worksheets()] \
-        else spreadsheet.add_worksheet(tab, rows=max(len(df) + 10, 50), cols=max(len(df.columns) + 5, 20))
-    ws.clear()
+    existing = [w.title for w in _retry(spreadsheet.worksheets)]
+    ws = _retry(spreadsheet.worksheet, tab) if tab in existing \
+        else _retry(spreadsheet.add_worksheet, tab, rows=max(len(df) + 10, 50), cols=max(len(df.columns) + 5, 20))
+    _retry(ws.clear)
     values = [[str(c) for c in df.columns]] + df.astype(str).values.tolist()
-    ws.update(values, raw=raw)
+    _retry(ws.update, values, raw=raw)
 
 
 def run_sync() -> dict:
@@ -168,12 +190,12 @@ def run_sync() -> dict:
     frames_by_year = defaultdict(list)
     file_report = []
     for dept, vendor, declared_year, file_id, title in parsed_files:
-        sh = gc.open_by_key(file_id)
+        sh = _retry(gc.open_by_key, file_id)
         matched_tabs = []
-        for ws in sh.worksheets():
+        for ws in _retry(sh.worksheets):
             if not _is_month_tab(ws.title):
                 continue
-            values = ws.get_all_values()
+            values = _retry(ws.get_all_values)
             if not values:
                 continue
             try:

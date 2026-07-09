@@ -394,6 +394,20 @@ Real bugs found and fixed while building this:
     name *differs* from the shift name (like FSOCE was originally assumed
     to, though it turned out identical) -- still covered by
     `_test_team_learned_from_shift_name`.
+  - `APIError: [503]: The service is currently unavailable.` -- Google's
+    Sheets/Drive APIs themselves, not our code, and increasingly likely to
+    surface as real vendor files/tabs grow (many more read/write calls per
+    `/sync` than the mocked tests ever exercised). Added `app._retry()`, a
+    small exponential-backoff wrapper (`max_tries=4, base_delay=2.0` ->
+    delays of 2/4/8s), applied at every actual Google API call site
+    (`drive.files().list().execute`, `gc.list_spreadsheet_files`,
+    `gc.open_by_key`, `sh.worksheets`, `ws.get_all_values`,
+    `spreadsheet.worksheets`/`worksheet`/`add_worksheet`, `ws.clear`,
+    `ws.update`) -- retries only on `429/500/502/503/504`; anything else
+    (auth, 404, permission) re-raises immediately, not retried. Covered by
+    `test_retry_succeeds_after_transient_error`,
+    `test_retry_reraises_non_retryable_immediately`,
+    `test_retry_gives_up_after_max_tries` in `render/test_sync.py`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no

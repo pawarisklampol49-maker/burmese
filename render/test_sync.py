@@ -6,6 +6,7 @@ import datetime as dt
 import os
 
 import pandas as pd
+from gspread.exceptions import APIError
 
 os.environ.setdefault("GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
 os.environ.setdefault("CENTRAL_FOLDER_ID", "fake-central-folder")
@@ -13,6 +14,61 @@ os.environ.setdefault("RAW_DEPARTMENTS", "SOCN,SOCE,SOCW,FSOCW")
 os.environ.setdefault("SYNC_TOKEN", "test-token")
 
 import app
+
+
+class _FakeAPIErrorResponse:
+    def __init__(self, code, message="error"):
+        self._code = code
+        self.text = message
+
+    def json(self):
+        return {"error": {"code": self._code, "message": self.text, "status": "ERROR"}}
+
+
+def test_retry_succeeds_after_transient_error():
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise APIError(_FakeAPIErrorResponse(503, "The service is currently unavailable."))
+        return "ok"
+
+    assert app._retry(flaky, base_delay=0) == "ok"
+    assert calls["n"] == 3
+    print("test_retry_succeeds_after_transient_error passed")
+
+
+def test_retry_reraises_non_retryable_immediately():
+    calls = {"n": 0}
+
+    def always_404():
+        calls["n"] += 1
+        raise APIError(_FakeAPIErrorResponse(404, "Not Found"))
+
+    try:
+        app._retry(always_404, base_delay=0)
+        raise AssertionError("expected APIError to propagate")
+    except APIError:
+        pass
+    assert calls["n"] == 1   # no retry attempted for a non-retryable status
+    print("test_retry_reraises_non_retryable_immediately passed")
+
+
+def test_retry_gives_up_after_max_tries():
+    calls = {"n": 0}
+
+    def always_503():
+        calls["n"] += 1
+        raise APIError(_FakeAPIErrorResponse(503, "The service is currently unavailable."))
+
+    try:
+        app._retry(always_503, max_tries=3, base_delay=0)
+        raise AssertionError("expected APIError to propagate after exhausting retries")
+    except APIError:
+        pass
+    assert calls["n"] == 3
+    print("test_retry_gives_up_after_max_tries passed")
 
 
 def _fake_raw_values(rows):
@@ -276,6 +332,9 @@ if __name__ == "__main__":
     test_parse_raw_title()
     test_to_raw_tab()
     test_list_raw_candidates_pagination()
+    test_retry_succeeds_after_transient_error()
+    test_retry_reraises_non_retryable_immediately()
+    test_retry_gives_up_after_max_tries()
     test_run_sync_end_to_end_multi_vendor()
     test_run_sync_throws_on_unmatched_title()
     test_run_sync_throws_on_unknown_department()
