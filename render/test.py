@@ -124,7 +124,14 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     # live Sheets data seen in production: "1-Jan-26", no leading zero, hyphens)
     # -- infer per-element rather than pin to one sample's format.
     d1 = pd.to_datetime(df["วันที่"], format="mixed", dayfirst=True, errors="raise")
-    d2 = pd.to_datetime(df["วันที่.1"], format="%Y-%m-%d", errors="raise")
+    # วันที่.1 (ISO) is itself a formula in some vendor files (confirmed live:
+    # "[SOCE 2026]_Daily name list_BTS", tab "Jul 26") and can evaluate to the
+    # broken-reference sentinel "#REF!" -- same failure class as team's
+    # "#N/A". วันที่ parses fine for every one of those rows (checked above,
+    # errors="raise" didn't fire), so recover via the sibling column instead
+    # of losing a real worker's show-up day.
+    d2 = pd.to_datetime(df["วันที่.1"].replace("#REF!", pd.NA), format="%Y-%m-%d", errors="raise")
+    d2 = d2.fillna(d1)
     if not (d1 == d2).all():
         raise ValueError("วันที่ and วันที่.1 disagree on date for some rows -- stop, ask which is the show-up date")
 
@@ -351,7 +358,21 @@ def _synthetic():
     return pd.DataFrame(r)
 
 
+def _test_ref_date_fallback():
+    """วันที่.1 (ISO date) can be a broken-formula '#REF!' in live vendor data
+    (confirmed: '[SOCE 2026]_Daily name list_BTS', tab 'Jul 26') -- _clean_raw
+    must recover the date from the sibling วันที่ column instead of throwing
+    or dropping a real worker's show-up day."""
+    header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    row = ["9 Jul 26", "zoe", "09:00", "Inbound", "#REF!", "SITE", "SH-9", "IB"]
+    out = _clean_raw(_rows_to_raw_df([header, row]))
+    assert len(out) == 1
+    assert out.iloc[0]["date"] == pd.Timestamp(2026, 7, 9)
+    print("_test_ref_date_fallback passed")
+
+
 def _run_tests():
+    _test_ref_date_fallback()
     df = _synthetic()
     c, _ = showup_block(df)
     assert c.loc["1-5", "Mar"] == 6 and c.loc["6-10", "Mar"] == 1 and c.loc["11-15", "Mar"] == 1

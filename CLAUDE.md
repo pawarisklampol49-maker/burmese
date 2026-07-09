@@ -33,9 +33,14 @@ pushed to Git without explicit review. Never commit .env*; if in doubt, stop and
       CLAUDE.md              <- this file (must be here, capital name)
       source/                <- local raw month CSV(s), for offline dev/validation
       docs/
-        RUNBOOK.md            <- plain-language ops guide for the non-technical successor
+        RUNBOOK.md              <- plain-language ops guide for the non-technical successor
+        visualizations.html    <- worked examples of the 3 Summary tabs, real numbers from
+                                   `python render/test.py`'s mock run -- illustrates the locked
+                                   definitions in test.py's docstring, never forks them. Add a
+                                   new tab here per the "Adding a fourth aspect" footer whenever
+                                   a new metric gets wired into a Summary tab in run_sync().
       n8n/
-        socn-daily-sync.json  <- Schedule Trigger -> HTTP Request workflow (see Automation)
+        soc-daily-sync.json   <- Schedule Trigger -> HTTP Request workflow (see Automation)
       render/                 <- the deployable unit (Render deploys THIS folder)
         app.py                 <- Flask sync service (Drive discovery + writes)
         test.py                 <- metric engine + report shaping (the "socn mvp")
@@ -157,27 +162,60 @@ file still uses the original per-tab-is-a-month convention (`_is_month_tab`,
 tries `%b %y` then `%B %y`, e.g. "Jun 26" / "July 26"). Year is derived from
 each row's actual date, not trusted from the title.
 
-Central side -- **one spreadsheet per year, human-created, service account
-only writes to it.** Lives inside a fixed Central Drive folder
+Central side -- **one spreadsheet per year, auto-created by n8n, service
+account only writes to it.** Lives inside a fixed Central Drive folder
 (`1oDCnJmwIjedcHNtSyd_Hr-B5HDhZIN4K`), titled exactly the year (e.g.
-`"2027"`). `_find_central` searches that folder for an exact-title match and
-throws a clear, actionable error if it's missing -- it does NOT call
-`gc.create()`. **Reversed from the original design (auto-create) after live
-testing:** a bare service account has ~0 Drive storage quota of its own; a
-file it creates is owned by it and fails with "storage quota exceeded"
-regardless of how much space the folder itself has -- confirmed live via a
-real 403. Writing to an already-existing, human-owned file doesn't touch
-that quota at all, so the one remaining manual step per new year is: a human
-duplicates last year's central sheet (or makes a blank one), titles it
-exactly the year, shares it with the service account as Editor -- documented
-in docs/RUNBOOK.md. (If the company's Workspace plan includes Shared
-Drives, auto-create could be restored by putting the Central folder on one --
-Shared Drive files are owned by the Shared Drive itself, not any individual
-account -- untested, not pursued since it's a paid Workspace tier and the
-project's constraint is to stay free.) `drive` scope (not `drive.readonly`)
-is still needed for the write operations `_write_df`/`_find_central` do (and
-originally for `create`, no longer called, but the write scope stays
-required regardless). Each central spreadsheet holds exactly 7 tabs:
+`"2027"`). `_find_central` (render/app.py) searches that folder for an
+exact-title match and throws a clear, actionable error if it's missing -- it
+does NOT call `gc.create()`. Root cause, confirmed live via a real 403: a
+bare service account has ~0 Drive storage quota of its own; a file it
+creates is owned by it and fails with "storage quota exceeded" regardless of
+how much space the folder itself has. Writing to an already-existing file
+doesn't touch that quota at all, so `render/app.py` can never be the thing
+that creates the yearly sheet.
+
+**Auto-create is restored, but at the n8n layer, not the service account.**
+`n8n/soc-daily-sync.json` now does the create-if-missing check itself using
+n8n's own Google Sheets/Drive OAuth credentials (a human-authorized identity
+with real Drive quota, unlike the service account): `Set Year` -> `Search
+Sheet In Folder` (Drive query for a spreadsheet named exactly the year in
+the Central folder, `alwaysOutputData: true` so a zero-match search still
+produces an item with no `id` instead of stalling the workflow) -> `Exists?`
+(IF node on `$json.id` empty) -> if missing: `Create Sheet` (Google Sheets
+node, creates a blank spreadsheet titled the year) -> `Move Into Folder`
+(Google Drive node, moves it into the Central folder) -> either branch
+converges on calling `/sync`. This works because Drive folder-level sharing
+is inherited by whatever's inside the folder, present or future -- since the
+Central folder is already shared with the service account as Editor, a
+sheet created elsewhere and moved in should become writable by the service
+account without any separate per-file share. **Not yet confirmed live** --
+the next real daily run (or a manual trigger) is the actual test; if
+`_find_central` still throws "no spreadsheet titled" right after a fresh
+`Create Sheet` + `Move Into Folder`, that theory is wrong and the moved file
+needs an explicit share step added to the n8n workflow.
+
+Open question, unresolved: `n8n/soc-daily-sync.json`'s `Create Sheet` /
+`Move Into Folder` nodes use n8n-stored Google OAuth credentials
+("Google Sheets account 215" / "Google Drive account 104") tied to whichever
+human Google account authorized them in n8n. If that's the user's *company*
+Gmail (the one scheduled for deactivation post-handoff -- see the
+Gmail-shutdown paragraph below), auto-create breaks once that account is
+gone, even though the service account's daily write to existing sheets keeps
+working -- silently reintroducing the exact risk the original
+service-account-only design was meant to avoid. Needs to be confirmed with
+the user and, if so, added to docs/RUNBOOK.md's pre-handoff checklist
+(reconnect those two n8n credentials to a durable account before the company
+Gmail is deactivated).
+
+(If the company's Workspace plan includes Shared Drives, the *service
+account* could instead own auto-create by putting the Central folder on
+one -- Shared Drive files are owned by the Shared Drive itself, not any
+individual account -- untested, not pursued since it's a paid Workspace tier
+and the project's constraint is to stay free; n8n's own OAuth nodes turned
+out to be the free path to the same result.) `drive` scope (not
+`drive.readonly`) is still needed on the service account for the write
+operations `_write_df`/`_find_central` do. Each central spreadsheet holds
+exactly 7 tabs:
   - 4 raw-consolidated department tabs, named exactly `SOCN`/`SOCE`/`SOCW`/
     `FSOCW`, aggregating every vendor file for that department/year. Header
     (user-specified, verbatim): `Date show up | Month show up | Sub-con name
@@ -204,12 +242,17 @@ The multi-vendor/multi-year grouping is still only exercised against
 synthetic fixtures locally (only one real raw file exists in `source/`) --
 confirmed instead against real data live in production, per real bugs below.
 
-`n8n/socn-daily-sync.json`: Schedule Trigger (daily 06:00) -> HTTP Request
-(POST to the Render URL, httpHeaderAuth credential named "SOCN Sync Token"
-holding `Authorization: Bearer <SYNC_TOKEN>`). Fire-and-forget -- no
-downstream node parses the response body, so it needed no changes across the
-dynamic-discovery redesign. URL is a placeholder until the Render service is
-deployed.
+`n8n/soc-daily-sync.json` (renamed "SOC Daily Sync" by the user; nodes
+"Call SOC Sync"/"Call SOC Sync1"): Schedule Trigger (daily 06:00) -> `Set
+Year` -> the create-if-missing central-sheet check described above -> HTTP
+Request POST to `/sync` (httpHeaderAuth credential "Header Auth account 17"
+holding `Authorization: Bearer <SYNC_TOKEN>`; `retryOnFail: true, maxTries:
+3, waitBetweenTries: 5000`, `timeout: 340000` -- raised from an original
+180000/30000 pairing after a live 500 turned out to be gunicorn's default
+30s worker timeout killing the request mid-sync, not an app error; Render's
+Start Command must carry a matching `--timeout 300` flag, e.g. `gunicorn
+--bind 0.0.0.0:$PORT --timeout 300 app:app`). Fire-and-forget -- no
+downstream node parses the response body.
 
 User is handling: GCP service account creation/sharing (Editor on the
 Central folder and every raw vendor file), moving the existing 2026 central
@@ -239,6 +282,26 @@ Real bugs found and fixed while building this:
     hard to diagnose without direct Sheets access -- `load_raw_from_values`
     calls in `run_sync` are now wrapped to prefix errors with the
     spreadsheet title, tab, department, and vendor.
+  - วันที่.1 (the ISO date column, used as `date`) can itself be a broken
+    spreadsheet formula evaluating to `"#REF!"` -- confirmed live in
+    `[SOCE 2026]_Daily name list_BTS`, tab `Jul 26`. Same failure class as
+    team's `"#N/A"`. The affected row still had a real name (survived the
+    `ค้นหา.notna()` filter) and วันที่ (the sibling display-format date column)
+    parsed fine for every row -- so `_clean_raw` now normalizes `"#REF!"` ->
+    NaT in วันที่.1 and falls back to the parsed วันที่ value for just those
+    rows, instead of throwing or silently dropping a real worker's show-up
+    day. Covered by `_test_ref_date_fallback` in `render/test.py`.
+  - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
+    `'8`) -- `_write_df` cast every value to a Python string
+    (`df.astype(str)`) then called `ws.update(values)` with no
+    `value_input_option`, and gspread 6.2.1 defaults to `raw=True` (Sheets'
+    RAW input mode), which stores numeric-looking text as literal text;
+    Sheets flags that with the apostrophe since it won't sum/sort/chart as a
+    number. Fixed by adding a `raw` param to `_write_df`: the 4
+    raw-consolidated tabs stay `raw=True` (IDs like `Shift_id`/`team` must
+    not be silently reinterpreted as numbers -- e.g. a leading zero would
+    get dropped), the 3 summary tabs now pass `raw=False` (USER_ENTERED) so
+    counts/percentages land as real numbers.
 
 Deployed 2026-07-08 to Render (`https://burmese-8ere.onrender.com`), pushed
 to `github.com/pawarisklampol49-maker/burmese` (main branch; `render/` as
