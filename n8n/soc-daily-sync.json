@@ -1,53 +1,5 @@
 {
-  "name": "SOC Daily Sync",
   "nodes": [
-    {
-      "parameters": {
-        "rule": {
-          "interval": [
-            {
-              "triggerAtHour": 6
-            }
-          ]
-        }
-      },
-      "id": "77ffdd4f-ce12-4d58-a9d8-1b7c3e1de5fd",
-      "name": "Daily 06:00",
-      "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.2,
-      "position": [
-        -608,
-        -176
-      ]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://burmese-8ere.onrender.com/sync",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "options": {
-          "timeout": 340000
-        }
-      },
-      "id": "e7ba064b-f540-474d-bf57-4a2de10e93a4",
-      "name": "Call SOC Sync",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        816,
-        -64
-      ],
-      "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 5000,
-      "credentials": {
-        "httpHeaderAuth": {
-          "id": "fS2z07UNqaLdmob3",
-          "name": "Header Auth account 17"
-        }
-      }
-    },
     {
       "parameters": {
         "assignments": {
@@ -62,13 +14,13 @@
         },
         "options": {}
       },
-      "id": "35af7ef6-be10-4149-8ebe-cac6cc739937",
+      "id": "5e687535-4595-4e28-8da8-1a6dd8333cd2",
       "name": "Set Year",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        -304,
-        -176
+        -160,
+        -112
       ]
     },
     {
@@ -96,13 +48,13 @@
         },
         "options": {}
       },
-      "id": "869cc3fc-e236-4843-a51d-4abd5c5f4cf6",
+      "id": "ef1e696e-975c-460e-9ecd-98a2937c6451",
       "name": "Exists?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        144,
-        -176
+        288,
+        -112
       ]
     },
     {
@@ -111,13 +63,13 @@
         "title": "={{ $('Set Year').item.json.year }}",
         "options": {}
       },
-      "id": "3534a3fc-090b-49d2-8b36-063ebf7b79ef",
+      "id": "6fc54692-d347-4b19-bc28-cac200896b16",
       "name": "Create Sheet",
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.5,
       "position": [
-        352,
-        -256
+        480,
+        -304
       ],
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -145,14 +97,39 @@
           "mode": "id"
         }
       },
-      "id": "2d74185d-38c7-4eff-934a-6ed59338c06a",
+      "id": "64166c63-f123-4ee1-b4ad-9a9374d572bd",
       "name": "Move Into Folder",
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
       "position": [
-        576,
-        -256
+        704,
+        -304
       ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "ON1340wgANLdRG8m",
+          "name": "Google Drive account 104"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "fileFolder",
+        "searchMethod": "query",
+        "queryString": "=name = '{{ $json.year }}' and '1oDCnJmwIjedcHNtSyd_Hr-B5HDhZIN4K' in parents and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false",
+        "returnAll": true,
+        "filter": {},
+        "options": {}
+      },
+      "id": "391dfd43-70e3-4e5d-863a-d23120628373",
+      "name": "Search Sheet In Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        48,
+        -112
+      ],
+      "alwaysOutputData": true,
       "credentials": {
         "googleDriveOAuth2Api": {
           "id": "ON1340wgANLdRG8m",
@@ -170,13 +147,13 @@
           "timeout": 340000
         }
       },
-      "id": "c44ff8af-4c7d-4613-89ab-ecfa1f293b3a",
-      "name": "Call SOC Sync1",
+      "id": "0fb40a0d-7dc1-418a-a9d8-75385f8cb4d2",
+      "name": "Call SOC Sync",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        816,
-        -256
+        992,
+        -96
       ],
       "retryOnFail": true,
       "maxTries": 3,
@@ -190,47 +167,25 @@
     },
     {
       "parameters": {
-        "resource": "fileFolder",
-        "searchMethod": "query",
-        "queryString": "=name = '{{ $json.year }}' and '1oDCnJmwIjedcHNtSyd_Hr-B5HDhZIN4K' in parents and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false",
-        "returnAll": true,
-        "filter": {},
-        "options": {}
-      },
-      "id": "4a420f7d-4222-44c9-a90b-0b783b931f28",
-      "name": "Search Sheet In Folder",
-      "type": "n8n-nodes-base.googleDrive",
-      "typeVersion": 3,
-      "position": [
-        -96,
-        -176
-      ],
-      "alwaysOutputData": true,
-      "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "ON1340wgANLdRG8m",
-          "name": "Google Drive account 104"
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 11
+            }
+          ]
         }
-      }
+      },
+      "id": "1949e095-bb3e-4b14-8739-4588bd644742",
+      "name": "Daily 11:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -464,
+        -112
+      ]
     }
   ],
   "connections": {
-    "Daily 06:00": {
-      "main": [
-        [
-          {
-            "node": "Set Year",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Call SOC Sync": {
-      "main": [
-        []
-      ]
-    },
     "Set Year": {
       "main": [
         [
@@ -275,7 +230,7 @@
       "main": [
         [
           {
-            "node": "Call SOC Sync1",
+            "node": "Call SOC Sync",
             "type": "main",
             "index": 0
           }
@@ -292,11 +247,18 @@
           }
         ]
       ]
+    },
+    "Daily 11:00": {
+      "main": [
+        [
+          {
+            "node": "Set Year",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
-  },
-  "active": false,
-  "settings": {
-    "executionOrder": "v1"
   },
   "pinData": {},
   "meta": {

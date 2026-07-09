@@ -63,6 +63,18 @@ def _mangle_dupe_cols(header: list) -> list:
 
 _REQUIRED_RAW_COLUMNS = {"วันที่", "ค้นหา", "วันที่.1", "team", "เข้างาน", "shift name", "Shift_id"}
 
+# Broken spreadsheet formulas surface as literal Excel/Sheets error strings,
+# not blank cells -- confirmed live twice now (team="#N/A" in one vendor
+# file, วันที่.1="#REF!" in another). pandas' default NA-string inference
+# can't be relied on once input comes from the Sheets API instead of
+# read_csv, so these are normalized explicitly, everywhere they might show
+# up, rather than one column/sentinel at a time as each is discovered live.
+_SHEETS_ERROR_SENTINELS = {"#REF!", "#N/A", "#VALUE!", "#DIV/0!", "#NAME?", "#NULL!", "#NUM!", "#ERROR!"}
+
+
+def _clear_sheets_errors(s: pd.Series) -> pd.Series:
+    return s.where(~s.isin(_SHEETS_ERROR_SENTINELS), pd.NA)
+
 
 def _find_header_row(rows: list, max_scan: int = 5) -> int:
     """Some vendor exports have a title/banner row above the real header
@@ -100,15 +112,18 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     Resolved mapping (see CLAUDE.md): name=ค้นหา, date=วันที่.1, team=team.
     วันที่ and วันที่.1 encode the same date in different formats (DD Mon YY vs
     ISO) -- verified equal after parsing, not as raw strings. Export pads the
-    file with fully-blank trailer rows, dropped via ค้นหา.notna(). "FSOCE "
-    (trailing space) vs "FSOCE" (no space) is a data-entry split of one shift
-    name; for the latter, team is a literal "#N/A" (a broken spreadsheet
-    lookup formula baked into the export, confirmed via raw csv module read
-    -- not an empty cell, and not something pandas' default NA-string
-    recognition can be relied on once input comes from Sheets API values
-    instead of read_csv). Normalized to NA here, then backfilled to
-    team="FSOCE" so it isn't silently dropped by pivot_table on a NaN team
-    key. Same-day rows with two different teams (double shift / OT past
+    file with fully-blank trailer rows, dropped via ค้นหา.notna(). Broken
+    vendor-file spreadsheet formulas surface as literal Excel/Sheets error
+    strings (e.g. "#N/A", "#REF!"), not blank cells -- confirmed live in team
+    and in either date column, across different vendor files; see
+    _SHEETS_ERROR_SENTINELS. "FSOCE " (trailing space) vs "FSOCE" (no space)
+    is a data-entry split of one shift name; for the latter, team is one of
+    those sentinels rather than an empty cell, normalized to NA then
+    backfilled to team="FSOCE" so it isn't silently dropped by pivot_table on
+    a NaN team key. If either date column is a sentinel, it's recovered from
+    the other; if both are, or if they parse to genuinely different dates,
+    _clean_raw throws rather than guessing. Same-day rows with two different
+    teams (double shift / OT past
     midnight) are collapsed by keeping the earliest เข้างาน (min clock-in
     time-of-day) -- the original เข้างาน string (not the parsed time used
     only for that tie-break) is kept in the output as `clockin`.
@@ -118,22 +133,38 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"missing required raw columns: {sorted(missing)}")
 
     df = raw[raw["ค้นหา"].notna()].copy()
-    df["team"] = df["team"].replace("#N/A", pd.NA)
+    df["team"] = _clear_sheets_errors(df["team"])
 
     # วันที่'s display format varies by source (local CSV export: "01 Jun 26";
     # live Sheets data seen in production: "1-Jan-26", no leading zero, hyphens)
-    # -- infer per-element rather than pin to one sample's format.
-    d1 = pd.to_datetime(df["วันที่"], format="mixed", dayfirst=True, errors="raise")
-    # วันที่.1 (ISO) is itself a formula in some vendor files (confirmed live:
-    # "[SOCE 2026]_Daily name list_BTS", tab "Jul 26") and can evaluate to the
-    # broken-reference sentinel "#REF!" -- same failure class as team's
-    # "#N/A". วันที่ parses fine for every one of those rows (checked above,
-    # errors="raise" didn't fire), so recover via the sibling column instead
-    # of losing a real worker's show-up day.
-    d2 = pd.to_datetime(df["วันที่.1"].replace("#REF!", pd.NA), format="%Y-%m-%d", errors="raise")
-    d2 = d2.fillna(d1)
-    if not (d1 == d2).all():
-        raise ValueError("วันที่ and วันที่.1 disagree on date for some rows -- stop, ask which is the show-up date")
+    # -- infer per-element rather than pin to one sample's format. Either
+    # column can independently be a broken formula (see _SHEETS_ERROR_SENTINELS);
+    # each is cross-filled from the other when one is unrecoverable, so a
+    # single broken cell doesn't lose a real worker's show-up day.
+    d1 = pd.to_datetime(_clear_sheets_errors(df["วันที่"]), format="mixed", dayfirst=True, errors="raise")
+    d2 = pd.to_datetime(_clear_sheets_errors(df["วันที่.1"]), format="%Y-%m-%d", errors="raise")
+    d1, d2 = d1.fillna(d2), d2.fillna(d1)
+
+    unrecoverable = d1.isna() & d2.isna()
+    if unrecoverable.any():
+        names = df.loc[unrecoverable, "ค้นหา"].head(5).tolist()
+        raise ValueError(
+            f"{int(unrecoverable.sum())} row(s) have no usable date in either วันที่ or วันที่.1 "
+            f"(both broken/blank) -- stop, ask. First workers: {names}"
+        )
+
+    mismatch = d1 != d2
+    if mismatch.any():
+        sample = df.loc[mismatch, ["ค้นหา", "วันที่", "วันที่.1"]].head(5)
+        examples = "; ".join(
+            f"{row['ค้นหา']}: วันที่={row['วันที่']!r} (parsed {d1[i].date()}) vs "
+            f"วันที่.1={row['วันที่.1']!r} (parsed {d2[i].date()})"
+            for i, row in sample.iterrows()
+        )
+        raise ValueError(
+            f"วันที่ and วันที่.1 disagree on date for {int(mismatch.sum())} row(s) -- stop, ask "
+            f"which is the show-up date. First examples: {examples}"
+        )
 
     shift = df["shift name"].str.strip()
     fsoce_blank_team = (shift == "FSOCE") & df["team"].isna()
@@ -371,8 +402,28 @@ def _test_ref_date_fallback():
     print("_test_ref_date_fallback passed")
 
 
+def _test_sheets_error_sentinels_general():
+    """The sentinel normalization isn't specific to one column/value -- any
+    known Excel/Sheets error string, in either date column or in team,
+    should be recovered the same way."""
+    header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    # วันที่ (not วันที่.1) broken this time -- symmetric recovery
+    row_a = ["#VALUE!", "amy", "09:00", "Inbound", "2026-07-10", "SITE", "SH-1", "IB"]
+    out_a = _clean_raw(_rows_to_raw_df([header, row_a]))
+    assert out_a.iloc[0]["date"] == pd.Timestamp(2026, 7, 10)
+    # both date columns broken -- genuinely unrecoverable, must throw
+    row_b = ["#REF!", "ben", "09:00", "Inbound", "#N/A", "SITE", "SH-2", "IB"]
+    try:
+        _clean_raw(_rows_to_raw_df([header, row_b]))
+        raise AssertionError("expected ValueError for unrecoverable date")
+    except ValueError as e:
+        assert "no usable date" in str(e)
+    print("_test_sheets_error_sentinels_general passed")
+
+
 def _run_tests():
     _test_ref_date_fallback()
+    _test_sheets_error_sentinels_general()
     df = _synthetic()
     c, _ = showup_block(df)
     assert c.loc["1-5", "Mar"] == 6 and c.loc["6-10", "Mar"] == 1 and c.loc["11-15", "Mar"] == 1

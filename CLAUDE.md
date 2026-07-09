@@ -242,10 +242,12 @@ The multi-vendor/multi-year grouping is still only exercised against
 synthetic fixtures locally (only one real raw file exists in `source/`) --
 confirmed instead against real data live in production, per real bugs below.
 
-`n8n/soc-daily-sync.json` (renamed "SOC Daily Sync" by the user; nodes
-"Call SOC Sync"/"Call SOC Sync1"): Schedule Trigger (daily 06:00) -> `Set
-Year` -> the create-if-missing central-sheet check described above -> HTTP
-Request POST to `/sync` (httpHeaderAuth credential "Header Auth account 17"
+`n8n/soc-daily-sync.json` (renamed "SOC Daily Sync" by the user; single
+merged "Call SOC Sync" node reached from both the Exists?-true and
+Exists?-false branches): Schedule Trigger (daily 11:00, moved from the
+original 06:00) -> `Set Year` -> the create-if-missing central-sheet check
+described above -> HTTP Request POST to `/sync` (httpHeaderAuth credential
+"Header Auth account 17"
 holding `Authorization: Bearer <SYNC_TOKEN>`; `retryOnFail: true, maxTries:
 3, waitBetweenTries: 5000`, `timeout: 340000` -- raised from an original
 180000/30000 pairing after a live 500 turned out to be gunicorn's default
@@ -287,10 +289,22 @@ Real bugs found and fixed while building this:
     `[SOCE 2026]_Daily name list_BTS`, tab `Jul 26`. Same failure class as
     team's `"#N/A"`. The affected row still had a real name (survived the
     `ค้นหา.notna()` filter) and วันที่ (the sibling display-format date column)
-    parsed fine for every row -- so `_clean_raw` now normalizes `"#REF!"` ->
-    NaT in วันที่.1 and falls back to the parsed วันที่ value for just those
-    rows, instead of throwing or silently dropping a real worker's show-up
-    day. Covered by `_test_ref_date_fallback` in `render/test.py`.
+    parsed fine for every row -- so `_clean_raw` recovers from the sibling
+    column for just those rows instead of throwing or silently dropping a
+    real worker's show-up day. Covered by `_test_ref_date_fallback`.
+  - Generalized after a second, different vendor file (`[SOCE
+    2026]_Daily name list_CYD`, tab `Feb 26`) hit a live case the narrow
+    `"#REF!"`-in-one-column fix didn't cover: both วันที่ and วันที่.1 parsed
+    to genuinely *different* valid dates (not a broken-formula sentinel at
+    all). `_clean_raw` now recognizes any of a small set of known
+    Excel/Sheets error strings (`_SHEETS_ERROR_SENTINELS`:
+    `#REF!/#N/A/#VALUE!/#DIV/0!/#NAME?/#NULL!/#NUM!/#ERROR!`) in **either**
+    date column or in team, cross-fills each date column from the other when
+    one is a sentinel, and throws a clear error (naming the affected
+    workers/rows, not just "some rows") if both are unrecoverable or if they
+    disagree without either being a known sentinel -- that last case is a
+    genuine data ambiguity, not something to silently resolve, so it still
+    stops and asks. Covered by `_test_sheets_error_sentinels_general`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no
