@@ -163,11 +163,15 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     vendor-file spreadsheet formulas surface as literal Excel/Sheets error
     strings (e.g. "#N/A", "#REF!"), not blank cells -- confirmed live in team
     and in either date column, across different vendor files; see
-    _SHEETS_ERROR_SENTINELS. "FSOCE " (trailing space) vs "FSOCE" (no space)
-    is a data-entry split of one shift name; for the latter, team is one of
-    those sentinels rather than an empty cell, normalized to NA then
-    backfilled to team="FSOCE" so it isn't silently dropped by pivot_table on
-    a NaN team key. If either date column is a sentinel, it's recovered from
+    _SHEETS_ERROR_SENTINELS. team is itself a spreadsheet lookup from shift
+    name and can break the same way; when missing, it's backfilled by
+    learning shift name -> team from whichever OTHER rows in the same tab
+    already have both populated (e.g. "FSOCE " with a trailing space vs
+    "FSOCE" without is a data-entry split of one shift name -- stripped
+    before learning, so one variant's valid rows recover the other's broken
+    ones). A shift name mapping to more than one distinct team, or with no
+    valid example anywhere in the tab, isn't guessed -- still throws. If
+    either date column is a sentinel, it's recovered from
     the other; if both are, or if they parse to genuinely different dates,
     _clean_raw throws rather than guessing. Same-day rows with two different
     teams (double shift / OT past
@@ -244,10 +248,36 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
         )
 
     shift = df["shift name"].str.strip()
-    fsoce_blank_team = (shift == "FSOCE") & df["team"].isna()
-    df.loc[fsoce_blank_team, "team"] = "FSOCE"
-    if df["team"].isna().any():
-        raise ValueError(f"{df['team'].isna().sum()} rows have no team after FSOCE backfill -- stop, ask")
+    # team is itself a spreadsheet lookup from shift name, and can break the
+    # same way as everything else (#N/A, blank). Rather than one hardcoded
+    # shift-name special case (the original FSOCE fix -- subsumed here once
+    # shift names are stripped, since "FSOCE " and "FSOCE" both normalize to
+    # the same key), learn shift name -> team from whichever OTHER rows in
+    # THIS tab already have both, but only for shift names that actually
+    # have a row needing backfill -- a shift name is free to appear with
+    # more than one team elsewhere in real data as long as nothing missing
+    # depends on it. Ambiguous (multiple teams for a NEEDED shift name) or
+    # entirely unlearnable (no valid example at all) still throws.
+    missing_team = df["team"].isna()
+    if missing_team.any():
+        needed = set(shift[missing_team])
+        has_team = df["team"].notna()
+        learned = pd.DataFrame({"shift": shift[has_team], "team": df.loc[has_team, "team"]}).drop_duplicates()
+        relevant = learned[learned["shift"].isin(needed)]
+        ambiguous = relevant["shift"].duplicated(keep=False)
+        if ambiguous.any():
+            bad = sorted(relevant.loc[ambiguous, "shift"].unique())
+            raise ValueError(f"shift name(s) map to more than one team, can't backfill safely: {bad} -- stop, ask")
+        shift_to_team = relevant.set_index("shift")["team"]
+
+        backfilled = shift[missing_team].map(shift_to_team).astype(df["team"].dtype)
+        df.loc[missing_team, "team"] = backfilled
+        if df["team"].isna().any():
+            unresolved = sorted(shift[df["team"].isna()].unique())
+            raise ValueError(
+                f"{int(df['team'].isna().sum())} row(s) have no team and no learnable shift-name -> "
+                f"team mapping in this tab (shift name(s): {unresolved}) -- stop, ask"
+            )
 
     out = pd.DataFrame({
         "name": df["ค้นหา"],
@@ -529,6 +559,48 @@ def _test_duplicate_header_row_dropped():
     print("_test_duplicate_header_row_dropped passed")
 
 
+def _test_team_learned_from_shift_name():
+    """Confirmed live: [SOCE 2026]_Daily name list_PPO, tab 'Jul 26' -- 10
+    rows had no team and weren't the FSOCE special case. team is itself a
+    lookup from shift name, so it's learned from whichever OTHER rows in
+    the tab already have both, generalizing the old FSOCE-only rule."""
+    header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    rows = [
+        ["9 Jul 26", "amy", "09:00", "Outbound", "2026-07-09", "SITE", "SH-1", "OBD"],
+        ["9 Jul 26", "ben", "09:00", "Outbound", "2026-07-09", "SITE", "SH-2", ""],   # learn from amy
+        ["9 Jul 26", "cara", "09:00", "FSOCE ", "2026-07-09", "SITE", "SH-3", "FSOCE"],
+        ["9 Jul 26", "dan", "09:00", "FSOCE", "2026-07-09", "SITE", "SH-4", ""],      # stripped match
+    ]
+    out = _clean_raw(_rows_to_raw_df([header] + rows))
+    teams = out.set_index("name")["team"]
+    assert teams["ben"] == "OBD" and teams["dan"] == "FSOCE"
+
+    # ambiguous: same shift name, two different known teams -- must throw
+    ambiguous_rows = [
+        ["9 Jul 26", "amy", "09:00", "Mixed", "2026-07-09", "SITE", "SH-1", "OBD"],
+        ["9 Jul 26", "ben", "09:00", "Mixed", "2026-07-09", "SITE", "SH-2", "IB"],
+        ["9 Jul 26", "cara", "09:00", "Mixed", "2026-07-09", "SITE", "SH-3", ""],
+    ]
+    try:
+        _clean_raw(_rows_to_raw_df([header] + ambiguous_rows))
+    except ValueError as e:
+        assert "more than one team" in str(e)
+    else:
+        raise AssertionError("expected ValueError for ambiguous shift name -> team mapping")
+
+    # unlearnable: no valid example anywhere for this shift name -- must throw
+    unlearnable_rows = [
+        ["9 Jul 26", "erin", "09:00", "Ghost Shift", "2026-07-09", "SITE", "SH-9", ""],
+    ]
+    try:
+        _clean_raw(_rows_to_raw_df([header] + unlearnable_rows))
+    except ValueError as e:
+        assert "no learnable shift-name" in str(e)
+    else:
+        raise AssertionError("expected ValueError for unlearnable team")
+    print("_test_team_learned_from_shift_name passed")
+
+
 def _test_sheets_error_sentinels_general():
     """The sentinel normalization isn't specific to one column/value -- any
     known Excel/Sheets error string, in either date column or in team,
@@ -594,6 +666,7 @@ def _run_tests():
     _test_garbled_clockin_tolerated()
     _test_corrupted_date_header_repaired()
     _test_duplicate_header_row_dropped()
+    _test_team_learned_from_shift_name()
     df = _synthetic()
     c, _ = showup_block(df)
     assert c.loc["1-5", "Mar"] == 6 and c.loc["6-10", "Mar"] == 1 and c.loc["11-15", "Mar"] == 1

@@ -355,6 +355,19 @@ Real bugs found and fixed while building this:
     when ค้นหา literally equals `"ค้นหา"` (the header's own label -- no real
     worker is named that), which is exactly the duplicate-header signature
     and nothing else. Covered by `_test_duplicate_header_row_dropped`.
+  - `[SOCE 2026]_Daily name list_PPO`, tab `Jul 26`: 10 rows had no team and
+    weren't the FSOCE special case -- user pointed out team is itself an
+    abbreviation of shift name, so it should be learnable the same general
+    way. Replaced the hardcoded FSOCE-only backfill with one that learns
+    shift name -> team from whichever OTHER rows in the same tab already
+    have both (subsumes FSOCE for free once shift names are stripped, since
+    "FSOCE " and "FSOCE" both normalize to the same key). Scoped to only
+    the shift names that actually have a row needing backfill -- checking
+    ambiguity tab-wide was too eager and broke the existing multi-vendor
+    test fixture (one shift name legitimately paired with several different
+    teams across unrelated, already-complete rows). Still throws if a
+    *needed* shift name maps to more than one team, or has no valid example
+    anywhere in the tab. Covered by `_test_team_learned_from_shift_name`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no
