@@ -415,6 +415,30 @@ Real bugs found and fixed while building this:
     `test_retry_succeeds_after_transient_error`,
     `test_retry_reraises_non_retryable_immediately`,
     `test_retry_gives_up_after_max_tries` in `render/test_sync.py`.
+  - Retries alone weren't enough: 43 minutes of Render logs showed every
+    single attempt (across multiple n8n retries) dying with the same
+    `WORKER TIMEOUT`, every time inside `ws.get_all_values()` -- confirming
+    this isn't transient throttling but that a full sync now genuinely
+    takes longer than even a 500s timeout with this much real vendor data.
+    Bumping the timeout further is a dead end (treadmill against
+    ever-growing data, and a 10+ minute daily sync is fragile regardless).
+    Root-caused to call *count*, not slowness per call: reading was making
+    1 `get_all_values()` call per month tab per vendor file (a full year of
+    one vendor = ~13 calls just to read). Added `app._batch_get_month_tabs`
+    using gspread's `values_batch_get` (Google's Sheets API batchGet
+    endpoint) to fetch every matched month tab from one vendor spreadsheet
+    in a single API call instead of one call per tab -- cuts the read side
+    from `1 + N` calls per vendor file down to `2`, regardless of how many
+    months it has. `valueRanges` in the batchGet response come back in the
+    same order as the requested titles (matched by position, not by
+    re-parsing quoted range strings, which vary by sheet-name escaping).
+    Covered by `test_batch_get_month_tabs`. The write side (7 tabs x ~4
+    calls each = up to 28 calls per year) has the same batching option
+    available (`values_batch_update`/`values_batch_clear`/`batch_update`
+    for new-sheet creation) but wasn't needed yet -- reads were the
+    confirmed bottleneck (the actual crash was always inside
+    `get_all_values()`), so this was scoped to the fix with evidence behind
+    it rather than batching everything preemptively.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no

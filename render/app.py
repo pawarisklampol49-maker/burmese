@@ -142,6 +142,23 @@ def _to_raw_tab(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=RAW_TAB_COLUMNS)[list(RAW_TAB_COLUMNS.values())]
 
 
+def _batch_get_month_tabs(sh: gspread.Spreadsheet, titles: list) -> dict:
+    """Read every matched month tab from one vendor spreadsheet in a single
+    API call, instead of one get_all_values() call per tab -- confirmed
+    live as the single biggest contributor to /sync exceeding even a 500s
+    gunicorn timeout with enough real vendor files/tabs (every WORKER
+    TIMEOUT crash was inside get_all_values()). Google's batchGet response
+    returns valueRanges in the same order as the requested titles, so
+    matching by position is safe and avoids re-parsing quoted range
+    strings. Returns {title: values} for every input title (empty list for
+    a tab with no data)."""
+    if not titles:
+        return {}
+    resp = _retry(sh.values_batch_get, titles)
+    value_ranges = resp.get("valueRanges", [])
+    return {title: vr.get("values", []) for title, vr in zip(titles, value_ranges)}
+
+
 def _write_df(spreadsheet: gspread.Spreadsheet, tab: str, df: pd.DataFrame, raw: bool = True) -> None:
     """raw=True (default) writes every cell as literal text -- required for
     the 4 department tabs, which carry IDs (Shift_id, team) that must not be
@@ -191,22 +208,22 @@ def run_sync() -> dict:
     file_report = []
     for dept, vendor, declared_year, file_id, title in parsed_files:
         sh = _retry(gc.open_by_key, file_id)
+        month_titles = [ws.title for ws in _retry(sh.worksheets) if _is_month_tab(ws.title)]
+        values_by_title = _batch_get_month_tabs(sh, month_titles)
         matched_tabs = []
-        for ws in _retry(sh.worksheets):
-            if not _is_month_tab(ws.title):
-                continue
-            values = _retry(ws.get_all_values)
+        for tab_title in month_titles:
+            values = values_by_title.get(tab_title, [])
             if not values:
                 continue
             try:
                 clean = engine.load_raw_from_values(values)
             except Exception as e:
-                raise ValueError(f"'{title}' tab '{ws.title}' (dept={dept}, vendor={vendor}): {e}") from e
+                raise ValueError(f"'{title}' tab '{tab_title}' (dept={dept}, vendor={vendor}): {e}") from e
             clean["department"], clean["vendor"] = dept, vendor
             years = pd.to_datetime(clean["date"]).dt.year.astype(str)
             for yr in years.unique():
                 frames_by_year[yr].append(clean[years == yr])
-            matched_tabs.append(ws.title)
+            matched_tabs.append(tab_title)
         if not matched_tabs:
             raise ValueError(
                 f"'{title}' (dept={dept}, vendor={vendor}) matched raw discovery but has no "

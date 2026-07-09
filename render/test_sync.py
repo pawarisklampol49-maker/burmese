@@ -114,6 +114,26 @@ def test_to_raw_tab():
     print("test_to_raw_tab passed")
 
 
+def test_batch_get_month_tabs():
+    class FakeSheetsSpreadsheet:
+        def __init__(self):
+            self.requested_ranges = None
+
+        def values_batch_get(self, ranges):
+            self.requested_ranges = ranges
+            return {"valueRanges": [
+                {"values": [["header"], [f"row-for-{r}"]]} for r in ranges
+            ]}
+
+    sh = FakeSheetsSpreadsheet()
+    result = app._batch_get_month_tabs(sh, ["Jan 26", "Feb 26"])
+    assert sh.requested_ranges == ["Jan 26", "Feb 26"]   # single call, both titles
+    assert result["Jan 26"] == [["header"], ["row-for-Jan 26"]]
+    assert result["Feb 26"] == [["header"], ["row-for-Feb 26"]]
+    assert app._batch_get_month_tabs(sh, []) == {}   # no call for an empty title list
+    print("test_batch_get_month_tabs passed")
+
+
 def test_list_raw_candidates_pagination():
     page1 = {"files": [{"id": "1", "name": "[SOCE 2026]_Daily name list_BTS"}], "nextPageToken": "p2"}
     page2 = {"files": [{"id": "2", "name": "[SOCE 2026]_Daily name list_CYD"}]}
@@ -173,6 +193,10 @@ class FakeSpreadsheetRaw:
 
     def worksheets(self):
         return self._tabs
+
+    def values_batch_get(self, ranges):
+        by_title = {ws.title: ws for ws in self._tabs}
+        return {"valueRanges": [{"values": by_title[title].get_all_values()} for title in ranges]}
 
 
 class FakeCentralSpreadsheet:
@@ -331,6 +355,7 @@ def test_run_sync_throws_when_central_missing():
 if __name__ == "__main__":
     test_parse_raw_title()
     test_to_raw_tab()
+    test_batch_get_month_tabs()
     test_list_raw_candidates_pagination()
     test_retry_succeeds_after_transient_error()
     test_retry_reraises_non_retryable_immediately()
