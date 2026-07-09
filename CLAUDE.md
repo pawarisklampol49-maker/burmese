@@ -157,13 +157,27 @@ file still uses the original per-tab-is-a-month convention (`_is_month_tab`,
 tries `%b %y` then `%B %y`, e.g. "Jun 26" / "July 26"). Year is derived from
 each row's actual date, not trusted from the title.
 
-Central side -- **one spreadsheet per year, auto-created.** Lives inside a
-fixed Central Drive folder (`1oDCnJmwIjedcHNtSyd_Hr-B5HDhZIN4K`), titled
-exactly the year (e.g. `"2027"`). `_find_or_create_central` searches that
-folder for an exact-title match; if none exists, creates one via
-`gc.create(year, folder_id=...)` (needs the full `drive` OAuth scope, not
-`drive.readonly` -- a required upgrade from the original build). Each
-central spreadsheet holds exactly 7 tabs:
+Central side -- **one spreadsheet per year, human-created, service account
+only writes to it.** Lives inside a fixed Central Drive folder
+(`1oDCnJmwIjedcHNtSyd_Hr-B5HDhZIN4K`), titled exactly the year (e.g.
+`"2027"`). `_find_central` searches that folder for an exact-title match and
+throws a clear, actionable error if it's missing -- it does NOT call
+`gc.create()`. **Reversed from the original design (auto-create) after live
+testing:** a bare service account has ~0 Drive storage quota of its own; a
+file it creates is owned by it and fails with "storage quota exceeded"
+regardless of how much space the folder itself has -- confirmed live via a
+real 403. Writing to an already-existing, human-owned file doesn't touch
+that quota at all, so the one remaining manual step per new year is: a human
+duplicates last year's central sheet (or makes a blank one), titles it
+exactly the year, shares it with the service account as Editor -- documented
+in docs/RUNBOOK.md. (If the company's Workspace plan includes Shared
+Drives, auto-create could be restored by putting the Central folder on one --
+Shared Drive files are owned by the Shared Drive itself, not any individual
+account -- untested, not pursued since it's a paid Workspace tier and the
+project's constraint is to stay free.) `drive` scope (not `drive.readonly`)
+is still needed for the write operations `_write_df`/`_find_central` do (and
+originally for `create`, no longer called, but the write scope stays
+required regardless). Each central spreadsheet holds exactly 7 tabs:
   - 4 raw-consolidated department tabs, named exactly `SOCN`/`SOCE`/`SOCW`/
     `FSOCW`, aggregating every vendor file for that department/year. Header
     (user-specified, verbatim): `Date show up | Month show up | Sub-con name
@@ -186,11 +200,9 @@ Dry-run tested end-to-end with Google APIs mocked (`render/test_sync.py`),
 including against the real June BTS CSV content routed through the new
 multi-vendor flow as a single-vendor case -- output matches the
 manually-verified numbers from the earlier diff (378 workers, same buckets).
-**NOT yet tested against real Sheets/Drive API / a real service account** --
-the multi-vendor/multi-year grouping in particular has only ever been
-exercised against synthetic fixtures, since only one real raw file exists
-locally. Do a real `/sync` call and manually check the Central folder before
-trusting the daily schedule.
+The multi-vendor/multi-year grouping is still only exercised against
+synthetic fixtures locally (only one real raw file exists in `source/`) --
+confirmed instead against real data live in production, per real bugs below.
 
 `n8n/socn-daily-sync.json`: Schedule Trigger (daily 06:00) -> HTTP Request
 (POST to the Render URL, httpHeaderAuth credential named "SOCN Sync Token"
@@ -211,6 +223,22 @@ Real bugs found and fixed while building this:
   - `_MONTH_NAME` was a hardcoded dict covering only 2026-03..06; replaced
     with `_month_label()` derived from the month string itself, since this
     automation exists specifically to handle months/years beyond that range.
+  - Found live against real vendor data, in order: (1) วันที่'s display
+    format isn't fixed -- local CSV sample was "01 Jun 26", a live vendor
+    sheet (DSR) actually uses "1-Jan-26" (hyphens, no leading zero); switched
+    to per-element format inference (`format="mixed", dayfirst=True`) instead
+    of a hardcoded strptime pattern. (2) Some vendor exports have a title/
+    banner row above the real header (also DSR) -- `_find_header_row` now
+    scans the first few rows for the one whose columns match the required
+    set, instead of assuming row 0 is always the header; unified `load_raw`
+    and `load_raw_from_values` around this shared detection. (3) Central
+    spreadsheet auto-create hit a real Drive storage-quota wall -- see the
+    Central-side paragraph above; reverted to human-creates/service-account-
+    only-writes.
+  - Raw-load errors originally had no file/tab context, making live failures
+    hard to diagnose without direct Sheets access -- `load_raw_from_values`
+    calls in `run_sync` are now wrapped to prefix errors with the
+    spreadsheet title, tab, department, and vendor.
 
 Deployed 2026-07-08 to Render (`https://burmese-8ere.onrender.com`), pushed
 to `github.com/pawarisklampol49-maker/burmese` (main branch; `render/` as

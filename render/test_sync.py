@@ -136,20 +136,21 @@ class FakeCentralSpreadsheet:
 
 
 class FakeClient:
-    def __init__(self, raw_files):
+    """No create() -- app.py no longer auto-creates central spreadsheets (a bare
+    service account has ~0 Drive storage quota, confirmed live; see _find_central's
+    docstring). Tests must pre-populate `centrals` for the "found" path."""
+
+    def __init__(self, raw_files, centrals=None):
         self._raw_files = raw_files
-        self.centrals = {}
+        self.centrals = centrals or {}
 
     def open_by_key(self, file_id):
-        return self._raw_files[file_id]
+        if file_id in self._raw_files:
+            return self._raw_files[file_id]
+        return self.centrals[file_id]
 
     def list_spreadsheet_files(self, title, folder_id):
         return [{"id": title}] if title in self.centrals else []
-
-    def create(self, title, folder_id):
-        c = FakeCentralSpreadsheet(title)
-        self.centrals[title] = c
-        return c
 
 
 class FakeDriveNoop:
@@ -171,7 +172,8 @@ def test_run_sync_end_to_end_multi_vendor():
         "bts-id": FakeSpreadsheetRaw([FakeWorksheet("Jun 26", bts_values), FakeWorksheet("Notes", [])]),
         "cyd-id": FakeSpreadsheetRaw([FakeWorksheet("Jun 26", cyd_values)]),
     }
-    fake_client = FakeClient(raw_files)
+    # central sheet must already exist -- app.py no longer creates it (quota)
+    fake_client = FakeClient(raw_files, centrals={"2026": FakeCentralSpreadsheet("2026")})
     candidates = [
         {"id": "bts-id", "name": "[SOCE 2026]_Daily name list_BTS"},
         {"id": "cyd-id", "name": "[SOCE 2026]_Daily name list_CYD"},
@@ -239,6 +241,28 @@ def test_run_sync_throws_on_zero_matches():
     print("test_run_sync_throws_on_zero_matches passed")
 
 
+def test_run_sync_throws_when_central_missing():
+    def d(day):
+        return dt.date(2026, 6, day)
+
+    values = _fake_raw_values([("alice", d(1), "IB")])
+    raw_files = {"bts-id": FakeSpreadsheetRaw([FakeWorksheet("Jun 26", values)])}
+    # centrals left empty -- app.py must not try to create one (quota) and
+    # must instead throw a clear, actionable error
+    fake_client = FakeClient(raw_files)
+    candidates = [{"id": "bts-id", "name": "[SOCE 2026]_Daily name list_BTS"}]
+
+    app._clients = lambda: (fake_client, FakeDriveNoop())
+    app._list_raw_candidates = lambda drive: candidates
+    try:
+        app.run_sync()
+        raise AssertionError("expected ValueError for missing central spreadsheet")
+    except ValueError as e:
+        assert "no spreadsheet titled '2026'" in str(e)
+        assert "quota" in str(e)
+    print("test_run_sync_throws_when_central_missing passed")
+
+
 if __name__ == "__main__":
     test_parse_raw_title()
     test_to_raw_tab()
@@ -247,4 +271,5 @@ if __name__ == "__main__":
     test_run_sync_throws_on_unmatched_title()
     test_run_sync_throws_on_unknown_department()
     test_run_sync_throws_on_zero_matches()
+    test_run_sync_throws_when_central_missing()
     print("\nAll sync tests passed.")

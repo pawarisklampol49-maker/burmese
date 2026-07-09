@@ -95,13 +95,26 @@ def _list_raw_candidates(drive) -> list:
     return files
 
 
-def _find_or_create_central(gc: gspread.Client, folder_id: str, year: str) -> gspread.Spreadsheet:
+def _find_central(gc: gspread.Client, folder_id: str, year: str) -> gspread.Spreadsheet:
+    """Find that year's central spreadsheet -- does NOT create one. A bare
+    service account has ~0 Drive storage quota of its own; a file it CREATES
+    is owned by it and fails with "storage quota exceeded" regardless of how
+    much space the folder itself has (confirmed live). Writing to an
+    already-existing, human-created file doesn't touch that quota at all, so
+    that's the one manual step per new year: duplicate last year's central
+    sheet (or create a blank one), title it exactly the year, share it with
+    the service account as Editor. See docs/RUNBOOK.md."""
     matches = gc.list_spreadsheet_files(title=year, folder_id=folder_id)
     if len(matches) > 1:
         raise ValueError(f"{len(matches)} spreadsheets titled '{year}' in the central folder -- ambiguous")
-    if matches:
-        return gc.open_by_key(matches[0]["id"])
-    return gc.create(year, folder_id=folder_id)
+    if not matches:
+        raise ValueError(
+            f"no spreadsheet titled '{year}' in the central folder -- a service account can't "
+            f"create one there itself (Drive storage quota is tied to the service account, not "
+            f"the folder). Create '{year}' there manually (e.g. duplicate last year's sheet) and "
+            f"share it with the service account as Editor, then re-run"
+        )
+    return gc.open_by_key(matches[0]["id"])
 
 
 def _to_raw_tab(df: pd.DataFrame) -> pd.DataFrame:
@@ -181,7 +194,7 @@ def run_sync() -> dict:
         if dup:
             raise ValueError(f"{year}: {dup} duplicate (name,date) rows across department/vendor files")
 
-        central = _find_or_create_central(gc, central_folder_id, year)
+        central = _find_central(gc, central_folder_id, year)
 
         for dept in sorted(known_departments):
             dept_rows = combined[combined["department"] == dept]

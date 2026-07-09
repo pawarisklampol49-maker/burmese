@@ -8,12 +8,18 @@ Every day at 6am, a small automated service reads every worker attendance file a
 
 ## What you never need to do manually
 
-- **A new year starting (e.g. 2027 begins):** nothing. The first time the sync finds 2027 data, it automatically creates a brand-new "2027" spreadsheet in the Central folder with the right layout.
-- **A new staffing vendor's file added for an existing department:** nothing, as long as it's named and shared correctly (see the one rule below). It just gets folded into that department's numbers on the next daily run.
+- **A new staffing vendor's file added for an existing department:** nothing beyond the one rule below (naming + sharing). It just gets folded into that department's numbers on the next daily run.
 
-## The one rule you do need to follow
+## The two things you DO need to do by hand
 
-When a new raw attendance file needs to be added (a new vendor, or a new year's file for an existing vendor), it must be:
+**1. Each new year, create that year's central spreadsheet once.** Google won't let the automated service create it itself (a technical quota limit, not a bug) — so:
+
+- In the **Central** Drive folder, duplicate the previous year's spreadsheet (or make a new blank Google Sheet).
+- Title it **exactly the year**, e.g. `2027`.
+- Share it with the service account as **Editor** (same email as below).
+- After that, the daily sync fills in all 7 tabs automatically for the rest of that year — this is a once-a-year, one-minute task.
+
+**2. Every new raw attendance file** (a new vendor, or a new year's file for an existing vendor) must be:
 
 1. **A real Google Sheet** (File → New → Google Sheets, or a copy of an existing one) — not a CSV file just sitting in Drive.
 2. **Named exactly like this:** `[DEPARTMENT YEAR]_Daily name list_VENDOR`
@@ -25,7 +31,7 @@ When a new raw attendance file needs to be added (a new vendor, or a new year's 
 3. **Have one tab per month** inside it, named like `Jun 26` or `July 26`.
 4. **Shared with the service account** as an **Editor**: `<ask the developer for the service-account email if you don't already have it>`.
 
-If a file is missing any of these, the daily sync will fail loudly (not silently produce wrong numbers) — see "if the daily run fails" below.
+If a file (or the year's central spreadsheet) is missing any of this, the daily sync will fail loudly (not silently produce wrong numbers) — see "if the daily run fails" below.
 
 ## Where results live
 
@@ -44,6 +50,7 @@ Open the **Central** Drive folder. Inside it, one spreadsheet per year, named ju
    - *"doesn't match the expected pattern"* — a file was found but its name doesn't exactly follow the `[DEPARTMENT YEAR]_Daily name list_VENDOR` format. Fix the name.
    - *"unrecognized department"* — a file's department code isn't one of SOCN/SOCE/SOCW/FSOCW. Check for a typo in the file name.
    - *"duplicate (name,date) rows"* — the same worker appears on the same date in two different vendor files for the same department. This needs a human to look at the source data and figure out which one is right.
+   - *"no spreadsheet titled '2027' ... create it manually"* — that year's central spreadsheet doesn't exist yet. Do step 1 under "The two things you DO need to do by hand" above.
 3. You can also check `https://<the Render URL>/health` in a browser — if that doesn't load at all, the service itself is down (not a data problem), and that's a developer question.
 4. When escalating to the developer, copy the exact error message from n8n's execution log — it's specific on purpose.
 
