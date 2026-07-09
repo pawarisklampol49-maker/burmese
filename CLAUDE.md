@@ -439,6 +439,23 @@ Real bugs found and fixed while building this:
     confirmed bottleneck (the actual crash was always inside
     `get_all_values()`), so this was scoped to the fix with evidence behind
     it rather than batching everything preemptively.
+  - Write-side batching followed one run later: even with batched reads, a
+    live run took ~19 minutes across n8n retries and still timed out. The
+    write side was making ~4 sequential calls per tab (exists-check /
+    open-or-create / clear / update = ~28 per year). Replaced `_write_df`
+    (per-tab) with `_write_tabs` (all 7 tabs of one central spreadsheet in
+    4-5 calls total): one `worksheets()` listing, one `batch_update` that
+    both adds missing tabs and RESIZES existing ones (values:batchUpdate
+    does not grow a sheet's grid -- writing more rows than the tab has
+    would fail with "exceeds grid limits"; the old per-tab path sized tabs
+    only at creation, a latent bug once data outgrew day one), one
+    `values_batch_clear`, then two `values_batch_update` calls -- two, not
+    one, because a values:batchUpdate carries a single valueInputOption and
+    the dept tabs need RAW while summary tabs need USER_ENTERED (see the
+    apostrophe bug above). Sheet titles in A1 ranges are single-quoted with
+    '' escaping via `_quoted_range`. `FakeCentralSpreadsheet` in
+    test_sync.py now speaks this batched API and records written values per
+    tab, so all existing assertions still hold.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no

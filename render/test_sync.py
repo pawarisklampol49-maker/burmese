@@ -171,20 +171,17 @@ def test_list_raw_candidates_pagination():
 
 # ---------------------------------------------------------------- end-to-end mock
 class FakeWorksheet:
+    _next_id = 0
+
     def __init__(self, title, values=None):
         self.title = title
         self._values = values or []
         self.written = None
+        FakeWorksheet._next_id += 1
+        self.id = FakeWorksheet._next_id
 
     def get_all_values(self):
         return self._values
-
-    def clear(self):
-        pass
-
-    def update(self, values, raw=True):
-        self.written = values
-        self.raw = raw
 
 
 class FakeSpreadsheetRaw:
@@ -199,7 +196,18 @@ class FakeSpreadsheetRaw:
         return {"valueRanges": [{"values": by_title[title].get_all_values()} for title in ranges]}
 
 
+def _range_title(range_str):
+    """'SOCE'!A1 or 'SOCE' -> SOCE (undo app._quoted_range)."""
+    quoted = range_str.split("!")[0]
+    assert quoted.startswith("'") and quoted.endswith("'"), f"unquoted range: {range_str}"
+    return quoted[1:-1].replace("''", "'")
+
+
 class FakeCentralSpreadsheet:
+    """Speaks the batched write API app._write_tabs actually uses
+    (batch_update / values_batch_clear / values_batch_update), recording
+    written values per tab so tests can keep asserting via worksheet(name)."""
+
     def __init__(self, id_):
         self.id = id_
         self._tabs = {}
@@ -210,10 +218,28 @@ class FakeCentralSpreadsheet:
     def worksheet(self, name):
         return self._tabs[name]
 
-    def add_worksheet(self, name, rows, cols):
-        ws = FakeWorksheet(name)
-        self._tabs[name] = ws
-        return ws
+    def batch_update(self, body):
+        for req in body["requests"]:
+            if "addSheet" in req:
+                title = req["addSheet"]["properties"]["title"]
+                self._tabs[title] = FakeWorksheet(title)
+            elif "updateSheetProperties" in req:
+                sheet_id = req["updateSheetProperties"]["properties"]["sheetId"]
+                assert any(ws.id == sheet_id for ws in self._tabs.values()), \
+                    f"resize for unknown sheetId {sheet_id}"
+            else:
+                raise AssertionError(f"unexpected batch_update request: {req}")
+
+    def values_batch_clear(self, params=None, body=None):
+        for r in body["ranges"]:
+            self._tabs[_range_title(r)].written = None
+
+    def values_batch_update(self, body):
+        raw = {"RAW": True, "USER_ENTERED": False}[body["valueInputOption"]]
+        for entry in body["data"]:
+            ws = self._tabs[_range_title(entry["range"])]
+            ws.written = entry["values"]
+            ws.raw = raw
 
 
 class FakeClient:

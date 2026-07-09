@@ -159,19 +159,59 @@ def _batch_get_month_tabs(sh: gspread.Spreadsheet, titles: list) -> dict:
     return {title: vr.get("values", []) for title, vr in zip(titles, value_ranges)}
 
 
-def _write_df(spreadsheet: gspread.Spreadsheet, tab: str, df: pd.DataFrame, raw: bool = True) -> None:
-    """raw=True (default) writes every cell as literal text -- required for
+def _quoted_range(title: str, cell: str = "") -> str:
+    """A1-notation range for a whole tab (or a start cell in it), with the
+    sheet title single-quoted per Sheets syntax ('' escapes a literal ')."""
+    quoted = "'" + title.replace("'", "''") + "'"
+    return f"{quoted}!{cell}" if cell else quoted
+
+
+def _write_tabs(spreadsheet: gspread.Spreadsheet, tabs: list) -> None:
+    """tabs: list of (title, df, raw). Writes ALL tabs of one central
+    spreadsheet in 4-5 API calls total, instead of ~4 calls per tab
+    (exists-check/open-or-create/clear/update) -- the write-side counterpart
+    of _batch_get_month_tabs, done after live timeouts showed total call
+    count (not per-call slowness) is what makes /sync outgrow any timeout.
+
+    raw=True tabs are written with Sheets' RAW input option -- required for
     the 4 department tabs, which carry IDs (Shift_id, team) that must not be
     silently reinterpreted as numbers (e.g. a leading zero getting dropped).
-    raw=False (Sheets' USER_ENTERED mode) is for the numeric summary tabs, so
-    counts/percentages land as real numbers instead of text Sheets flags with
-    a leading apostrophe."""
-    existing = [w.title for w in _retry(spreadsheet.worksheets)]
-    ws = _retry(spreadsheet.worksheet, tab) if tab in existing \
-        else _retry(spreadsheet.add_worksheet, tab, rows=max(len(df) + 10, 50), cols=max(len(df.columns) + 5, 20))
-    _retry(ws.clear)
-    values = [[str(c) for c in df.columns]] + df.astype(str).values.tolist()
-    _retry(ws.update, values, raw=raw)
+    raw=False tabs use USER_ENTERED, so the summary tabs' counts/percentages
+    land as real numbers instead of text Sheets flags with a leading
+    apostrophe. One values:batchUpdate call carries one valueInputOption, so
+    the two groups are two calls.
+
+    Existing tabs are resized (not just cleared) to fit the new data --
+    values:batchUpdate does NOT grow a sheet's grid, so writing more rows
+    than the tab currently has would otherwise fail with 'exceeds grid
+    limits'."""
+    dims = {title: (max(len(df) + 10, 50), max(len(df.columns) + 5, 20)) for title, df, _ in tabs}
+    existing = {ws.title: ws.id for ws in _retry(spreadsheet.worksheets)}
+
+    requests = []
+    for title, df, _ in tabs:
+        rows, cols = dims[title]
+        grid = {"rowCount": rows, "columnCount": cols}
+        if title in existing:
+            requests.append({"updateSheetProperties": {
+                "properties": {"sheetId": existing[title], "gridProperties": grid},
+                "fields": "gridProperties.rowCount,gridProperties.columnCount",
+            }})
+        else:
+            requests.append({"addSheet": {"properties": {"title": title, "gridProperties": grid}}})
+    _retry(spreadsheet.batch_update, {"requests": requests})
+
+    _retry(spreadsheet.values_batch_clear, body={"ranges": [_quoted_range(t) for t, _, _ in tabs]})
+
+    for input_option, group in (("RAW", [t for t in tabs if t[2]]),
+                                ("USER_ENTERED", [t for t in tabs if not t[2]])):
+        if not group:
+            continue
+        data = [{
+            "range": _quoted_range(title, "A1"),
+            "values": [[str(c) for c in df.columns]] + df.astype(str).values.tolist(),
+        } for title, df, _ in group]
+        _retry(spreadsheet.values_batch_update, body={"valueInputOption": input_option, "data": data})
 
 
 def run_sync() -> dict:
@@ -241,16 +281,18 @@ def run_sync() -> dict:
 
         central = _find_central(gc, central_folder_id, year)
 
-        for dept in sorted(known_departments):
-            dept_rows = combined[combined["department"] == dept]
-            _write_df(central, dept, _to_raw_tab(dept_rows))
-
         counts, pct = engine.showup_block(combined)
         pct_renamed = pct.add_suffix(" %")
         showup = pd.concat([counts, pct_renamed], axis=1).reset_index(names="bucket")
-        _write_df(central, "Summary_1", showup, raw=False)
-        _write_df(central, "Summary_Rotation", engine.rotation_summary(combined), raw=False)
-        _write_df(central, "Summary_5", engine.streak_month_crosstab(combined), raw=False)
+
+        tabs = [(dept, _to_raw_tab(combined[combined["department"] == dept]), True)
+                for dept in sorted(known_departments)]
+        tabs += [
+            ("Summary_1", showup, False),
+            ("Summary_Rotation", engine.rotation_summary(combined), False),
+            ("Summary_5", engine.streak_month_crosstab(combined), False),
+        ]
+        _write_tabs(central, tabs)
 
         year_results[year] = {
             "spreadsheet_id": central.id,
