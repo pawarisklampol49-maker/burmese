@@ -29,7 +29,7 @@
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {
-          "timeout": 180000
+          "timeout": 340000
         }
       },
       "id": "http-request-1",

@@ -121,12 +121,18 @@ def _to_raw_tab(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=RAW_TAB_COLUMNS)[list(RAW_TAB_COLUMNS.values())]
 
 
-def _write_df(spreadsheet: gspread.Spreadsheet, tab: str, df: pd.DataFrame) -> None:
+def _write_df(spreadsheet: gspread.Spreadsheet, tab: str, df: pd.DataFrame, raw: bool = True) -> None:
+    """raw=True (default) writes every cell as literal text -- required for
+    the 4 department tabs, which carry IDs (Shift_id, team) that must not be
+    silently reinterpreted as numbers (e.g. a leading zero getting dropped).
+    raw=False (Sheets' USER_ENTERED mode) is for the numeric summary tabs, so
+    counts/percentages land as real numbers instead of text Sheets flags with
+    a leading apostrophe."""
     ws = spreadsheet.worksheet(tab) if tab in [w.title for w in spreadsheet.worksheets()] \
         else spreadsheet.add_worksheet(tab, rows=max(len(df) + 10, 50), cols=max(len(df.columns) + 5, 20))
     ws.clear()
     values = [[str(c) for c in df.columns]] + df.astype(str).values.tolist()
-    ws.update(values)
+    ws.update(values, raw=raw)
 
 
 def run_sync() -> dict:
@@ -203,9 +209,9 @@ def run_sync() -> dict:
         counts, pct = engine.showup_block(combined)
         pct_renamed = pct.add_suffix(" %")
         showup = pd.concat([counts, pct_renamed], axis=1).reset_index(names="bucket")
-        _write_df(central, "Summary_1", showup)
-        _write_df(central, "Summary_Rotation", engine.rotation_summary(combined))
-        _write_df(central, "Summary_5", engine.streak_month_crosstab(combined))
+        _write_df(central, "Summary_1", showup, raw=False)
+        _write_df(central, "Summary_Rotation", engine.rotation_summary(combined), raw=False)
+        _write_df(central, "Summary_5", engine.streak_month_crosstab(combined), raw=False)
 
         year_results[year] = {
             "spreadsheet_id": central.id,

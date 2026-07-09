@@ -106,8 +106,9 @@ class FakeWorksheet:
     def clear(self):
         pass
 
-    def update(self, values):
+    def update(self, values, raw=True):
         self.written = values
+        self.raw = raw
 
 
 class FakeSpreadsheetRaw:
@@ -202,6 +203,14 @@ def test_run_sync_end_to_end_multi_vendor():
     # a known department with zero rows this year still gets a header-only tab
     socn_written = central.worksheet("SOCN").written
     assert socn_written == [list(app.RAW_TAB_COLUMNS.values())]
+
+    # raw tabs write as literal text (IDs must not be reinterpreted as numbers);
+    # summary tabs write as USER_ENTERED (so counts land as real numbers, not
+    # apostrophe-prefixed text)
+    assert central.worksheet("SOCE").raw is True
+    assert central.worksheet("Summary_1").raw is False
+    assert central.worksheet("Summary_Rotation").raw is False
+    assert central.worksheet("Summary_5").raw is False
 
     print("test_run_sync_end_to_end_multi_vendor passed")
 
