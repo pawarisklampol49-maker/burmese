@@ -180,6 +180,14 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"missing required raw columns: {sorted(missing)}")
 
     df = raw[raw["ค้นหา"].notna()].copy()
+    # Confirmed live: [SOCE 2026]_Daily name list_SPT, tab 'Mar 26' had the
+    # header row accidentally pasted twice (rows 1 and 2), so after the real
+    # header is correctly identified, the SECOND header copy shows up as a
+    # data row -- ค้นหา literally == "ค้นหา", วันที่ literally == "วันที่", etc.
+    # No real worker is named "ค้นหา", so this one check safely drops the
+    # duplicate without adopting a general "drop anything unparseable" rule,
+    # which would also hide a genuine data-entry typo that deserves a human.
+    df = df[df["ค้นหา"] != "ค้นหา"]
     df["team"] = _clear_sheets_errors(df["team"])
 
     # วันที่'s display format varies by source (local CSV export: "01 Jun 26";
@@ -507,6 +515,20 @@ def _test_corrupted_date_header_repaired():
     print("_test_corrupted_date_header_repaired passed")
 
 
+def _test_duplicate_header_row_dropped():
+    """Confirmed live: [SOCE 2026]_Daily name list_SPT, tab 'Mar 26' -- the
+    header was accidentally pasted twice, so the second copy shows up as a
+    data row (ค้นหา literally == 'ค้นหา'). Must be dropped, not thrown on --
+    but only via this exact signal, not a general 'drop anything
+    unparseable' rule."""
+    header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    dup_header_row = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    real_row = ["9 Mar 26", "amy", "09:00", "Inbound", "2026-03-09", "SITE", "SH-1", "IB"]
+    out = _clean_raw(_rows_to_raw_df([header, dup_header_row, real_row]))
+    assert len(out) == 1 and out.iloc[0]["name"] == "amy"
+    print("_test_duplicate_header_row_dropped passed")
+
+
 def _test_sheets_error_sentinels_general():
     """The sentinel normalization isn't specific to one column/value -- any
     known Excel/Sheets error string, in either date column or in team,
@@ -571,6 +593,7 @@ def _run_tests():
     _test_blank_placeholder_row_dropped()
     _test_garbled_clockin_tolerated()
     _test_corrupted_date_header_repaired()
+    _test_duplicate_header_row_dropped()
     df = _synthetic()
     c, _ = showup_block(df)
     assert c.loc["1-5", "Mar"] == 6 and c.loc["6-10", "Mar"] == 1 and c.loc["11-15", "Mar"] == 1

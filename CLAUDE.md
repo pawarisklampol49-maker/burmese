@@ -344,6 +344,17 @@ Real bugs found and fixed while building this:
     still matches, use it" is enforced structurally by the existing strict
     date parsing, not a separate check. Covered by
     `_test_corrupted_date_header_repaired`.
+  - `[SOCE 2026]_Daily name list_SPT`, tab `Mar 26`: the header row was
+    accidentally pasted twice (rows 1 and 2), so once the real header is
+    identified, the second copy shows up as a plain data row and blows up
+    date parsing ("Unknown datetime string format, unable to parse: วันที่").
+    User asked for a general "drop any row that doesn't match the format"
+    rule; deliberately scoped narrower than that -- a blanket
+    drop-on-parse-failure would also hide a genuine data-entry typo that
+    deserves a human's attention. Instead, `_clean_raw` drops a row only
+    when ค้นหา literally equals `"ค้นหา"` (the header's own label -- no real
+    worker is named that), which is exactly the duplicate-header signature
+    and nothing else. Covered by `_test_duplicate_header_row_dropped`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no
