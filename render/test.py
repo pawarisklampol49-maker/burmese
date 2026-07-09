@@ -201,7 +201,17 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
         "clockin": df["เข้างาน"],
         "shift_name": shift,
         "shift_id": df["Shift_id"],
-        "_clocksort": pd.to_datetime(df["เข้างาน"], format="%H:%M", errors="raise"),
+        # เข้างาน isn't load-bearing for a show-up day at all (no clock-in
+        # filter on the core metric) -- it's only read here to break ties
+        # when the SAME worker has two different teams on the SAME date.
+        # Confirmed live: [SOCE 2026]_Daily name list_CYD, tab 'Mar 26' had
+        # a garbled value ("$0.88" -- looks like a different column's data
+        # leaked in via a broken formula) that isn't a time at all. coerce
+        # instead of raise: an unparseable clock-in sorts last (pandas'
+        # default NaT ordering), so it naturally loses a tie to a row with a
+        # real time, and only matters at all for the rare collision case --
+        # the raw string is preserved as-is in `clockin` regardless.
+        "_clocksort": pd.to_datetime(df["เข้างาน"], format="%H:%M", errors="coerce"),
     })
     out = out.sort_values("_clocksort").drop_duplicates(subset=["name", "date"], keep="first")
     out = out.drop(columns="_clocksort").reset_index(drop=True)
@@ -465,10 +475,28 @@ def _test_blank_placeholder_row_dropped():
     print("_test_blank_placeholder_row_dropped passed")
 
 
+def _test_garbled_clockin_tolerated():
+    """เข้างาน isn't load-bearing for a show-up day -- a garbled value like
+    '$0.88' (confirmed live, CYD 'Mar 26') must not crash the whole sync,
+    and must still lose a same-day dedup tie-break to a row with a real
+    clock-in time."""
+    header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    solo = ["9 Jul 26", "amy", "$0.88", "Inbound", "2026-07-09", "SITE", "SH-1", "IB"]
+    out = _clean_raw(_rows_to_raw_df([header, solo]))
+    assert len(out) == 1 and out.iloc[0]["clockin"] == "$0.88"
+
+    garbled = ["9 Jul 26", "ben", "$0.88", "Inbound", "2026-07-09", "SITE", "SH-2", "IB"]
+    real = ["9 Jul 26", "ben", "08:00", "Outbound", "2026-07-09", "SITE", "SH-3", "OBD"]
+    out2 = _clean_raw(_rows_to_raw_df([header, garbled, real]))
+    assert len(out2) == 1 and out2.iloc[0]["team"] == "OBD"   # real clock-in wins the tie
+    print("_test_garbled_clockin_tolerated passed")
+
+
 def _run_tests():
     _test_ref_date_fallback()
     _test_sheets_error_sentinels_general()
     _test_blank_placeholder_row_dropped()
+    _test_garbled_clockin_tolerated()
     df = _synthetic()
     c, _ = showup_block(df)
     assert c.loc["1-5", "Mar"] == 6 and c.loc["6-10", "Mar"] == 1 and c.loc["11-15", "Mar"] == 1

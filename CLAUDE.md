@@ -315,6 +315,18 @@ Real bugs found and fixed while building this:
     while other fields are populated still throws (a real worked shift with
     an unknown date is a genuine gap, not a placeholder to silently
     discard). Covered by `_test_blank_placeholder_row_dropped`.
+  - Same vendor, tab `Mar 26`: เข้างาน (clock-in) had a garbled value
+    (`"$0.88"` -- looks like a different column's data leaked in via a
+    broken formula, not a broken-formula sentinel like `#REF!`/`#N/A`).
+    Unlike team/date, clock-in genuinely isn't load-bearing for the core
+    show-up-day metric (see "Input" section above: "No clock-in filter" --
+    it's only read here to break ties when one worker has two different
+    teams on the same date). Changed `_clocksort`'s `pd.to_datetime(...,
+    errors="raise")` to `errors="coerce")` -- an unparseable clock-in
+    becomes NaT, sorts last, and so naturally loses a same-day tie-break to
+    a row with a real time; the raw string is still preserved as-is in the
+    `clockin` output column regardless. Covered by
+    `_test_garbled_clockin_tolerated`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no
