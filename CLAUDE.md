@@ -456,6 +456,19 @@ Real bugs found and fixed while building this:
     '' escaping via `_quoted_range`. `FakeCentralSpreadsheet` in
     test_sync.py now speaks this batched API and records written values per
     tab, so all existing assertions still hold.
+  - Regression from the batched read (found next live run): the Sheets API
+    batchGet endpoint returns RAGGED rows -- trailing empty cells trimmed
+    per row, and a data row can even run WIDER than the header when there's
+    stray data past the schema -- unlike `get_all_values`, which
+    rectangularizes. `[SOCE 2026]_Daily name list_PPO`, tab `Jul 26` had a
+    29-column data row against a 22-column header, crashing DataFrame
+    construction ("22 columns passed, passed data had 29 columns"). The
+    batch optimization was meant to be purely a perf change, so
+    `_rows_to_raw_df` now normalizes every row to a common max width first
+    (pad short rows, widen the header for over-long ones -- extra
+    beyond-schema columns become unused, nameless columns), reproducing
+    exactly the rectangular grid `get_all_values` used to hand it. Covered
+    by `_test_ragged_rows_normalized`.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no

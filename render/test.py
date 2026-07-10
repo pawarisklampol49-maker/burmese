@@ -152,13 +152,25 @@ def _resolve_header(row: list) -> list:
 
 def _rows_to_raw_df(rows: list) -> pd.DataFrame:
     """rows: list of row-lists (all strings, header position not yet known).
-    Locates the real header row, builds the raw (uncleaned) frame for _clean_raw."""
+    Locates the real header row, builds the raw (uncleaned) frame for _clean_raw.
+
+    Normalizes every row to one common width first. The Sheets API batchGet
+    endpoint (used by the batched read in app.py) returns RAGGED rows --
+    trailing empty cells trimmed per row, and a data row can even run WIDER
+    than the header when there's stray data past the schema -- unlike
+    gspread's get_all_values, which rectangularizes. A row wider than the
+    header would otherwise crash DataFrame construction ("N columns passed,
+    passed data had M columns"); a row narrower would misalign. Padding
+    header and data alike to the max width reproduces exactly what
+    get_all_values used to hand us: extra beyond-schema columns become
+    unused, nameless columns, and the required columns still line up."""
     if not rows:
         raise ValueError("empty sheet -- no header row")
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
     header_idx = _find_header_row(rows)
     header = _resolve_header(rows[header_idx])
-    data = [r + [""] * (len(header) - len(r)) for r in rows[header_idx + 1:]]
-    return pd.DataFrame(data, columns=header).replace("", pd.NA)
+    return pd.DataFrame(rows[header_idx + 1:], columns=header).replace("", pd.NA)
 
 
 def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
@@ -581,6 +593,26 @@ def _test_corrupted_date_header_repaired():
     print("_test_corrupted_date_header_repaired passed")
 
 
+def _test_ragged_rows_normalized():
+    """Confirmed live: [SOCE 2026]_Daily name list_PPO, tab 'Jul 26' -- the
+    Sheets API batchGet endpoint returns ragged rows (unlike get_all_values),
+    and one data row ran WIDER than the header (29 vs 22 cols) from stray
+    data past the schema, crashing DataFrame construction. _rows_to_raw_df
+    must rectangularize -- pad short rows AND widen the header for over-long
+    ones (extra columns are outside the schema and unused)."""
+    header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    wider = ["9 Jul 26", "amy", "09:00", "Inbound", "2026-07-09", "SITE", "SH-1", "IB",
+             "junk1", "junk2", "junk3"]   # 3 cols past the 8-col header
+    shorter = ["10 Jul 26", "ben", "09:00", "Inbound", "2026-07-10", "SITE", "SH-2"]  # missing team
+    out = _clean_raw(_rows_to_raw_df([header, wider, shorter]))
+    teams = out.set_index("name")["team"]
+    assert teams["amy"] == "IB"
+    # ben's team cell was trimmed off entirely -> NA -> learned from amy's
+    # Inbound row (same shift name), proving alignment held after widening
+    assert teams["ben"] == "IB"
+    print("_test_ragged_rows_normalized passed")
+
+
 def _test_duplicate_header_row_dropped():
     """Confirmed live: [SOCE 2026]_Daily name list_SPT, tab 'Mar 26' -- the
     header was accidentally pasted twice, so the second copy shows up as a
@@ -722,6 +754,7 @@ def _run_tests():
     _test_blank_placeholder_row_dropped()
     _test_garbled_clockin_tolerated()
     _test_corrupted_date_header_repaired()
+    _test_ragged_rows_normalized()
     _test_duplicate_header_row_dropped()
     _test_team_learned_from_shift_name()
     _test_fsoce_hardcoded_fallback_when_unlearnable()
