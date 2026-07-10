@@ -166,52 +166,69 @@ def _quoted_range(title: str, cell: str = "") -> str:
     return f"{quoted}!{cell}" if cell else quoted
 
 
-def _write_tabs(spreadsheet: gspread.Spreadsheet, tabs: list) -> None:
-    """tabs: list of (title, df, raw). Writes ALL tabs of one central
-    spreadsheet in 4-5 API calls total, instead of ~4 calls per tab
-    (exists-check/open-or-create/clear/update) -- the write-side counterpart
-    of _batch_get_month_tabs, done after live timeouts showed total call
-    count (not per-call slowness) is what makes /sync outgrow any timeout.
+_SUMMARY_TABS = ["Summary_1", "Summary_Rotation", "Summary_5"]
+_DEFAULT_GRID = {"rowCount": 1000, "columnCount": 26}
 
-    raw=True tabs are written with Sheets' RAW input option -- required for
-    the 4 department tabs, which carry IDs (Shift_id, team) that must not be
-    silently reinterpreted as numbers (e.g. a leading zero getting dropped).
-    raw=False tabs use USER_ENTERED, so the summary tabs' counts/percentages
-    land as real numbers instead of text Sheets flags with a leading
-    apostrophe. One values:batchUpdate call carries one valueInputOption, so
-    the two groups are two calls.
 
-    Existing tabs are resized (not just cleared) to fit the new data --
-    values:batchUpdate does NOT grow a sheet's grid, so writing more rows
-    than the tab currently has would otherwise fail with 'exceeds grid
-    limits'."""
-    dims = {title: (max(len(df) + 10, 50), max(len(df.columns) + 5, 20)) for title, df, _ in tabs}
+def _prepare_central(spreadsheet: gspread.Spreadsheet, dept_names: list) -> None:
+    """Reset one year's central spreadsheet to a known-empty 7-tab shape and
+    write the 4 department headers, in ~4 API calls -- done once per year,
+    before any streamed department-row appends. The department tabs are then
+    grown row-by-row via values.append (which auto-extends the grid), so we
+    never have to hold a whole year's raw rows in memory to size or write
+    them (the free-tier 512MB OOM this streaming design exists to avoid).
+    Summary tabs are created here but written at the end from the slim
+    {name,date,team} slice."""
+    all_titles = list(dept_names) + _SUMMARY_TABS
     existing = {ws.title: ws.id for ws in _retry(spreadsheet.worksheets)}
 
     requests = []
-    for title, df, _ in tabs:
-        rows, cols = dims[title]
-        grid = {"rowCount": rows, "columnCount": cols}
+    for title in all_titles:
         if title in existing:
             requests.append({"updateSheetProperties": {
-                "properties": {"sheetId": existing[title], "gridProperties": grid},
+                "properties": {"sheetId": existing[title], "gridProperties": _DEFAULT_GRID},
                 "fields": "gridProperties.rowCount,gridProperties.columnCount",
             }})
         else:
-            requests.append({"addSheet": {"properties": {"title": title, "gridProperties": grid}}})
+            requests.append({"addSheet": {"properties": {"title": title, "gridProperties": _DEFAULT_GRID}}})
     _retry(spreadsheet.batch_update, {"requests": requests})
 
-    _retry(spreadsheet.values_batch_clear, body={"ranges": [_quoted_range(t) for t, _, _ in tabs]})
+    _retry(spreadsheet.values_batch_clear, body={"ranges": [_quoted_range(t) for t in all_titles]})
 
-    for input_option, group in (("RAW", [t for t in tabs if t[2]]),
-                                ("USER_ENTERED", [t for t in tabs if not t[2]])):
-        if not group:
-            continue
-        data = [{
+    header = list(RAW_TAB_COLUMNS.values())
+    _retry(spreadsheet.values_batch_update, body={
+        "valueInputOption": "RAW",
+        "data": [{"range": _quoted_range(d, "A1"), "values": [header]} for d in dept_names],
+    })
+
+
+def _append_dept_rows(spreadsheet: gspread.Spreadsheet, dept: str, df: pd.DataFrame) -> None:
+    """Append one vendor file's rows to a department tab (RAW input option --
+    IDs like Shift_id/team must not be reinterpreted as numbers). One call
+    per vendor file; the caller releases the vendor frame right after, so raw
+    rows never all coexist in memory. INSERT_ROWS grows the sheet grid as
+    needed, so the modest _DEFAULT_GRID set in _prepare_central is fine."""
+    if df.empty:
+        return
+    values = df.astype(str).values.tolist()
+    _retry(spreadsheet.values_append,
+           _quoted_range(dept, "A1"),
+           {"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+           {"values": values})
+
+
+def _write_summary_tabs(spreadsheet: gspread.Spreadsheet, tabs: list) -> None:
+    """Write the 3 summary tabs (title, df) in one USER_ENTERED batch, so
+    counts/percentages land as real numbers rather than apostrophe-prefixed
+    text. They're tiny (per-month / per-team rows) and comfortably fit the
+    _DEFAULT_GRID from _prepare_central, so no resize is needed."""
+    _retry(spreadsheet.values_batch_update, body={
+        "valueInputOption": "USER_ENTERED",
+        "data": [{
             "range": _quoted_range(title, "A1"),
             "values": [[str(c) for c in df.columns]] + df.astype(str).values.tolist(),
-        } for title, df, _ in group]
-        _retry(spreadsheet.values_batch_update, body={"valueInputOption": input_option, "data": data})
+        } for title, df in tabs],
+    })
 
 
 def run_sync() -> dict:
@@ -244,13 +261,30 @@ def run_sync() -> dict:
             "check that they're shared with the service account"
         )
 
-    frames_by_year = defaultdict(list)
+    # Streamed to stay under Render free tier's 512MB: the heavy raw rows
+    # (all columns) are appended to each department tab per vendor file and
+    # released immediately, so they never all coexist in memory. Only the
+    # slim {name,date,team} slice is accumulated for the whole year -- that's
+    # all the 3 summary tabs' engine functions need, and it's small even for
+    # hundreds of thousands of worker-days.
+    dept_names = sorted(known_departments)
+    central_by_year = {}                  # year -> prepared central spreadsheet
+    slim_by_year = defaultdict(list)      # year -> list of slim {name,date,team} frames
+    depts_by_year = defaultdict(set)      # year -> departments that had data
     file_report = []
+
+    def _central_for(year):
+        if year not in central_by_year:
+            central = _find_central(gc, central_folder_id, year)
+            _prepare_central(central, dept_names)
+            central_by_year[year] = central
+        return central_by_year[year]
+
     for dept, vendor, declared_year, file_id, title in parsed_files:
         sh = _retry(gc.open_by_key, file_id)
         month_titles = [ws.title for ws in _retry(sh.worksheets) if _is_month_tab(ws.title)]
         values_by_title = _batch_get_month_tabs(sh, month_titles)
-        matched_tabs = []
+        vendor_frames, matched_tabs = [], []
         for tab_title in month_titles:
             values = values_by_title.get(tab_title, [])
             if not values:
@@ -260,10 +294,9 @@ def run_sync() -> dict:
             except Exception as e:
                 raise ValueError(f"'{title}' tab '{tab_title}' (dept={dept}, vendor={vendor}): {e}") from e
             clean["department"], clean["vendor"] = dept, vendor
-            years = pd.to_datetime(clean["date"]).dt.year.astype(str)
-            for yr in years.unique():
-                frames_by_year[yr].append(clean[years == yr])
+            vendor_frames.append(clean)
             matched_tabs.append(tab_title)
+        del values_by_title
         if not matched_tabs:
             raise ValueError(
                 f"'{title}' (dept={dept}, vendor={vendor}) matched raw discovery but has no "
@@ -272,34 +305,38 @@ def run_sync() -> dict:
         file_report.append({"title": title, "department": dept, "vendor": vendor,
                              "declared_year": declared_year, "tabs": matched_tabs})
 
+        vendor_df = pd.concat(vendor_frames, ignore_index=True)
+        del vendor_frames
+        vendor_df["_year"] = pd.to_datetime(vendor_df["date"]).dt.year.astype(str)
+        for year, ydf in vendor_df.groupby("_year"):
+            central = _central_for(year)
+            _append_dept_rows(central, dept, _to_raw_tab(ydf))
+            slim_by_year[year].append(ydf[["name", "date", "team"]].copy())
+            depts_by_year[year].add(dept)
+        del vendor_df
+
     year_results = {}
-    for year, frames in sorted(frames_by_year.items()):
-        combined = pd.concat(frames, ignore_index=True)
-        dup = combined.duplicated(subset=["name", "date"]).sum()
+    for year in sorted(central_by_year):
+        slim = pd.concat(slim_by_year[year], ignore_index=True)
+        dup = slim.duplicated(subset=["name", "date"]).sum()
         if dup:
             raise ValueError(f"{year}: {dup} duplicate (name,date) rows across department/vendor files")
 
-        central = _find_central(gc, central_folder_id, year)
-
-        counts, pct = engine.showup_block(combined)
+        counts, pct = engine.showup_block(slim)
         pct_renamed = pct.add_suffix(" %")
         showup = pd.concat([counts, pct_renamed], axis=1).reset_index(names="bucket")
-
-        tabs = [(dept, _to_raw_tab(combined[combined["department"] == dept]), True)
-                for dept in sorted(known_departments)]
-        tabs += [
-            ("Summary_1", showup, False),
-            ("Summary_Rotation", engine.rotation_summary(combined), False),
-            ("Summary_5", engine.streak_month_crosstab(combined), False),
-        ]
-        _write_tabs(central, tabs)
+        _write_summary_tabs(central_by_year[year], [
+            ("Summary_1", showup),
+            ("Summary_Rotation", engine.rotation_summary(slim)),
+            ("Summary_5", engine.streak_month_crosstab(slim)),
+        ])
 
         year_results[year] = {
-            "spreadsheet_id": central.id,
-            "departments": sorted(combined["department"].unique().tolist()),
-            "months": sorted(pd.to_datetime(combined["date"]).dt.strftime("%Y-%m").unique().tolist()),
-            "workers": int(combined["name"].nunique()),
-            "rows": len(combined),
+            "spreadsheet_id": central_by_year[year].id,
+            "departments": sorted(depts_by_year[year]),
+            "months": sorted(pd.to_datetime(slim["date"]).dt.strftime("%Y-%m").unique().tolist()),
+            "workers": int(slim["name"].nunique()),
+            "rows": len(slim),
         }
 
     return {"years": year_results, "files": file_report}

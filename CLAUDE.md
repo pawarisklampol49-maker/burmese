@@ -214,8 +214,8 @@ individual account -- untested, not pursued since it's a paid Workspace tier
 and the project's constraint is to stay free; n8n's own OAuth nodes turned
 out to be the free path to the same result.) `drive` scope (not
 `drive.readonly`) is still needed on the service account for the write
-operations `_write_df`/`_find_central` do. Each central spreadsheet holds
-exactly 7 tabs:
+operations `_prepare_central`/`_append_dept_rows`/`_write_summary_tabs`/
+`_find_central` do. Each central spreadsheet holds exactly 7 tabs:
   - 4 raw-consolidated department tabs, named exactly `SOCN`/`SOCE`/`SOCW`/
     `FSOCW`, aggregating every vendor file for that department/year. Header
     (user-specified, verbatim): `Date show up | Month show up | Sub-con name
@@ -227,8 +227,11 @@ exactly 7 tabs:
     before, scoped to that year's combined data across all 4 departments.
 
 Every `/sync` call recomputes every discovered year from scratch (no
-incremental state -- `ws.clear()` before every write, matches the project's
-"no fallbacks" stance). Config is env vars, not code constants, so a
+incremental state -- `_prepare_central` clears all 7 tabs before any write,
+matches the project's "no fallbacks" stance). Writes are streamed, not
+accumulated, to stay under Render free tier's 512MB (see the OOM entry in
+"Real bugs" below): heavy raw rows are appended per vendor file and
+released; only the slim `{name,date,team}` slice is held for the summaries. Config is env vars, not code constants, so a
 non-technical successor can change them from Render's dashboard without a
 redeploy: `GOOGLE_SERVICE_ACCOUNT_JSON`, `CENTRAL_FOLDER_ID`,
 `RAW_DEPARTMENTS` (comma-separated, e.g. `SOCN,SOCE,SOCW,FSOCW`),
@@ -469,6 +472,32 @@ Real bugs found and fixed while building this:
     beyond-schema columns become unused, nameless columns), reproducing
     exactly the rectangular grid `get_all_values` used to hand it. Covered
     by `_test_ragged_rows_normalized`.
+  - Ran out of memory (>512MB, Render free tier's cap) -- the OOM killer,
+    not a timeout. `run_sync` accumulated every vendor file's cleaned rows
+    (all ~9 columns) for the whole year in memory, then `pd.concat`'d them
+    (temporary doubling) before writing -- and the batched read made it
+    worse by holding a whole vendor-year of raw values at once. **Redesigned
+    to stream, not accumulate:** the heavy raw rows are now appended to each
+    department tab per vendor file (`_append_dept_rows` via
+    `values.append`/INSERT_ROWS, which auto-grows the grid) and released
+    immediately, so a whole year's raw rows never coexist in memory. Only
+    the slim `{name,date,team}` slice is accumulated for the year -- that's
+    all the 3 summary tabs' engine functions need, and it's small even for
+    hundreds of thousands of worker-days. `_write_tabs` (the single-shot
+    all-7-tabs writer) was replaced by three phase helpers: `_prepare_central`
+    (once per year: add/resize the 7 tabs to a modest default grid, clear
+    all, write the 4 dept headers), `_append_dept_rows` (per vendor file,
+    RAW), and `_write_summary_tabs` (once per year, USER_ENTERED, from the
+    slim slice -- summaries are tiny so they fit the default grid, no resize
+    needed). Peak memory is now ~one vendor file + the slim year slice,
+    instead of every vendor's full data at once. Tradeoff, accepted under
+    the free-tier constraint: the cross-vendor duplicate-(name,date) check
+    now runs at the end (on the slim slice) *after* dept rows are already
+    appended, so a dup error leaves that year's dept tabs written but
+    summaries blank until the next run re-clears everything -- consistent
+    with the project's recompute-from-scratch stance, and dup errors are
+    rare and loud. `FakeCentralSpreadsheet` in test_sync.py now models each
+    tab's full content across prepare/append/summary phases.
   - Summary tab numbers showed up in Sheets with a leading apostrophe (e.g.
     `'8`) -- `_write_df` cast every value to a Python string
     (`df.astype(str)`) then called `ws.update(values)` with no

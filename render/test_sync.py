@@ -203,14 +203,28 @@ def _range_title(range_str):
     return quoted[1:-1].replace("''", "'")
 
 
+class _FakeCentralTab:
+    def __init__(self, title, id_):
+        self.title = title
+        self.id = id_
+        self.content = []   # full current cell grid (header + any appended rows)
+        self.raw = None
+
+    @property
+    def written(self):
+        return self.content
+
+
 class FakeCentralSpreadsheet:
-    """Speaks the batched write API app._write_tabs actually uses
-    (batch_update / values_batch_clear / values_batch_update), recording
-    written values per tab so tests can keep asserting via worksheet(name)."""
+    """Speaks the streaming write API app.py uses: batch_update (add/resize
+    tabs), values_batch_clear, values_batch_update (dept headers + summary
+    tabs, written from A1), and values_append (per-vendor department rows).
+    Models each tab's full content so tests assert via worksheet(name)."""
 
     def __init__(self, id_):
         self.id = id_
         self._tabs = {}
+        self._next_id = 0
 
     def worksheets(self):
         return list(self._tabs.values())
@@ -222,24 +236,30 @@ class FakeCentralSpreadsheet:
         for req in body["requests"]:
             if "addSheet" in req:
                 title = req["addSheet"]["properties"]["title"]
-                self._tabs[title] = FakeWorksheet(title)
+                self._next_id += 1
+                self._tabs[title] = _FakeCentralTab(title, self._next_id)
             elif "updateSheetProperties" in req:
                 sheet_id = req["updateSheetProperties"]["properties"]["sheetId"]
-                assert any(ws.id == sheet_id for ws in self._tabs.values()), \
+                assert any(t.id == sheet_id for t in self._tabs.values()), \
                     f"resize for unknown sheetId {sheet_id}"
             else:
                 raise AssertionError(f"unexpected batch_update request: {req}")
 
     def values_batch_clear(self, params=None, body=None):
         for r in body["ranges"]:
-            self._tabs[_range_title(r)].written = None
+            self._tabs[_range_title(r)].content = []
 
     def values_batch_update(self, body):
         raw = {"RAW": True, "USER_ENTERED": False}[body["valueInputOption"]]
         for entry in body["data"]:
-            ws = self._tabs[_range_title(entry["range"])]
-            ws.written = entry["values"]
-            ws.raw = raw
+            tab = self._tabs[_range_title(entry["range"])]
+            tab.content = list(entry["values"])   # written from A1
+            tab.raw = raw
+
+    def values_append(self, range_str, params, body):
+        tab = self._tabs[_range_title(range_str)]
+        tab.content.extend(body["values"])
+        tab.raw = {"RAW": True, "USER_ENTERED": False}[params["valueInputOption"]]
 
 
 class FakeClient:
