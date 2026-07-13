@@ -160,6 +160,17 @@ setup and nothing to re-paste when 2027 rolls over.
   plain JS and its Node footer is guarded by `typeof module !== "undefined"`,
   so it runs unchanged under GAS V8. Keep `n8n/engine.js` canonical; re-copy
   on any change (one source of the cleaning + metric logic, no fork).
+- **Write path is Advanced Sheets Service ONLY, never SpreadsheetApp.** Mixing
+  the two on one spreadsheet silently corrupts output: `SpreadsheetApp` buffers
+  writes and flushes them lazily (often at script end), so a `SpreadsheetApp`
+  `clear()`/`insertSheet()` can land *after* the Advanced Service value writes
+  and wipe them. First live `sync` hit exactly this — all 7 tabs present but
+  empty, `lastRow=0`, no error, while the result JSON still reported 141k rows.
+  `prepareCentral_` now does tab add/delete via `Sheets.Spreadsheets.batchUpdate`,
+  clears via `values.batchClear`, and writes via `values.batchUpdate`/`append` —
+  no `SpreadsheetApp` mutation on the write path (only `.create()` in
+  `findOrCreateYearSheet_`, committed with `SpreadsheetApp.flush()` before the
+  Advanced Service takes over).
 - `appscript/Code.gs` — the orchestration (ported from `render/app.py`
   `run_sync` + the five retired `n8n/*.js` Code-node scripts): `discoverFiles_`
   (Drive search + strict title parse, throws on a loose match / unknown dept),

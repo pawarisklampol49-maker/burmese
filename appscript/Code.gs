@@ -141,32 +141,42 @@ function findOrCreateYearSheet_(folderId, year) {
 
 // reset one year's central sheet to the 7-tab shape, clear all, write dept
 // headers. Done once per year before any raw-row appends. Mirrors app.py
-// _prepare_central.
+// _prepare_central. IMPORTANT: this uses ONLY the Advanced Sheets Service --
+// NOT SpreadsheetApp. Mixing the two on one spreadsheet corrupts the result:
+// SpreadsheetApp buffers its writes and flushes them lazily (often at script
+// end), so a SpreadsheetApp clear()/insertSheet can land AFTER the Advanced
+// Service value writes and silently wipe them -- exactly the "7 tabs present,
+// all empty, no error" failure seen live. Everything on the write path
+// (prepare/append/summaries) is Advanced Service so ordering is deterministic.
 function prepareCentral_(ss, departments) {
+  const id = ss.getId();
+  SpreadsheetApp.flush();   // commit the create/move from findOrCreateYearSheet_ first
   const allTitles = departments.concat(SUMMARY_TABS);
   const keep = {};
   allTitles.forEach(function (t) { keep[t] = true; });
 
-  const existing = {};
-  ss.getSheets().forEach(function (sh) { existing[sh.getName()] = sh; });
+  const meta = Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  const existing = {};   // title -> sheetId
+  (meta.sheets || []).forEach(function (s) { existing[s.properties.title] = s.properties.sheetId; });
 
-  // ensure every target tab exists
+  // one batchUpdate: add every missing target tab, then delete any stray tab
+  // (e.g. the default "Sheet1"). Adds are listed before deletes so we never
+  // delete the last remaining sheet.
+  const requests = [];
   allTitles.forEach(function (t) {
-    if (!existing[t]) existing[t] = ss.insertSheet(t);
+    if (!(t in existing)) requests.push({ addSheet: { properties: { title: t } } });
   });
-  // drop any stray tab (e.g. the default "Sheet1" on a freshly created sheet)
-  // so the 7-tab shape never varies. Safe: the 7 keepers already exist.
-  ss.getSheets().forEach(function (sh) {
-    if (!keep[sh.getName()]) ss.deleteSheet(sh);
+  Object.keys(existing).forEach(function (t) {
+    if (!keep[t]) requests.push({ deleteSheet: { sheetId: existing[t] } });
   });
-  // clear all 7
-  allTitles.forEach(function (t) { existing[t].clear(); });
-  // dept headers (RAW so IDs are never reinterpreted)
-  departments.forEach(function (d) {
-    Sheets.Spreadsheets.Values.update(
-      { values: [RAW_TAB_HEADER] }, ss.getId(), quoted_(d) + '!A1',
-      { valueInputOption: 'RAW' });
-  });
+  if (requests.length) Sheets.Spreadsheets.batchUpdate({ requests: requests }, id);
+
+  // clear all 7, then write the dept headers (RAW so IDs aren't reinterpreted)
+  Sheets.Spreadsheets.Values.batchClear({ ranges: allTitles.map(quoted_) }, id);
+  Sheets.Spreadsheets.Values.batchUpdate({
+    valueInputOption: 'RAW',
+    data: departments.map(function (d) { return { range: quoted_(d) + '!A1', values: [RAW_TAB_HEADER] }; }),
+  }, id);
 }
 
 // append one vendor file's rows to a department tab (RAW, INSERT_ROWS auto-grows
