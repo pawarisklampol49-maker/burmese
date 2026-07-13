@@ -39,9 +39,14 @@ pushed to Git without explicit review. Never commit .env*; if in doubt, stop and
                                    definitions in test.py's docstring, never forks them. Add a
                                    new tab here per the "Adding a fourth aspect" footer whenever
                                    a new metric gets wired into a Summary tab in run_sync().
-      n8n/
-        soc-daily-sync.json   <- Schedule Trigger -> HTTP Request workflow (see Automation)
-      render/                 <- the deployable unit (Render deploys THIS folder)
+      appscript/              <- CURRENT deployable: standalone Google Apps Script
+        engine.gs              <- verbatim copy of n8n/engine.js (JS runs as-is in GAS)
+        Code.gs                <- discovery + read/clean + per-SOC summaries + write
+        appsscript.json         <- manifest (enables Advanced Sheets Service, V8, scopes)
+      n8n/                    <- SUPERSEDED by appscript/ (kept for reference)
+        engine.js              <- canonical engine; source that engine.gs is copied from
+        soc-daily-sync.json    <- old Schedule Trigger workflow (retired)
+      render/                 <- SUPERSEDED by appscript/ (kept for reference)
         app.py                 <- Flask sync service (Drive discovery + writes)
         test.py                 <- metric engine + report shaping (the "socn mvp")
         test_sync.py            <- app.py tests, mocked Google APIs
@@ -136,7 +141,69 @@ pickup) are done -- see Automation below. Remaining, in order:
    the real raw file titles once visible -- this session took the user's word
    for "FSOCW", flagged as unconfirmed against live data.
 
-## Automation (Render + n8n)
+## Automation — CURRENT: standalone Apps Script (supersedes Render + n8n)
+
+Everything runs inside one **standalone Google Apps Script** (`appscript/`),
+triggered daily by its own time-based trigger. This replaced the Render + n8n
+stack after the n8n rewrite hit an unavoidable worker OOM: pulling every
+vendor sheet's raw rows into an n8n worker (plus 3-4 duplicate copies across
+the compute/write nodes) blew the 512MB worker — the same all-in-memory wall
+that OOM-killed Render. Apps Script reads/computes/writes **in place on
+Google's servers**, so the data never travels and there is no memory ceiling.
+
+Why standalone (not a sheet-bound script): it's pasted once, ever, and runs
+as the owning Google account (real Drive quota, unlike the ~0-quota service
+account), so it **creates each new year's central sheet itself** — no manual
+setup and nothing to re-paste when 2027 rolls over.
+
+- `appscript/engine.gs` — **verbatim copy** of `n8n/engine.js`. That file is
+  plain JS and its Node footer is guarded by `typeof module !== "undefined"`,
+  so it runs unchanged under GAS V8. Keep `n8n/engine.js` canonical; re-copy
+  on any change (one source of the cleaning + metric logic, no fork).
+- `appscript/Code.gs` — the orchestration (ported from `render/app.py`
+  `run_sync` + the five retired `n8n/*.js` Code-node scripts): `discoverFiles_`
+  (Drive search + strict title parse, throws on a loose match / unknown dept),
+  `readMonthTabs_` (Advanced Sheets Service `batchGet`, capped to `A:J`),
+  streams each file's raw rows into its dept tab via `appendDeptRows_` and
+  keeps only the slim `{name,date,team,dept}` slice, `findOrCreateYearSheet_`
+  (the create-if-missing that the service account couldn't do), `sync()` the
+  daily entry point, plus `initProperties`/`dryRun`/`createYearSheet`/
+  `installTrigger` ops helpers.
+- Config is **Script Properties** (successor-editable, no code change):
+  `CENTRAL_FOLDER_ID`, `RAW_DEPARTMENTS`. Run `initProperties()` once to seed.
+
+**Summaries are now PER-SOC, not combined.** Each of the 3 summary tabs holds
+4 stacked, labeled sections (SOCN, SOCE, SOCW, FSOCW), each the *same*
+computation (`showupBlock`/`rotationSummary`/`streakMonthCrosstab`) scoped to
+that one department's slim slice — `writeStacked_` in `Code.gs`. The engine's
+`prepare()` throws on a duplicate `(name,date)` **within a department**
+(cross-vendor collision guard); the same name+date across two different SOCs
+is fine — they're separate sections. (Render/app.py computed each summary once
+over all departments combined — that's the behavior this changes.)
+
+Still true from the old design (the raw side is unchanged): 4 raw dept tabs
+`SOCN/SOCE/SOCW/FSOCW` with the verbatim 8-col header `Date show up | Month
+show up | Sub-con name | Name | Clock in | shift name | Shift_id | team`
+(RAW), always written even if header-only; recompute-from-scratch every run
+(prepare clears all 7 tabs first); year derived from each row's actual date.
+
+**Durable-account requirement (handoff-critical):** the script and its daily
+trigger run as whichever Google account owns the project. That account must
+NOT be the company Gmail being deactivated after handoff, and the raw vendor
+sheets + central folder must be accessible to it. This replaces the old
+service-account/n8n-OAuth ownership risks with a single one — see
+docs/RUNBOOK.md.
+
+Scaling ceiling is now the **6-minute Apps Script execution limit** (not
+memory). Current data runs well inside it; if vendor growth ever exceeds it,
+the fallback is one-department-per-execution — deferred until measured.
+
+### Superseded: Render + n8n (kept for reference, retired)
+
+The section below documents the previous Render Flask service + n8n workflow.
+It is no longer the deployed path — `appscript/` is. Left intact because the
+real-bug catalog (data-quality edge cases the engine handles) and the design
+rationale still apply to `engine.gs`, which is the same logic.
 
 Architecture: a small Flask service (`render/app.py`) deployed on Render,
 triggered daily by n8n (company-hosted, no local/Docker access -- HTTP

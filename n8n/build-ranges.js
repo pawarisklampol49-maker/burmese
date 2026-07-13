@@ -52,7 +52,11 @@ if (monthTabs.length === 0) {
 }
 
 const base = `https://sheets.googleapis.com/v4/spreadsheets/${ctx.id}/values:batchGet`;
-const rangesQs = monthTabs.map((t) => "ranges=" + encodeURIComponent(quoted(t))).join("&");
+// Cap each range to columns A:J -- the engine only reads the first ~8 columns
+// (วันที่..team), so pulling whole tabs just drags in junk/wide columns from
+// broken formulas and bloats the response. Bounding width shrinks every read
+// and defuses ultra-wide rows at the source.
+const rangesQs = monthTabs.map((t) => "ranges=" + encodeURIComponent(quoted(t) + "!A:J")).join("&");
 const batchGetUrl = `${base}?${rangesQs}&majorDimension=ROWS`;
 
 return {

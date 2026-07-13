@@ -1,72 +1,74 @@
-# SOCN Sync — Runbook
+# SOC Sync — Runbook
 
-This is for whoever operates this system day to day. It doesn't assume you can read code — if you can use Google Drive and n8n, that's enough.
+This is for whoever operates this system day to day. It doesn't assume you can read code — if you can use Google Drive and open the Apps Script editor, that's enough.
 
 ## What this does, in one paragraph
 
-Every day at 6am, a small automated service reads every worker attendance file across all 4 departments (SOCN, SOCE, SOCW, FSOCW), combines them, and updates one summary spreadsheet per year in the Central folder. You never have to run this by hand, and you never have to tell it about a new file — it finds them itself, as long as they're named correctly and shared with it (see below).
+Every day, a small Google Apps Script reads every worker attendance file across all 4 departments (SOCN, SOCE, SOCW, FSOCW) and updates one summary spreadsheet per year in the Central folder. It runs entirely inside Google — there's no separate server. You never run it by hand, you never tell it about a new file (it finds them itself), and you never create the yearly spreadsheet by hand (it makes that itself too). The only rule is that the raw files are named correctly and shared with the account that owns the script.
+
+## Where the script lives
+
+It's a **standalone Apps Script project** (not attached to any spreadsheet), owned by one Google account. To open it: that account → <https://script.google.com> → the SOC sync project. Everything — the schedule, the code, the run history — is in there.
 
 ## What you never need to do manually
 
-- **A new staffing vendor's file added for an existing department:** nothing beyond the one rule below (naming + sharing). It just gets folded into that department's numbers on the next daily run.
+- **A new staffing vendor's file for an existing department:** nothing beyond the one rule below (naming + sharing). It gets folded into that department's numbers on the next daily run.
+- **Each new year's central spreadsheet:** the script creates it automatically. When January 2027 arrives and the first 2027 data appears, it makes a spreadsheet titled `2027` in the Central folder itself. This used to be a manual once-a-year task; it no longer is.
 
-## The two things you DO need to do by hand
+## The one thing you DO need to do by hand
 
-**1. Each new year, create that year's central spreadsheet once.** Google won't let the automated service create it itself (a technical quota limit, not a bug) — so:
-
-- In the **Central** Drive folder, duplicate the previous year's spreadsheet (or make a new blank Google Sheet).
-- Title it **exactly the year**, e.g. `2027`.
-- Share it with the service account as **Editor** (same email as below).
-- After that, the daily sync fills in all 7 tabs automatically for the rest of that year — this is a once-a-year, one-minute task.
-
-**2. Every new raw attendance file** (a new vendor, or a new year's file for an existing vendor) must be:
+**Every new raw attendance file** (a new vendor, or a new year's file for an existing vendor) must be:
 
 1. **A real Google Sheet** (File → New → Google Sheets, or a copy of an existing one) — not a CSV file just sitting in Drive.
 2. **Named exactly like this:** `[DEPARTMENT YEAR]_Daily name list_VENDOR`
    - Example: `[SOCE 2026]_Daily name list_BTS`
    - `DEPARTMENT` must be one of: `SOCN`, `SOCE`, `SOCW`, `FSOCW`
    - `YEAR` is a 4-digit year
-   - `VENDOR` is the staffing vendor's short code (BTS, CYD, SPT, DSR, etc. — whatever it already is)
+   - `VENDOR` is the staffing vendor's short code (BTS, CYD, SPT, DSR, WAS, etc. — whatever it already is)
    - Get the brackets, spaces, and underscores exactly right — the system matches this pattern precisely and will refuse to run (rather than guess) if a file's name is close but not exact.
 3. **Have one tab per month** inside it, named like `Jun 26` or `July 26`.
-4. **Shared with the service account** as an **Editor**: `<ask the developer for the service-account email if you don't already have it>`.
+4. **Shared with the account that owns the script** as an **Editor** (the Google account named under "Where the script lives"). There is no separate "service account" anymore — it's just that one human account.
 
-If a file (or the year's central spreadsheet) is missing any of this, the daily sync will fail loudly (not silently produce wrong numbers) — see "if the daily run fails" below.
+If a file is missing any of this, the daily sync fails loudly (rather than silently producing wrong numbers) — see "if the daily run fails" below.
 
 ## Where results live
 
 Open the **Central** Drive folder. Inside it, one spreadsheet per year, named just the year (e.g. `2026`, `2027`). Each one has 7 tabs:
 
 - **`SOCN`, `SOCE`, `SOCW`, `FSOCW`** — one tab per department, showing every worker's show-up day that year, combined across all that department's vendor files. Columns: *Date show up, Month show up, Sub-con name (the vendor), Name, Clock in, shift name, Shift_id, team*.
-- **`Summary_1`, `Summary_Rotation`, `Summary_5`** — the three analysis views (show-up day buckets, station rotation, consecutive-day streaks), computed across all 4 departments combined.
+- **`Summary_1`, `Summary_Rotation`, `Summary_5`** — the three analysis views (show-up day buckets, station rotation, consecutive-day streaks). Each of these tabs is split into **4 stacked sections, one per department** (SOCN, then SOCE, then SOCW, then FSOCW), each labeled — so you read each SOC's numbers separately, not blended together.
 
-**Important: all 7 tabs are wiped and rewritten every single day.** If you type anything directly into these tabs, it will be gone the next morning. If you need to correct something, fix it in the *source* file (the vendor's raw sheet), not here.
+**Important: all 7 tabs are wiped and rewritten every single day.** If you type anything directly into these tabs, it's gone the next morning. To correct something, fix it in the *source* file (the vendor's raw sheet), not here.
 
 ## If the daily run fails
 
-1. In n8n, look at the workflow's execution history — a failed run shows up in red with an error message.
+1. Open the Apps Script project → **Executions** (the left sidebar, the "clock/list" icon). A failed run of `sync` shows up with a red "Failed" status and an error message. Click it to read the full message.
 2. Common causes and what they mean:
-   - *"no raw vendor spreadsheets found"* — the service account can't see any files at all. Check the sharing step above.
-   - *"doesn't match the expected pattern"* — a file was found but its name doesn't exactly follow the `[DEPARTMENT YEAR]_Daily name list_VENDOR` format. Fix the name.
+   - *"no raw vendor spreadsheets found"* — the owning account can't see any files. Check the sharing step above.
+   - *"doesn't match … pattern"* — a file was found but its name doesn't exactly follow `[DEPARTMENT YEAR]_Daily name list_VENDOR`. Fix the name.
    - *"unrecognized department"* — a file's department code isn't one of SOCN/SOCE/SOCW/FSOCW. Check for a typo in the file name.
-   - *"duplicate (name,date) rows"* — the same worker appears on the same date in two different vendor files for the same department. This needs a human to look at the source data and figure out which one is right.
-   - *"no spreadsheet titled '2027' ... create it manually"* — that year's central spreadsheet doesn't exist yet. Do step 1 under "The two things you DO need to do by hand" above.
-3. You can also check `https://<the Render URL>/health` in a browser — if that doesn't load at all, the service itself is down (not a data problem), and that's a developer question.
-4. When escalating to the developer, copy the exact error message from n8n's execution log — it's specific on purpose.
+   - *"duplicate (name,date)"* — the same worker appears on the same date in two vendor files **for the same department**. A human needs to look at the source data and decide which is right.
+   - a message ending in *"…: <something about a date / team / column>"* prefixed with a file name and tab — a specific bad row in that vendor sheet; the message names the file and tab.
+3. To test without waiting for the schedule: in the editor, pick the **`dryRun`** function and Run it, then open **Executions** to read its log — it reports what it found (files, row counts) and writes nothing. To do a real run on demand, Run **`sync`**.
+4. When escalating to the developer, copy the exact error message from the Executions log — it's specific on purpose.
 
-## Before the current developer's company account is deactivated
+## Before the current owner's company account is deactivated
 
-This system is designed to keep working even after the person who built it (and their company Google account) leaves — but only if these are done *before* that account is deactivated:
+This system keeps working after the person who built it leaves — **but only if the Apps Script project is not owned by a Google account that gets deactivated.** The script, its daily trigger, and its access to the sheets all run as whoever owns the project.
 
-1. **GCP project**: the service account (the robot identity everything authenticates as) lives inside a Google Cloud project. Add a second Owner to that project — a generic company account, IT's account, or the next operator's own account — via Google Cloud Console → **IAM & Admin → IAM → Grant Access**. Once this is done, the project survives the original creator's account being gone; nothing about the service account, its key, or any Drive sharing needs to change.
-2. **Render**: add a second team member/owner to the Render account or team, so the deployed service isn't locked to one person's login.
-3. **GitHub**: add a second collaborator/owner to the repository, same reasoning.
+Do this *before* the original account goes away:
 
-None of this touches the service account's key, the `SYNC_TOKEN`, or any file sharing already set up — those keep working regardless of whose Gmail is active. This is purely about making sure a human can still *administer* things (redeploy, check logs, rotate the key someday) after the original operator is gone.
+1. **Move ownership of the Apps Script project** to a durable account — a generic company account, IT's account, or the next operator's personal account. (In Apps Script / Google Drive, transfer ownership of the project, or re-create it under the durable account by copying `engine.gs` + `Code.gs` + the manifest.)
+2. **Re-run `installTrigger`** under that durable account so the daily schedule belongs to it, and **re-run `initProperties`** (or confirm the Script Properties `CENTRAL_FOLDER_ID` and `RAW_DEPARTMENTS` are set).
+3. **Make sure the durable account has Editor access** to the Central folder and every raw vendor sheet (or that those are owned by it).
+4. **GitHub** (where the code is version-controlled): add a second collaborator/owner to the repository.
+
+Once the project is owned by a durable account, nothing about the daily run depends on the departed person's Gmail.
 
 ## Glossary
 
-- **Department**: one of SOCN, SOCE, SOCW, FSOCW — the four groups this whole system tracks.
-- **Vendor** (a.k.a. "Sub-con"): a staffing agency that supplies workers (BTS, CYD, SPT, DSR, etc.). Not a physical location — just which agency the worker's file came through. It's kept in the data for traceability only; nothing is calculated "per vendor."
-- **Central folder**: the one Drive folder where every year's finished summary spreadsheet lives.
-- **Sync**: the daily automated process that reads all vendor files and updates the Central folder.
+- **Department (SOC)**: one of SOCN, SOCE, SOCW, FSOCW — the four groups this system tracks. Each now gets its own section in every summary tab.
+- **Vendor** (a.k.a. "Sub-con"): a staffing agency that supplies workers (BTS, CYD, SPT, DSR, WAS, etc.). Not a physical location — just which agency the worker's file came through. Kept for traceability only; nothing is calculated "per vendor."
+- **Central folder**: the one Drive folder where every year's finished summary spreadsheet lives, and where the script auto-creates each new year's sheet.
+- **Apps Script**: Google's built-in automation tool. Our script is "standalone" (its own project, not attached to a sheet) and runs on a daily timer.
+- **Sync**: the daily process (`sync` function) that reads all vendor files and rewrites the Central folder's year spreadsheet.
