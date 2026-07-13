@@ -414,6 +414,26 @@ Real bugs found and fixed while building this:
     still matches, use it" is enforced structurally by the existing strict
     date parsing, not a separate check. Covered by
     `_test_corrupted_date_header_repaired`.
+  - `[SOCE 2026]_Daily name list_BTS`, tab `Jul 26`, row 2074 (found live on
+    the first Apps Script `dryRun`): a broken formula spilled the shift name
+    `"FSOCE "` (trailing space, not a known error sentinel) across `วันที่.1`
+    AND every column after it, while `วันที่` still held a clean `"09 Jul 26"`.
+    The old rule from the `"49"` entry above -- "a date column that doesn't
+    parse throws" -- was too strict: it killed a real worker's show-up day
+    even though the sibling column had a perfectly good date. Relaxed the date
+    resolution from `errors="raise"` to `errors="coerce"` (JS: `dateCell`
+    returns `null` instead of throwing on an unparseable value): a non-empty
+    value that simply doesn't parse becomes NA and is cross-filled from the
+    other date column, exactly like a `#REF!` sentinel already was. The
+    safety guards are unchanged and still do the real work -- a row with NO
+    valid date in EITHER column is caught (placeholder-drop, or the "no usable
+    date" throw when other fields are populated), and two columns holding
+    DIFFERENT valid dates still trips the disagree throw. This also softens
+    the `"49"` entry's claim that a mis-repaired position column throws: it
+    only throws now if BOTH date columns end up unusable, which a genuinely
+    wrong repair (two non-date columns) still produces. Covered by
+    `_test_garbage_date_col_recovered` (and the `_test_corrupted_date_header_repaired`
+    bad-row case now asserts recovery from the sibling instead of a throw).
   - `[SOCE 2026]_Daily name list_SPT`, tab `Mar 26`: the header row was
     accidentally pasted twice (rows 1 and 2), so once the real header is
     identified, the second copy shows up as a plain data row and blows up

@@ -194,15 +194,20 @@ function clearSentinel(v) {
   return SHEETS_ERROR_SENTINELS.has(v) ? null : v;
 }
 
-// resolve one date cell like pandas to_datetime(..., errors="raise") after the
-// sentinel/blank normalization: blank or sentinel -> null (NA, fine); a real
-// non-empty value that can't be parsed -> throw.
+// resolve one date cell after sentinel/blank normalization: blank, a known
+// sentinel, OR a non-empty value that simply doesn't parse as a date -> null.
+// Returning null (rather than throwing) lets the caller cross-fill from the
+// sibling date column. Confirmed live in [SOCE 2026]_Daily name list_BTS
+// 'Jul 26' row 2074: a broken formula spilled the shift name ("FSOCE ") across
+// วันที่.1 and the rest of the row while วันที่ still held a clean "09 Jul 26".
+// Same recovery the sentinel path already does for #REF!, just for garbage that
+// isn't one of the known error strings. A row with NO valid date in EITHER
+// column is still caught downstream (placeholder-drop or the "no usable date"
+// throw); two columns holding DIFFERENT valid dates still trips the disagree throw.
 function dateCell(rawVal, parser) {
   const v = clearSentinel(rawVal);
   if (v == null || v === "") return null;
-  const p = parser(v);
-  if (p == null) throw new Error(`Unknown datetime string format, unable to parse: ${v}`);
-  return p;
+  return parser(v);   // null if unparseable -> recoverable from the sibling column
 }
 
 // ------------------------------------------------------------------ cleaning
@@ -584,13 +589,23 @@ function runSelfTests() {
   assert(sb0.counts["1-5"]["Jul"] === 1, "name-with-spaces grouped as one worker");
   ok("test_name_with_spaces");
 
-  // corrupted date header ("49") repaired by position; bad data still throws
+  // corrupted date header ("49") repaired by position; a single bad date column
+  // is recovered from the valid sibling (was: threw on the unparseable cell)
   const Hbad = ["49", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team", "กะ", "เวลาเข้า-ออกงาน"];
   out = loadRawFromValues([Hbad, ["9 May 26", "amy", "09:00", "Inbound", "2026-05-09", "SITE", "SH-1", "IB", "K1", "09:00-17:00"]]);
   assert(out.length === 1 && out[0].date.key === "2026-05-09", "corrupted header repaired");
-  expectThrow(() => loadRawFromValues([Hbad, ["not a date", "ben", "09:00", "Inbound", "2026-05-10", "SITE", "SH-2", "IB", "K1", "09:00-17:00"]]),
-    "unable to parse", "corrupted header bad data");
+  out = loadRawFromValues([Hbad, ["not a date", "ben", "09:00", "Inbound", "2026-05-10", "SITE", "SH-2", "IB", "K1", "09:00-17:00"]]);
+  assert(out.length === 1 && out[0].date.key === "2026-05-10", "one bad date column recovered from sibling");
   ok("test_corrupted_date_header_repaired");
+
+  // BTS 'Jul 26' row 2074: a broken formula spilled "FSOCE " across วันที่.1 and
+  // the rest of the row; วันที่ still valid -> recover the show-up day, don't throw
+  out = loadRawFromValues([H, ["09 Jul 26", "BTS 0122 x", "19:00", "FSOCE ", "FSOCE ", "FSOCE ", "FSOCE ", "FSOCE "]]);
+  assert(out.length === 1 && out[0].date.key === "2026-07-09", "garbage วันที่.1 recovered from วันที่");
+  // both date columns unparseable garbage, other fields populated -> still throws
+  expectThrow(() => loadRawFromValues([H, ["junk", "cara", "09:00", "Inbound", "junk", "SITE", "SH-1", "IB"]]),
+    "no usable date", "both date columns garbage still throws");
+  ok("test_garbage_date_col_recovered");
 
   // ragged rows normalized (wider + shorter than header)
   out = loadRawFromValues([H,

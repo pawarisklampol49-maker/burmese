@@ -230,8 +230,16 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     # column can independently be a broken formula (see _SHEETS_ERROR_SENTINELS);
     # each is cross-filled from the other when one is unrecoverable, so a
     # single broken cell doesn't lose a real worker's show-up day.
-    d1 = pd.to_datetime(_clear_sheets_errors(df["วันที่"]), format="mixed", dayfirst=True, errors="raise")
-    d2 = pd.to_datetime(_clear_sheets_errors(df["วันที่.1"]), format="%Y-%m-%d", errors="raise")
+    # errors="coerce" (not "raise"): a non-empty value that just doesn't parse as
+    # a date becomes NaT and is cross-filled from the sibling column, same as a
+    # known sentinel. Confirmed live in [SOCE 2026]_Daily name list_BTS 'Jul 26'
+    # row 2074, where a broken formula spilled the shift name ("FSOCE ") across
+    # วันที่.1 and the rest of the row while วันที่ still held "09 Jul 26". A row
+    # with no valid date in EITHER column is still caught below (placeholder-drop
+    # or the "no usable date" throw); two DIFFERENT valid dates still trips the
+    # disagree throw.
+    d1 = pd.to_datetime(_clear_sheets_errors(df["วันที่"]), format="mixed", dayfirst=True, errors="coerce")
+    d2 = pd.to_datetime(_clear_sheets_errors(df["วันที่.1"]), format="%Y-%m-%d", errors="coerce")
     d1, d2 = d1.fillna(d2), d2.fillna(d1)
 
     unrecoverable = d1.isna() & d2.isna()
@@ -580,17 +588,34 @@ def _test_corrupted_date_header_repaired():
     out = _clean_raw(_rows_to_raw_df([header, row]))
     assert len(out) == 1 and out.iloc[0]["date"] == pd.Timestamp(2026, 5, 9)
 
-    # position-repair must still throw if the recovered column isn't
-    # actually dates -- not a silent guess
+    # one date column unparseable but the sibling valid -> recover from the
+    # sibling (was: threw). วันที่ here is "not a date", วันที่.1 is a real date.
     bad_row = ["not a date", "ben", "09:00", "Inbound", "2026-05-10", "SITE", "SH-2", "IB",
                "K1", "09:00-17:00"]
+    out = _clean_raw(_rows_to_raw_df([header, bad_row]))
+    assert len(out) == 1 and out.iloc[0]["date"] == pd.Timestamp(2026, 5, 10)
+    print("_test_corrupted_date_header_repaired passed")
+
+
+def _test_garbage_date_col_recovered():
+    """Confirmed live: [SOCE 2026]_Daily name list_BTS, tab 'Jul 26' row 2074 --
+    a broken formula spilled the shift name ("FSOCE ") across วันที่.1 and the
+    rest of the row while วันที่ still held a clean "09 Jul 26". The valid
+    sibling recovers the show-up day; only when BOTH date columns are
+    unrecoverable (and other fields are populated) does it stop and ask."""
+    header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
+    row = ["09 Jul 26", "BTS 0122 x", "19:00", "FSOCE ", "FSOCE ", "FSOCE ", "FSOCE ", "FSOCE "]
+    out = _clean_raw(_rows_to_raw_df([header, row]))
+    assert len(out) == 1 and out.iloc[0]["date"] == pd.Timestamp(2026, 7, 9)
+
+    both_bad = ["junk", "cara", "09:00", "Inbound", "junk", "SITE", "SH-1", "IB"]
     try:
-        _clean_raw(_rows_to_raw_df([header, bad_row]))
+        _clean_raw(_rows_to_raw_df([header, both_bad]))
     except Exception:
         pass
     else:
-        raise AssertionError("expected a parse failure, not a silent guess")
-    print("_test_corrupted_date_header_repaired passed")
+        raise AssertionError("expected 'no usable date', not a silent guess")
+    print("_test_garbage_date_col_recovered passed")
 
 
 def _test_ragged_rows_normalized():
@@ -754,6 +779,7 @@ def _run_tests():
     _test_blank_placeholder_row_dropped()
     _test_garbled_clockin_tolerated()
     _test_corrupted_date_header_repaired()
+    _test_garbage_date_col_recovered()
     _test_ragged_rows_normalized()
     _test_duplicate_header_row_dropped()
     _test_team_learned_from_shift_name()
