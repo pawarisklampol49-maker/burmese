@@ -175,11 +175,21 @@ setup and nothing to re-paste when 2027 rolls over.
 **Summaries are now PER-SOC, not combined.** Each of the 3 summary tabs holds
 4 stacked, labeled sections (SOCN, SOCE, SOCW, FSOCW), each the *same*
 computation (`showupBlock`/`rotationSummary`/`streakMonthCrosstab`) scoped to
-that one department's slim slice — `writeStacked_` in `Code.gs`. The engine's
-`prepare()` throws on a duplicate `(name,date)` **within a department**
-(cross-vendor collision guard); the same name+date across two different SOCs
-is fine — they're separate sections. (Render/app.py computed each summary once
-over all departments combined — that's the behavior this changes.)
+that one department's slim slice — `writeStacked_` in `Code.gs`. The same
+name+date across two different SOCs is fine — they're separate sections.
+(Render/app.py computed each summary once over all departments combined —
+that's the behavior this changes.)
+
+`Code.gs` dedups one row per `(name,date)` (keeping the earliest clock-in, the
+same rule `cleanRaw` uses within a tab) both **per vendor file** before writing
+its raw dept-tab rows and **per department** before the summaries —
+`dedupByNameDate_`. This is needed because month tabs overlap at boundaries: a
+`Mar 26` tab and an `Apr 26` tab both carry the same Apr-1 show-up (confirmed
+live for SPT — identical team and clock-in in both). Worker names are
+vendor-prefixed (`SPT 543…`, `BTS 0015…`), so a `(name,date)` collision only
+ever happens within one vendor across adjacent tabs, never across vendors.
+Where app.py's `run_sync` *threw* on a duplicate `(name,date)`, the Apps Script
+collapses it — a show-up recorded in two tabs is one show-up, not an error.
 
 Still true from the old design (the raw side is unchanged): 4 raw dept tabs
 `SOCN/SOCE/SOCW/FSOCW` with the verbatim 8-col header `Date show up | Month

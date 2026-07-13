@@ -223,17 +223,41 @@ function objRowsGrid_(objs, cols) {
 }
 
 // write one summary tab as 4 stacked, labeled SOC sections. Each section is the
-// SAME computation as before, scoped to that one department's slim slice. A
-// department with no rows still emits its label + header (predictable shape).
-function writeStacked_(ss, tabName, slim, departments, blockFn) {
+// SAME computation as before, scoped to that one department's (pre-deduped)
+// slim slice. A department with no rows still emits its label + header.
+function writeStacked_(ss, tabName, deptSlimMap, departments, blockFn) {
   const grid = [];
   departments.forEach(function (dept) {
-    const deptSlim = slim.filter(function (r) { return r.dept === dept; });
     grid.push([dept]);                          // section label
-    blockFn(deptSlim).forEach(function (row) { grid.push(row); });
+    blockFn(deptSlimMap[dept] || []).forEach(function (row) { grid.push(row); });
     grid.push([]);                              // spacer
   });
   writeGrid_(ss, tabName, grid);
+}
+
+// collapse to one row per (name, date), keeping the earliest clock-in (garbled/
+// missing sorts last) -- the same rule cleanRaw uses within a single tab, here
+// applied across a vendor's tabs. Month-boundary overlap: a 'Mar 26' tab and an
+// 'Apr 26' tab can both carry the same Apr-1 show-up (confirmed live, SPT).
+// Worker names are vendor-prefixed, so (name,date) never collides across vendors.
+// SEP + parseClockMinutes come from engine.gs (global at call time).
+function dedupByNameDate_(rows) {
+  const withClock = rows.map(function (r, i) {
+    return { r: r, c: parseClockMinutes(r.clockin == null ? '' : r.clockin), i: i };
+  });
+  withClock.sort(function (a, b) {
+    const ca = a.c == null ? Infinity : a.c, cb = b.c == null ? Infinity : b.c;
+    return ca !== cb ? ca - cb : a.i - b.i;
+  });
+  const seen = {};
+  const out = [];
+  for (var j = 0; j < withClock.length; j++) {
+    const k = withClock[j].r.name + SEP + withClock[j].r.date.key;
+    if (seen[k]) continue;
+    seen[k] = true;
+    out.push(withClock[j].r);
+  }
+  return out;
 }
 
 function writeGrid_(ss, tabName, grid) {
@@ -293,32 +317,42 @@ function sync() {
     });
     Object.keys(rowsByYear).forEach(function (y) {
       const ctx = yearCtx_(y);
-      const rows = rowsByYear[y];
+      // dedup one row per (name,date) across THIS file's tabs before writing the
+      // raw dept tab -- month-boundary overlap (a 'Mar 26' tab carrying the same
+      // Apr-1 show-up as 'Apr 26', confirmed live for SPT). Keeps earliest clock-in.
+      const rows = dedupByNameDate_(rowsByYear[y]);
       appendDeptRows_(ctx.ss, f.dept, rows);
       rows.forEach(function (r) {
-        ctx.slim.push({ name: r.name, date: r.date, team: r.team, dept: r.dept });
+        ctx.slim.push({ name: r.name, date: r.date, team: r.team, dept: r.dept, clockin: r.clockin });
       });
     });
   });
 
-  // per year: write the 3 per-SOC summary tabs. The engine's prepare() (inside
-  // each summary fn) throws on a duplicate (name,date) WITHIN a department --
-  // the meaningful cross-vendor collision guard; the same name+date in two
-  // different SOCs is fine, they're separate sections.
+  // per year: build one deduped {name,date,team} slice PER department, then write
+  // the 3 per-SOC summary tabs from it. Per-file dedup above already removes
+  // within-vendor overlap; this final dedup is the belt-and-suspenders guarantee
+  // that the engine's one-row-per-(name,date) contract holds per department.
   const result = {};
   Object.keys(yearData).forEach(function (y) {
     const ctx = yearData[y];
-    writeStacked_(ctx.ss, 'Summary_1', ctx.slim, conf.departments,
+    const deptSlim = {};
+    conf.departments.forEach(function (dept) {
+      deptSlim[dept] = dedupByNameDate_(ctx.slim.filter(function (r) { return r.dept === dept; }));
+    });
+
+    writeStacked_(ctx.ss, 'Summary_1', deptSlim, conf.departments,
       function (s) { return summary1Grid_(s); });
-    writeStacked_(ctx.ss, 'Summary_Rotation', ctx.slim, conf.departments,
+    writeStacked_(ctx.ss, 'Summary_Rotation', deptSlim, conf.departments,
       function (s) { return objRowsGrid_(rotationSummary(s), ROTATION_COLS); });
-    writeStacked_(ctx.ss, 'Summary_5', ctx.slim, conf.departments,
+    writeStacked_(ctx.ss, 'Summary_5', deptSlim, conf.departments,
       function (s) { return objRowsGrid_(streakMonthCrosstab(s), STREAK_COLS); });
 
     const names = {};
-    ctx.slim.forEach(function (r) { names[r.name] = true; });
-    result[y] = { spreadsheetId: ctx.ss.getId(), rows: ctx.slim.length,
-                  workers: Object.keys(names).length };
+    var total = 0;
+    conf.departments.forEach(function (dept) {
+      deptSlim[dept].forEach(function (r) { names[r.name] = true; total++; });
+    });
+    result[y] = { spreadsheetId: ctx.ss.getId(), rows: total, workers: Object.keys(names).length };
   });
 
   Logger.log(JSON.stringify(result, null, 2));
