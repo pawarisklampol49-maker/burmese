@@ -159,12 +159,33 @@ function prepareCentral_(ss, departments) {
   const existing = {};   // title -> sheetId
   (meta.sheets || []).forEach(function (s) { existing[s.properties.title] = s.properties.sheetId; });
 
-  // one batchUpdate: add every missing target tab, then delete any stray tab
-  // (e.g. the default "Sheet1"). Adds are listed before deletes so we never
+  // RESET every target tab to a small baseline grid. Clearing values does NOT
+  // shrink a sheet's grid, so without this the dept tabs grow by ~one full
+  // year of rows every run and the workbook eventually blows past the hard
+  // 10,000,000-cell limit (hit live). Dept tabs get exactly the 8 header
+  // columns (values.append re-grows the rows each run); summary tabs get
+  // bounded headroom for their 4 stacked sections. Also self-heals an already
+  // bloated grid, since shrinking cells is always allowed.
+  const deptSet = {};
+  departments.forEach(function (d) { deptSet[d] = true; });
+  function gridFor_(t) {
+    return deptSet[t]
+      ? { rowCount: 1, columnCount: RAW_TAB_HEADER.length }
+      : { rowCount: 1000, columnCount: 30 };
+  }
+  // one batchUpdate: add missing tabs (sized), resize existing tabs, then delete
+  // strays (e.g. default "Sheet1"). Adds/updates precede deletes so we never
   // delete the last remaining sheet.
   const requests = [];
   allTitles.forEach(function (t) {
-    if (!(t in existing)) requests.push({ addSheet: { properties: { title: t } } });
+    if (t in existing) {
+      requests.push({ updateSheetProperties: {
+        properties: { sheetId: existing[t], gridProperties: gridFor_(t) },
+        fields: 'gridProperties.rowCount,gridProperties.columnCount',
+      } });
+    } else {
+      requests.push({ addSheet: { properties: { title: t, gridProperties: gridFor_(t) } } });
+    }
   });
   Object.keys(existing).forEach(function (t) {
     if (!keep[t]) requests.push({ deleteSheet: { sheetId: existing[t] } });
