@@ -96,6 +96,9 @@ function isMonthTab_(title) {
   return t.length === 2 && MONTH_TAB_NAMES[t[0].toLowerCase()] === true && /^\d{2}$/.test(t[1]);
 }
 
+// the 2-digit year suffix of a month tab ("Dec 25" -> "25")
+function monthTabYear_(title) { return String(title).trim().split(/\s+/)[1]; }
+
 function quoted_(t) { return "'" + String(t).replace(/'/g, "''") + "'"; }
 
 // retry an idempotent read through transient Google API errors (a live 404
@@ -116,13 +119,18 @@ function retryRead_(fn) {
 // read every month tab of one vendor file in a single batchGet, capped to A:J
 // (only the first ~8 columns are used -- avoids junk/wide columns). Mirrors
 // n8n Build Ranges + Batch Read and app.py _batch_get_month_tabs.
-function readMonthTabs_(fileId) {
+function readMonthTabs_(fileId, yearSuffix) {
   const meta = retryRead_(function () {
     return Sheets.Spreadsheets.get(fileId, { fields: 'sheets.properties.title' });
   });
+  // Only this file's own year: a '[<DEPT> 2026]' file is scoped to 2026 by its
+  // title, so read only its '... 26' tabs. An off-year tab (e.g. a leftover
+  // 'Dec 25') belongs to a different year's file and can have stale/broken
+  // structure -- confirmed live, PPO SOCW had a 'Dec 25' tab that broke header
+  // detection. yearSuffix is the title's last two digits ('2026' -> '26').
   const titles = (meta.sheets || [])
     .map(function (s) { return s.properties.title; })
-    .filter(isMonthTab_);
+    .filter(function (t) { return isMonthTab_(t) && monthTabYear_(t) === yearSuffix; });
   if (!titles.length) return { titles: [], valuesByTitle: {} };
   const ranges = titles.map(function (t) { return quoted_(t) + '!A:J'; });
   const resp = retryRead_(function () {
@@ -342,7 +350,7 @@ function sync() {
   }
 
   files.forEach(function (f) {
-    const read = readMonthTabs_(f.id);
+    const read = readMonthTabs_(f.id, f.year.slice(-2));
     if (!read.titles.length) {
       throw new Error("'" + f.name + "' (dept=" + f.dept + ", vendor=" + f.vendor +
         ") has no month tabs -- schema drift or an empty file");
@@ -416,7 +424,7 @@ function dryRun() {
   const files = discoverFiles_(conf.departments);
   const report = [];
   files.forEach(function (f) {
-    const read = readMonthTabs_(f.id);
+    const read = readMonthTabs_(f.id, f.year.slice(-2));
     let rows = 0;
     read.titles.forEach(function (t) {
       const v = read.valuesByTitle[t];
