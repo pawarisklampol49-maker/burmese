@@ -98,17 +98,36 @@ function isMonthTab_(title) {
 
 function quoted_(t) { return "'" + String(t).replace(/'/g, "''") + "'"; }
 
+// retry an idempotent read through transient Google API errors (a live 404
+// "Requested entity was not found" cleared on its own the next second -- Drive/
+// Sheets eventual consistency). Reads only: safe to repeat. Backoff 1s/2s/4s.
+function retryRead_(fn) {
+  var lastErr;
+  for (var attempt = 1; attempt <= 4; attempt++) {
+    try { return fn(); }
+    catch (e) {
+      lastErr = e;
+      if (attempt < 4) Utilities.sleep(1000 * Math.pow(2, attempt - 1));
+    }
+  }
+  throw lastErr;
+}
+
 // read every month tab of one vendor file in a single batchGet, capped to A:J
 // (only the first ~8 columns are used -- avoids junk/wide columns). Mirrors
 // n8n Build Ranges + Batch Read and app.py _batch_get_month_tabs.
 function readMonthTabs_(fileId) {
-  const meta = Sheets.Spreadsheets.get(fileId, { fields: 'sheets.properties.title' });
+  const meta = retryRead_(function () {
+    return Sheets.Spreadsheets.get(fileId, { fields: 'sheets.properties.title' });
+  });
   const titles = (meta.sheets || [])
     .map(function (s) { return s.properties.title; })
     .filter(isMonthTab_);
   if (!titles.length) return { titles: [], valuesByTitle: {} };
   const ranges = titles.map(function (t) { return quoted_(t) + '!A:J'; });
-  const resp = Sheets.Spreadsheets.Values.batchGet(fileId, { ranges: ranges, majorDimension: 'ROWS' });
+  const resp = retryRead_(function () {
+    return Sheets.Spreadsheets.Values.batchGet(fileId, { ranges: ranges, majorDimension: 'ROWS' });
+  });
   const vr = resp.valueRanges || [];
   const valuesByTitle = {};
   titles.forEach(function (t, i) { valuesByTitle[t] = (vr[i] && vr[i].values) || []; });
