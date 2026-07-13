@@ -126,12 +126,19 @@ function mangleDupeCols(header) {
   });
 }
 
-function repairDateHeaderPositions(header) {
+// Recover a header whose fragile cells were overwritten by stray values (a date
+// "49"/"4" in วันที่, a time "11:00:00 AM" in เข้างาน -- both confirmed live).
+// The column ORDER is fixed by the locked schema, so recover by position from
+// the two anchor names that have never shown corruption, ค้นหา and 'shift name':
+// วันที่ = ค้นหา-1, เข้างาน = ค้นหา+1, second วันที่ = shift name+1. Fallback only
+// (see mangledHeaderCandidates) -- never touches an already-matching header.
+function repairHeaderPositions(header) {
   if (!header.includes("ค้นหา") || !header.includes("shift name")) return header;
   const out = header.slice();
   const nameIdx = out.indexOf("ค้นหา");
   const shiftIdx = out.indexOf("shift name");
   if (nameIdx - 1 >= 0) out[nameIdx - 1] = "วันที่";
+  if (nameIdx + 1 < out.length) out[nameIdx + 1] = "เข้างาน";
   if (shiftIdx + 1 < out.length) out[shiftIdx + 1] = "วันที่";
   return out;
 }
@@ -142,7 +149,7 @@ function isSuperset(candidate) {
 }
 
 function mangledHeaderCandidates(row) {
-  return [mangleDupeCols(row), mangleDupeCols(repairDateHeaderPositions(row))];
+  return [mangleDupeCols(row), mangleDupeCols(repairHeaderPositions(row))];
 }
 
 function findHeaderRow(rows, maxScan) {
@@ -606,6 +613,12 @@ function runSelfTests() {
   expectThrow(() => loadRawFromValues([H, ["junk", "cara", "09:00", "Inbound", "junk", "SITE", "SH-1", "IB"]]),
     "no usable date", "both date columns garbage still throws");
   ok("test_garbage_date_col_recovered");
+
+  // clock-in header cell overwritten by a stray time -> repaired by position
+  const Htime = ["วันที่", "ค้นหา", "11:00:00 AM", "shift name", "วันที่", "PPO", "Shift_id", "team", "กะ", "เวลาเข้า-ออกงาน"];
+  out = loadRawFromValues([Htime, ["9 Feb 26", "amy", "09:00", "Inbound", "2026-02-09", "SITE", "SH-1", "IB", "K1", "09:00-17:00"]]);
+  assert(out.length === 1 && out[0].date.key === "2026-02-09" && out[0].clockin === "09:00", "clock-in header repaired");
+  ok("test_corrupted_clockin_header_repaired");
 
   // ragged rows normalized (wider + shorter than header)
   out = loadRawFromValues([H,

@@ -89,19 +89,17 @@ _KNOWN_SHIFT_TEAM = {
 
 
 def _repair_date_header_positions(header: list) -> list:
-    """A วันที่ header cell can itself be a broken-formula artifact -- but as
-    a stray value like a bare row number, not one of _SHEETS_ERROR_SENTINELS
-    (confirmed live: BTS 'May 26' had "49" where the first วันที่ should be,
-    while the column's actual DATA underneath was still real dates). The
-    underlying column ORDER is unaffected, only that one cell's text -- the
-    locked convention (CLAUDE.md's Input section) is that the two วันที่
-    columns are always exactly one before ค้นหา and one after 'shift name',
-    and neither of those two anchor names has ever been seen corrupted.
+    """A fragile header cell can itself be overwritten by a stray value -- not
+    one of _SHEETS_ERROR_SENTINELS, just a bare number or a time. Confirmed
+    live: BTS 'May 26' had "49" where the first วันที่ should be; PPO 'Feb 26'
+    had "11:00:00 AM" where เข้างาน (clock-in) should be. The column ORDER is
+    unaffected, only that one cell's text -- the locked schema (CLAUDE.md's
+    Input section) fixes the fragile columns by position relative to the two
+    anchor names that have never been seen corrupted, ค้นหา and 'shift name':
+    วันที่ = ค้นหา-1, เข้างาน = ค้นหา+1, second วันที่ = shift name+1.
     Only ever consulted as a fallback (see _find_header_row/_resolve_header)
     when strict name-matching has already failed for a row -- never touches
-    an already-working header, and the caller still requires the resulting
-    columns to actually parse as dates, so a wrong guess here still throws
-    rather than silently producing bad data."""
+    an already-working header."""
     if "ค้นหา" not in header or "shift name" not in header:
         return header
     header = list(header)
@@ -109,6 +107,8 @@ def _repair_date_header_positions(header: list) -> list:
     shift_idx = header.index("shift name")
     if name_idx - 1 >= 0:
         header[name_idx - 1] = "วันที่"
+    if name_idx + 1 < len(header):
+        header[name_idx + 1] = "เข้างาน"
     if shift_idx + 1 < len(header):
         header[shift_idx + 1] = "วันที่"
     return header
@@ -618,6 +618,22 @@ def _test_garbage_date_col_recovered():
     print("_test_garbage_date_col_recovered passed")
 
 
+def _test_corrupted_clockin_header_repaired():
+    """Confirmed live: [SOCW 2026]_Daily name list_PPO, tab 'Feb 26' -- the
+    เข้างาน (clock-in) header cell held a stray time "11:00:00 AM" instead of
+    the column name, so name-matching couldn't find a header. Position-repair
+    recovers เข้างาน as ค้นหา+1 (locked schema); the actual clock-in data
+    underneath is read normally."""
+    header = ["วันที่", "ค้นหา", "11:00:00 AM", "shift name", "วันที่", "PPO",
+              "Shift_id", "team", "กะ", "เวลาเข้า-ออกงาน"]
+    row = ["9 Feb 26", "amy", "09:00", "Inbound", "2026-02-09", "SITE", "SH-1", "IB",
+           "K1", "09:00-17:00"]
+    out = _clean_raw(_rows_to_raw_df([header, row]))
+    assert len(out) == 1 and out.iloc[0]["date"] == pd.Timestamp(2026, 2, 9)
+    assert out.iloc[0]["clockin"] == "09:00"
+    print("_test_corrupted_clockin_header_repaired passed")
+
+
 def _test_ragged_rows_normalized():
     """Confirmed live: [SOCE 2026]_Daily name list_PPO, tab 'Jul 26' -- the
     Sheets API batchGet endpoint returns ragged rows (unlike get_all_values),
@@ -780,6 +796,7 @@ def _run_tests():
     _test_garbled_clockin_tolerated()
     _test_corrupted_date_header_repaired()
     _test_garbage_date_col_recovered()
+    _test_corrupted_clockin_header_repaired()
     _test_ragged_rows_normalized()
     _test_duplicate_header_row_dropped()
     _test_team_learned_from_shift_name()
