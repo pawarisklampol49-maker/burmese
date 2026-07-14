@@ -110,6 +110,19 @@ function monthLabel(monthISO) {           // "2026-06" -> "Jun"
   return MONTHS[m - 1];
 }
 
+// period grouping: a date -> a sortable key and a display label, for "month"
+// (default), ISO "week", or "day". Lets one computation serve all three grains.
+function periodKey(date, period) {
+  if (period === "week") return date.iso.year + "-W" + pad2(date.iso.week);
+  if (period === "day") return date.key;                 // YYYY-MM-DD
+  return date.month;                                     // YYYY-MM
+}
+function periodLabel(key, period) {
+  if (period === "week") return "W" + parseInt(key.slice(key.indexOf("W") + 1), 10);
+  if (period === "day") return key;                      // already YYYY-MM-DD
+  return monthLabel(key);
+}
+
 function parseClockMinutes(s) {            // "09:00" -> 540; garbled -> null (sorts last)
   const mm = String(s).trim().match(/^(\d{1,2}):(\d{2})/);
   if (!mm) return null;
@@ -126,20 +139,33 @@ function mangleDupeCols(header) {
   });
 }
 
-// Recover a header whose fragile cells were overwritten by stray values (a date
-// "49"/"4" in วันที่, a time "11:00:00 AM" in เข้างาน -- both confirmed live).
-// The column ORDER is fixed by the locked schema, so recover by position from
-// the two anchor names that have never shown corruption, ค้นหา and 'shift name':
-// วันที่ = ค้นหา-1, เข้างาน = ค้นหา+1, second วันที่ = shift name+1. Fallback only
-// (see mangledHeaderCandidates) -- never touches an already-matching header.
+// Recover a header whose fragile cells were overwritten by stray values or left
+// blank (a date "49"/"4" in วันที่, a time "11:00:00 AM" in เข้างาน, a BLANK
+// ค้นหา -- all confirmed live). The first columns are LOCKED in order
+// (วันที่, ค้นหา, เข้างาน, shift name, วันที่, ...), so the block can be located
+// by EITHER anchor that's still intact: ค้นหา, or 'shift name' (fixed 2 columns
+// to its right). ค้นหา itself can be the corrupted cell -- DSR 'Jan 26' had a
+// blank ค้นหา header with real names underneath while 'shift name' was fine --
+// so it can't be the sole anchor. From the located name index the fragile cells
+// are rewritten by their known offset: วันที่ = name-1, ค้นหา = name, เข้างาน =
+// name+1, shift name = name+2, second วันที่ = name+3. Bails only if NEITHER
+// anchor is present. Fallback only (see mangledHeaderCandidates) -- never
+// touches an already-matching header, and a mis-repair still has to pass
+// isSuperset AND real date parsing downstream, so "if the data matches, use it"
+// stays structurally enforced.
 function repairHeaderPositions(header) {
-  if (!header.includes("ค้นหา") || !header.includes("shift name")) return header;
+  let nameIdx = header.indexOf("ค้นหา");
+  if (nameIdx < 0) {
+    const shiftIdx = header.indexOf("shift name");
+    if (shiftIdx >= 2) nameIdx = shiftIdx - 2;   // ค้นหา sits 2 left of shift name
+  }
+  if (nameIdx < 0) return header;                // no usable anchor
   const out = header.slice();
-  const nameIdx = out.indexOf("ค้นหา");
-  const shiftIdx = out.indexOf("shift name");
   if (nameIdx - 1 >= 0) out[nameIdx - 1] = "วันที่";
+  out[nameIdx] = "ค้นหา";
   if (nameIdx + 1 < out.length) out[nameIdx + 1] = "เข้างาน";
-  if (shiftIdx + 1 < out.length) out[shiftIdx + 1] = "วันที่";
+  if (nameIdx + 2 < out.length) out[nameIdx + 2] = "shift name";
+  if (nameIdx + 3 < out.length) out[nameIdx + 3] = "วันที่";
   return out;
 }
 
@@ -236,24 +262,21 @@ function cleanRaw(rawObjs) {
     return { r: r, team: team0, d1: d1 || d2, d2: d2 || d1 };
   });
 
-  // unrecoverable date (both null): drop only if EVERY other field is blank
-  // (roster placeholder); otherwise it's a real gap -> throw.
-  const stillBad = [];
+  // unrecoverable date (both null): DROP the row and count it. A show-up with
+  // no date in EITHER column has no attributable calendar day, so it can't be
+  // counted (streaks in Summary_5 need a real day) -- dropping beats throwing
+  // and blocking the whole sync, and beats fabricating a day. Per user decision
+  // (PNK 'Jul 26': 109 rows had a full work record -- name/clock/shift/team --
+  // but both date cells simply blank). The count is surfaced on the returned
+  // array (out.droppedNoDate) so the caller logs it and the drop is never silent.
+  // This subsumes the old roster-placeholder case (all-fields-blank is just one
+  // kind of no-date row).
+  let noDateDropped = 0;
   rows = rows.filter((x) => {
     if (x.d1 || x.d2) return true;
-    const r = x.r;
-    const placeholder = x.team == null && r["shift name"] == null &&
-      r["เข้างาน"] == null && r["Shift_id"] == null;
-    if (placeholder) return false;
-    stillBad.push(x.r["ค้นหา"]);
-    return true;
+    noDateDropped++;
+    return false;
   });
-  if (stillBad.length) {
-    throw new Error(
-      `${stillBad.length} row(s) have no usable date in either วันที่ or วันที่.1 ` +
-      `but other fields are populated -- stop, ask. First workers: ${JSON.stringify(stillBad.slice(0, 5))}`
-    );
-  }
 
   // both dates present but disagree -> genuine ambiguity, throw
   const mism = rows.filter((x) => x.d1.key !== x.d2.key);
@@ -273,18 +296,34 @@ function cleanRaw(rawObjs) {
   const needsTeam = rows.filter((x) => x.team == null);
   if (needsTeam.length) {
     const needed = new Set(needsTeam.map((x) => x.shift));
-    // learn shift -> team from rows that already have both, limited to needed shifts
-    const learned = {};                 // shift -> Set(team)
+    // learn shift -> team COUNTS from rows that already have both (limited to
+    // needed shifts), then resolve each to its MAJORITY team. team is an
+    // abbreviation of shift name, so the dominant pairing is the real mapping and
+    // the minority are data-entry noise -- confirmed live (SPT 'Jul 26': "Outbound"
+    // -> OB x195 with a scatter of stray teams, "Helper" -> Helper x9 with 3 stray).
+    // (Was: threw on ANY shift mapping to >1 team, which stalled the whole sync on
+    // one mislabeled row.) Only a genuine TIE for the top (no dominant team) is
+    // real ambiguity and still throws.
+    const counts = {};                  // shift -> { team: n }
     rows.filter((x) => x.team != null).forEach((x) => {
       if (!needed.has(x.shift)) return;
-      (learned[x.shift] = learned[x.shift] || new Set()).add(x.team);
+      const m = (counts[x.shift] = counts[x.shift] || {});
+      m[x.team] = (m[x.team] || 0) + 1;
     });
-    const ambiguous = Object.keys(learned).filter((s) => learned[s].size > 1).sort();
-    if (ambiguous.length) {
-      throw new Error(`shift name(s) map to more than one team, can't backfill safely: ${JSON.stringify(ambiguous)} -- stop, ask`);
-    }
+    const tied = [];
     const shiftToTeam = {};
-    Object.keys(learned).forEach((s) => { shiftToTeam[s] = Array.from(learned[s])[0]; });
+    Object.keys(counts).forEach((s) => {
+      const m = counts[s], teams = Object.keys(m);
+      let best = teams[0], bestN = m[teams[0]], tie = false;
+      for (let i = 1; i < teams.length; i++) {
+        if (m[teams[i]] > bestN) { best = teams[i]; bestN = m[teams[i]]; tie = false; }
+        else if (m[teams[i]] === bestN) { tie = true; }
+      }
+      if (tie) tied.push(s); else shiftToTeam[s] = best;
+    });
+    if (tied.length) {
+      throw new Error(`shift name(s) map to multiple teams with no majority (a tie), can't backfill safely: ${JSON.stringify(tied.sort())} -- stop, ask`);
+    }
 
     needsTeam.forEach((x) => {
       if (x.shift != null && shiftToTeam[x.shift] != null) x.team = shiftToTeam[x.shift];   // data-driven
@@ -324,6 +363,7 @@ function cleanRaw(rawObjs) {
       shift_name: b.shift_name, shift_id: b.shift_id, month: monthLabel(b.date.month),
     });
   }
+  out.droppedNoDate = noDateDropped;   // surfaced for the caller to log (see cleanRaw's no-date drop)
   return out;
 }
 
@@ -359,6 +399,11 @@ function maxConsecutiveRun(dayNums) {
 }
 
 function sortedUnique(arr) { return Array.from(new Set(arr)).sort(); }
+
+// the distinct teams present in a clean set, sorted. Replaces the hardcoded
+// OPERATIONAL_TEAMS -- teams are now data-driven per SOC (station lists differ
+// by SOC, e.g. "OB" vs "OBD", and each SOC is reported separately).
+function distinctTeams(rows) { return sortedUnique(rows.map((r) => r.team)); }
 
 function round2(x) { return Math.round((x + Number.EPSILON) * 100) / 100; }
 
@@ -429,31 +474,39 @@ function showupBlock(rows, team) {
   return { counts: countsOut, pct: pct, monthLabels: months.map(monthLabel) };
 }
 
-function rotationWorkerTable(rows) {
+// period defaults to "month" (unchanged behavior); "week" gives the same
+// rotation logic recomputed per ISO week. teamCount[t] = distinct days at t
+// (clean set is one row per name+date). rotationCount = # distinct teams touched.
+function rotationWorkerTable(rows, period) {
+  period = period || "month";
   const d = prepare(rows);
-  const g = groupBy(d, (r) => r.date.month + SEP + r.name);
+  const g = groupBy(d, (r) => periodKey(r.date, period) + SEP + r.name);
   const table = [];
   for (const rs of g.values()) {
     const teamCount = {};
     rs.forEach((r) => { teamCount[r.team] = (teamCount[r.team] || 0) + 1; });
-    const rotationCount = Object.values(teamCount).filter((c) => c > 0).length;
+    const rotationCount = Object.keys(teamCount).length;
     const analyze = {};
-    for (const t of OPERATIONAL_TEAMS) {
-      const c = teamCount[t] || 0;
-      analyze[t] = (c > 1 && rotationCount > 1) ? "Rotated" : "";
-    }
-    table.push({ month: rs[0].date.month, name: rs[0].name, teamCount: teamCount, analyze: analyze });
+    Object.keys(teamCount).forEach((t) => {
+      analyze[t] = (teamCount[t] > 1 && rotationCount > 1) ? "Rotated" : "";
+    });
+    const pk = periodKey(rs[0].date, period);
+    table.push({ periodKey: pk, label: periodLabel(pk, period), name: rs[0].name, teamCount: teamCount, analyze: analyze });
   }
   return table;
 }
 
-function rotationSummary(rows) {
-  const wt = rotationWorkerTable(rows);
-  const byMonth = groupBy(wt, (r) => r.month);
+function rotationSummary(rows, period) {
+  period = period || "month";
+  const wt = rotationWorkerTable(rows, period);
+  const teams = distinctTeams(prepare(rows));
+  const byPeriod = groupBy(wt, (r) => r.periodKey);
   const out = [];
-  for (const month of Array.from(byMonth.keys()).sort()) {
-    const g = byMonth.get(month);
-    for (const t of OPERATIONAL_TEAMS) {
+  for (const pk of Array.from(byPeriod.keys()).sort()) {
+    const g = byPeriod.get(pk);
+    // monthly keeps the ISO month key ("2026-03", unchanged); weekly is "W7"
+    const label = period === "month" ? pk : g[0].label;
+    for (const t of teams) {
       const inTeam = g.filter((r) => (r.teamCount[t] || 0) >= 1);
       const pop = inTeam.length;
       if (pop === 0) continue;
@@ -461,7 +514,7 @@ function rotationSummary(rows) {
       const nonrot = pop - rotated;
       const oneday = inTeam.filter((r) => r.analyze[t] !== "Rotated" && (r.teamCount[t] || 0) === 1).length;
       out.push({
-        month: month, team: t, population: pop, rotation: rotated, non_rotation: nonrot,
+        month: label, team: t, population: pop, rotation: rotated, non_rotation: nonrot,
         oneday_nonrot: oneday,
         "rotation%": round2(rotated / pop * 100),
         "non_rotation%": round2(nonrot / pop * 100),
@@ -470,6 +523,71 @@ function rotationSummary(rows) {
     }
   }
   return out;
+}
+
+// New/Old face (slide p3): per (month, worker), the MAX distinct days at any
+// single team. Old (experienced) if that max >= 10, else New. With a team arg,
+// scope to that team (days at T), so Old = present at T with >=10 days at T.
+// Returns a wide block {counts:{Old,New}, pct:{"Old %","New %"}, monthLabels}
+// mirroring showupBlock's shape so one grid shaper renders both.
+const NEWOLD_MIN_DAYS = 10;
+function newOldMonthly(rows, team) {
+  const d = prepare(rows);
+  const x = team == null ? d : d.filter((r) => r.team === team);
+  const months = sortedUnique(x.map((r) => r.date.month));
+  const g = groupBy(x, (r) => r.date.month + SEP + r.name);
+  const raw = { Old: {}, New: {} };
+  months.forEach((m) => { raw.Old[m] = 0; raw.New[m] = 0; });
+  for (const rs of g.values()) {
+    const month = rs[0].date.month;
+    const byTeam = groupBy(rs, (r) => r.team);
+    let maxDays = 0;
+    for (const trs of byTeam.values()) {
+      const dd = new Set(trs.map((r) => r.date.key)).size;
+      if (dd > maxDays) maxDays = dd;
+    }
+    if (maxDays >= NEWOLD_MIN_DAYS) raw.Old[month]++; else raw.New[month]++;
+  }
+  const counts = { Old: {}, New: {} };
+  const pct = { "Old %": {}, "New %": {} };
+  months.forEach((m) => {
+    const ml = monthLabel(m);
+    const tot = raw.Old[m] + raw.New[m];
+    counts.Old[ml] = raw.Old[m];
+    counts.New[ml] = raw.New[m];
+    pct["Old %"][ml] = tot ? round2(raw.Old[m] / tot * 100) : 0.0;
+    pct["New %"][ml] = tot ? round2(raw.New[m] / tot * 100) : 0.0;
+  });
+  return { counts: counts, pct: pct, monthLabels: months.map(monthLabel) };
+}
+
+// Attendance headcount: distinct workers present per period, per team, plus an
+// "All" row across teams. Serves the daily ("day") and weekly ("week") grains
+// (the bucket/rotation/consecutive metrics can't run on a single day, so this
+// is the shared non-degenerate daily/weekly view). team rows x period cols.
+function attendanceCrosstab(rows, period) {
+  const d = prepare(rows);
+  const teams = distinctTeams(d);
+  const seenPeriods = {};
+  const map = {};      // team -> periodKey -> Set(name)
+  const allMap = {};   // periodKey -> Set(name)
+  d.forEach((r) => {
+    const pk = periodKey(r.date, period);
+    seenPeriods[pk] = true;
+    (map[r.team] = map[r.team] || {});
+    (map[r.team][pk] = map[r.team][pk] || new Set()).add(r.name);
+    (allMap[pk] = allMap[pk] || new Set()).add(r.name);
+  });
+  const periodKeys = Object.keys(seenPeriods).sort();
+  const periodLabels = periodKeys.map((k) => periodLabel(k, period));
+  const counts = {};
+  teams.forEach((t) => {
+    counts[t] = {};
+    periodKeys.forEach((pk, i) => { counts[t][periodLabels[i]] = (map[t] && map[t][pk]) ? map[t][pk].size : 0; });
+  });
+  const allRow = {};
+  periodKeys.forEach((pk, i) => { allRow[periodLabels[i]] = allMap[pk].size; });
+  return { teams: teams, periodLabels: periodLabels, counts: counts, allRow: allRow };
 }
 
 function workerMonthStats(d, team) {
@@ -563,20 +681,22 @@ function runSelfTests() {
   assert(out.length === 1 && out[0].date.key === "2026-07-09", "ref-date fallback");
   ok("test_ref_date_fallback");
 
-  // sentinel general: broken วันที่ recovered from วันที่.1; both broken -> throw
+  // sentinel general: broken วันที่ recovered from วันที่.1; both broken -> dropped
   out = loadRawFromValues([H, ["#VALUE!", "amy", "09:00", "Inbound", "2026-07-10", "SITE", "SH-1", "IB"]]);
   assert(out[0].date.key === "2026-07-10", "sentinel symmetric");
-  expectThrow(() => loadRawFromValues([H, ["#REF!", "ben", "09:00", "Inbound", "#N/A", "SITE", "SH-2", "IB"]]),
-    "no usable date", "sentinel both-broken");
+  out = loadRawFromValues([H,
+    ["#REF!", "ben", "09:00", "Inbound", "#N/A", "SITE", "SH-2", "IB"],
+    ["10 Jul 26", "dave", "09:00", "Inbound", "2026-07-10", "SITE", "SH-4", "IB"]]);
+  assert(out.length === 1 && out[0].name === "dave" && out.droppedNoDate === 1, "sentinel both-broken dropped");
   ok("test_sheets_error_sentinels_general");
 
-  // blank placeholder dropped; date-only-missing throws
+  // blank placeholder AND date-only-missing are BOTH dropped now (no attributable day)
   out = loadRawFromValues([H,
     ["", "CYD 11502 THAE THAE", "", "", "", "SITE", "", ""],
     ["9 Jul 26", "zoe", "09:00", "Inbound", "2026-07-09", "SITE", "SH-9", "IB"]]);
-  assert(out.length === 1 && out[0].name === "zoe", "placeholder dropped");
-  expectThrow(() => loadRawFromValues([H, ["", "carol", "09:00", "Inbound", "", "SITE", "SH-3", "IB"]]),
-    "other fields are populated", "date-only-missing");
+  assert(out.length === 1 && out[0].name === "zoe" && out.droppedNoDate === 1, "placeholder dropped");
+  out = loadRawFromValues([H, ["", "carol", "09:00", "Inbound", "", "SITE", "SH-3", "IB"]]);
+  assert(out.length === 0 && out.droppedNoDate === 1, "date-only-missing dropped");
   ok("test_blank_placeholder_row_dropped");
 
   // garbled clock-in tolerated; loses same-day tie to a real time
@@ -609,9 +729,13 @@ function runSelfTests() {
   // the rest of the row; วันที่ still valid -> recover the show-up day, don't throw
   out = loadRawFromValues([H, ["09 Jul 26", "BTS 0122 x", "19:00", "FSOCE ", "FSOCE ", "FSOCE ", "FSOCE ", "FSOCE "]]);
   assert(out.length === 1 && out[0].date.key === "2026-07-09", "garbage วันที่.1 recovered from วันที่");
-  // both date columns unparseable garbage, other fields populated -> still throws
-  expectThrow(() => loadRawFromValues([H, ["junk", "cara", "09:00", "Inbound", "junk", "SITE", "SH-1", "IB"]]),
-    "no usable date", "both date columns garbage still throws");
+  // both date columns unparseable garbage, other fields populated -> the row is
+  // DROPPED (no attributable day) and counted, not thrown (PNK 'Jul 26' decision)
+  out = loadRawFromValues([H,
+    ["junk", "cara", "09:00", "Inbound", "junk", "SITE", "SH-1", "IB"],
+    ["10 Jul 26", "dave", "09:00", "Inbound", "2026-07-10", "SITE", "SH-2", "IB"]]);
+  assert(out.length === 1 && out[0].name === "dave", "undated row dropped, dated row kept");
+  assert(out.droppedNoDate === 1, "no-date drop counted");
   ok("test_garbage_date_col_recovered");
 
   // clock-in header cell overwritten by a stray time -> repaired by position
@@ -619,6 +743,13 @@ function runSelfTests() {
   out = loadRawFromValues([Htime, ["9 Feb 26", "amy", "09:00", "Inbound", "2026-02-09", "SITE", "SH-1", "IB", "K1", "09:00-17:00"]]);
   assert(out.length === 1 && out[0].date.key === "2026-02-09" && out[0].clockin === "09:00", "clock-in header repaired");
   ok("test_corrupted_clockin_header_repaired");
+
+  // DSR 'Jan 26': the ค้นหา (name) header cell is BLANK, names real underneath;
+  // anchor on 'shift name' (2 cols right) to recover ค้นหา by position
+  const Hname = ["วันที่", "", "เข้างาน", "shift name", "วันที่", "DSR", "Shift_id", "team", "กะ", "เวลาเข้า-ออกงาน"];
+  out = loadRawFromValues([Hname, ["01 Jan 26", "DSRCW 0130 x", "23:00", "Small Sort", "2026-01-01", "DSR", "SS_N_23", "SS", "N", "23:00-08:00"]]);
+  assert(out.length === 1 && out[0].name === "DSRCW 0130 x" && out[0].date.key === "2026-01-01", "blank name header repaired");
+  ok("test_blank_name_header_repaired");
 
   // ragged rows normalized (wider + shorter than header)
   out = loadRawFromValues([H,
@@ -633,7 +764,8 @@ function runSelfTests() {
   assert(out.length === 1 && out[0].name === "amy", "duplicate header dropped");
   ok("test_duplicate_header_row_dropped");
 
-  // team learned from shift name; ambiguous throws; unlearnable -> shift name; both-missing dropped
+  // team learned from shift name; majority wins over noise; a TIE throws;
+  // unlearnable -> shift name; both-missing dropped
   out = loadRawFromValues([H,
     ["9 Jul 26", "amy", "09:00", "Outbound", "2026-07-09", "SITE", "SH-1", "OBD"],
     ["9 Jul 26", "ben", "09:00", "Outbound", "2026-07-09", "SITE", "SH-2", ""],
@@ -641,11 +773,19 @@ function runSelfTests() {
     ["9 Jul 26", "dan", "09:00", "FSOCE", "2026-07-09", "SITE", "SH-4", ""]]);
   const t2 = Object.fromEntries(out.map((r) => [r.name, r.team]));
   assert(t2["ben"] === "OBD" && t2["dan"] === "FSOCE", "team learned");
+  // majority vote: dominant team + noise -> the blank-team row gets the dominant team
+  out = loadRawFromValues([H,
+    ["9 Jul 26", "amy", "09:00", "Outbound", "2026-07-09", "SITE", "SH-1", "OB"],
+    ["9 Jul 26", "ben", "09:00", "Outbound", "2026-07-09", "SITE", "SH-2", "OB"],
+    ["9 Jul 26", "cara", "09:00", "Outbound", "2026-07-09", "SITE", "SH-3", "AdminA"],
+    ["9 Jul 26", "dan", "09:00", "Outbound", "2026-07-09", "SITE", "SH-4", ""]]);
+  assert(Object.fromEntries(out.map((r) => [r.name, r.team]))["dan"] === "OB", "majority team backfill");
+  // genuine tie (OBD x1 vs IB x1) has no dominant team -> still throws
   expectThrow(() => loadRawFromValues([H,
     ["9 Jul 26", "amy", "09:00", "Mixed", "2026-07-09", "SITE", "SH-1", "OBD"],
     ["9 Jul 26", "ben", "09:00", "Mixed", "2026-07-09", "SITE", "SH-2", "IB"],
     ["9 Jul 26", "cara", "09:00", "Mixed", "2026-07-09", "SITE", "SH-3", ""]]),
-    "more than one team", "ambiguous team");
+    "no majority", "tied team");
   out = loadRawFromValues([H, ["9 Jul 26", "erin", "09:00", "Ghost Shift", "2026-07-09", "SITE", "SH-9", ""]]);
   assert(out[0].team === "Ghost Shift", "unlearnable -> shift name as team");
   out = loadRawFromValues([H,
@@ -678,6 +818,37 @@ function runSelfTests() {
   assert(w["W10"][">=3"] === 4 && w["W11"][">=3"] === 2 && w["W14"][">=3"] === 1, "streak week");
   ok("engine_synthetic_numbers");
 
+  // data-driven teams: exactly the teams present in the clean set
+  assert(JSON.stringify(distinctTeams(df)) === JSON.stringify(["IB", "MS"]), "distinctTeams");
+  ok("test_distinct_teams");
+
+  // New/Old face: only grace (12 days at IB in Mar) clears the 10-day bar -> Old
+  const nof = newOldMonthly(df);
+  assert(nof.counts.Old["Mar"] === 1 && nof.counts.New["Mar"] === 7, "newold all Mar");
+  const nofIB = newOldMonthly(df, "IB");
+  assert(nofIB.counts.Old["Mar"] === 1 && nofIB.counts.New["Mar"] === 7, "newold IB Mar");
+  // a worker split 5+6 across two teams (max 6 < 10) stays New despite 11 total days
+  const split = makeCleanRows([
+    ["zed", "IB", [2026, 6, 1]], ["zed", "IB", [2026, 6, 2]], ["zed", "IB", [2026, 6, 3]],
+    ["zed", "IB", [2026, 6, 4]], ["zed", "IB", [2026, 6, 5]],
+    ["zed", "MS", [2026, 6, 8]], ["zed", "MS", [2026, 6, 9]], ["zed", "MS", [2026, 6, 10]],
+    ["zed", "MS", [2026, 6, 11]], ["zed", "MS", [2026, 6, 12]], ["zed", "MS", [2026, 6, 15]],
+  ]);
+  assert(newOldMonthly(split).counts.New["Jun"] === 1 && newOldMonthly(split).counts.Old["Jun"] === 0, "newold split-max<10 is New");
+  ok("test_newold_face");
+
+  // attendance headcount: 6 distinct workers present on Mar-02, all in IB
+  const ad = attendanceCrosstab(df, "day");
+  assert(ad.counts["IB"]["2026-03-02"] === 6 && ad.allRow["2026-03-02"] === 6, "attendance daily");
+  const aw = attendanceCrosstab(df, "week");
+  assert(aw.allRow["W10"] === 6, "attendance weekly W10");
+  ok("test_attendance_crosstab");
+
+  // weekly rotation reuses the monthly logic per ISO week (smoke: shape + fields)
+  const rw = rotationSummary(df, "week");
+  assert(rw.length > 0 && rw[0].month[0] === "W" && "population" in rw[0], "weekly rotation shape");
+  ok("test_rotation_weekly");
+
   log.push("ALL SELF-TESTS PASSED");
   return [{ json: { passed: true, log: log } }];
 }
@@ -692,6 +863,7 @@ if (typeof module !== "undefined") {
     loadRawFromValues: loadRawFromValues, cleanRaw: cleanRaw, rowsToRawObjects: rowsToRawObjects,
     showupBlock: showupBlock, rotationSummary: rotationSummary, streakMonthCrosstab: streakMonthCrosstab,
     streakWeek: streakWeek, makeDate: makeDate, monthLabel: monthLabel, runSelfTests: runSelfTests,
+    distinctTeams: distinctTeams, newOldMonthly: newOldMonthly, attendanceCrosstab: attendanceCrosstab,
     OPERATIONAL_TEAMS: OPERATIONAL_TEAMS, BUCKETS: BUCKETS,
   };
 }

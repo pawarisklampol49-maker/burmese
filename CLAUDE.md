@@ -183,17 +183,55 @@ setup and nothing to re-paste when 2027 rolls over.
 - Config is **Script Properties** (successor-editable, no code change):
   `CENTRAL_FOLDER_ID`, `RAW_DEPARTMENTS`. Run `initProperties()` once to seed.
 
-**Summaries are now PER-SOC, not combined.** Each of the 3 summary tabs holds
-4 stacked, labeled sections (SOCN, SOCE, SOCW, FSOCW), each the *same*
-computation (`showupBlock`/`rotationSummary`/`streakMonthCrosstab`) scoped to
-that one department's slim slice — `writeStacked_` in `Code.gs`. The same
-name+date across two different SOCs is fine — they're separate sections.
-(Render/app.py computed each summary once over all departments combined —
-that's the behavior this changes.)
+**Departments are SOCN / SOCE / SOCW (FSOCW dropped).** `RAW_DEPARTMENTS` =
+`SOCN,SOCE,SOCW`. (`FSOCN` is a *station* inside SOCN, not the dropped `FSOCW`
+department.) Some vendors are excluded via the `SKIP_VENDORS` Script Property
+(`PPO,WAS,RG,YSL,BigBoom`) — a loud, logged skip, so SOCN totals legitimately
+won't match the slide deck's "7 vendors / 5,298 names".
+
+**One spreadsheet PER SOC PER YEAR**, titled `<YEAR>_<DEPT>` (e.g. `2026_SOCN`,
+`2026_SOCE`, `2026_SOCW`), each created in the Central folder by the script
+itself. Each holds exactly **5 tabs**: one `raw` tab + **one tab per aspect**
+(`New-Old Face`, `Show Up`, `Consecutive`, `Rotation` — `ASPECT_TABS`). So there
+is no single combined yearly sheet anymore; each SOC's data lives in its own file.
+`findOrCreateSocSheet_` + `prepareSocSheet_` build the 5-tab shape; `sync` keys
+its streaming context by `(year, dept)`.
+
+**Summaries follow the slide deck.** Each aspect tab stacks that aspect at
+monthly / weekly / daily grain, **grouped by team**:
+  - **New / Old face** (`newOldMonthly`) — per (month, worker) the MAX distinct
+    days at any single team; **Old** (experienced) if that max ≥ 10, else **New**
+    (rotation does not disqualify). Monthly, All + per team.
+  - **Show up** (`showupBlock`) — day-count buckets 1-5/6-10/11-15/16-20/21-30.
+    Monthly, All + per team.
+  - **3-day consecutive** (`streakMonthCrosstab` monthly + `streakWeek` weekly).
+  - **Rotation** (`rotationSummary`, monthly + weekly).
+  - within each aspect tab, the **weekly/daily** grain for the inherently-monthly
+    aspects (New/Old, Show up) is the **Attendance** headcount (`attendanceCrosstab`
+    — distinct workers present per week/day, per team); Consecutive carries its own
+    real weekly (`streakWeek`) and Rotation its own real weekly (`rotationSummary`
+    period `week`), each plus a daily attendance block. This is the "daily" the
+    user asked for — the bucket/rotation/consecutive metrics can't run on a single
+    day.
+
+Teams are **data-driven per SOC** (`distinctTeams` — the distinct `team` values
+in that SOC's own slice), not a fixed station list; abbreviations differ across
+SOCs (e.g. `OB` vs `OBD`) and each SOC is a separate file. The hardcoded
+`OPERATIONAL_TEAMS`/`STATIONS_*` remain only for the local `render/test.py` mock.
+Assembly: one `*TabGrid_` builder per aspect (`newOldTabGrid_`/`showUpTabGrid_`/
+`consecutiveTabGrid_`/`rotationTabGrid_`, dispatched by `aspectGridFor_`) +
+`writeSummaryTab_` in `Code.gs` (which resizes each tab to its actual grid before
+writing, since the daily-attendance section is wide — one column per calendar day).
+
+**Excluded / deferred:** slide p2 "% Burmese" and Cap.-per-station need total
+(non-Burmese) headcount we don't have (Burmese-only name lists) — out of scope.
+Drill-down ("click a cell → the list of people behind the number") is deferred;
+static tables only for now (a plain values-written Sheet can't do per-cell
+drill-down without extra machinery).
 
 `Code.gs` dedups one row per `(name,date)` (keeping the earliest clock-in, the
 same rule `cleanRaw` uses within a tab) both **per vendor file** before writing
-its raw dept-tab rows and **per department** before the summaries —
+its rows to that SOC's `raw` tab and **per (year, dept)** before the summaries —
 `dedupByNameDate_`. This is needed because month tabs overlap at boundaries: a
 `Mar 26` tab and an `Apr 26` tab both carry the same Apr-1 show-up (confirmed
 live for SPT — identical team and clock-in in both). Worker names are
@@ -202,11 +240,11 @@ ever happens within one vendor across adjacent tabs, never across vendors.
 Where app.py's `run_sync` *threw* on a duplicate `(name,date)`, the Apps Script
 collapses it — a show-up recorded in two tabs is one show-up, not an error.
 
-Still true from the old design (the raw side is unchanged): 4 raw dept tabs
-`SOCN/SOCE/SOCW/FSOCW` with the verbatim 8-col header `Date show up | Month
-show up | Sub-con name | Name | Clock in | shift name | Shift_id | team`
-(RAW), always written even if header-only; recompute-from-scratch every run
-(prepare clears all 7 tabs first); year derived from each row's actual date.
+Still true from the old design (the raw side is unchanged): each SOC file's `raw`
+tab has the verbatim 8-col header `Date show up | Month show up | Sub-con name |
+Name | Clock in | shift name | Shift_id | team` (RAW), always written even if
+header-only; recompute-from-scratch every run (`prepareSocSheet_` clears all 5
+tabs first and deletes strays); year derived from each row's actual date.
 
 **Durable-account requirement (handoff-critical):** the script and its daily
 trigger run as whichever Google account owns the project. That account must

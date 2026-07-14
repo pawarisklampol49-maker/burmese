@@ -4,7 +4,7 @@ This is for whoever operates this system day to day. It doesn't assume you can r
 
 ## What this does, in one paragraph
 
-Every day, a small Google Apps Script reads every worker attendance file across all 4 departments (SOCN, SOCE, SOCW, FSOCW) and updates one summary spreadsheet per year in the Central folder. It runs entirely inside Google — there's no separate server. You never run it by hand, you never tell it about a new file (it finds them itself), and you never create the yearly spreadsheet by hand (it makes that itself too). The only rule is that the raw files are named correctly and shared with the account that owns the script.
+Every day, a small Google Apps Script reads every worker attendance file across the 3 departments (SOCN, SOCE, SOCW) and updates one summary spreadsheet per year in the Central folder. It runs entirely inside Google — there's no separate server. You never run it by hand, you never tell it about a new file (it finds them itself), and you never create the yearly spreadsheet by hand (it makes that itself too). The only rule is that the raw files are named correctly and shared with the account that owns the script.
 
 ## Where the script lives
 
@@ -22,7 +22,7 @@ It's a **standalone Apps Script project** (not attached to any spreadsheet), own
 1. **A real Google Sheet** (File → New → Google Sheets, or a copy of an existing one) — not a CSV file just sitting in Drive.
 2. **Named exactly like this:** `[DEPARTMENT YEAR]_Daily name list_VENDOR`
    - Example: `[SOCE 2026]_Daily name list_BTS`
-   - `DEPARTMENT` must be one of: `SOCN`, `SOCE`, `SOCW`, `FSOCW`
+   - `DEPARTMENT` must be one of: `SOCN`, `SOCE`, `SOCW`
    - `YEAR` is a 4-digit year
    - `VENDOR` is the staffing vendor's short code (BTS, CYD, SPT, DSR, WAS, etc. — whatever it already is)
    - Get the brackets, spaces, and underscores exactly right — the system matches this pattern precisely and will refuse to run (rather than guess) if a file's name is close but not exact.
@@ -33,12 +33,19 @@ If a file is missing any of this, the daily sync fails loudly (rather than silen
 
 ## Where results live
 
-Open the **Central** Drive folder. Inside it, one spreadsheet per year, named just the year (e.g. `2026`, `2027`). Each one has 7 tabs:
+Open the **Central** Drive folder. Inside it, **one spreadsheet per SOC per year**, named `<YEAR>_<DEPT>` — e.g. `2026_SOCN`, `2026_SOCE`, `2026_SOCW` (and `2027_SOCN`, … next year). The script creates each one itself. Each spreadsheet has **5 tabs**: one `raw` tab + one tab per analysis aspect.
 
-- **`SOCN`, `SOCE`, `SOCW`, `FSOCW`** — one tab per department, showing every worker's show-up day that year, combined across all that department's vendor files. Columns: *Date show up, Month show up, Sub-con name (the vendor), Name, Clock in, shift name, Shift_id, team*.
-- **`Summary_1`, `Summary_Rotation`, `Summary_5`** — the three analysis views (show-up day buckets, station rotation, consecutive-day streaks). Each of these tabs is split into **4 stacked sections, one per department** (SOCN, then SOCE, then SOCW, then FSOCW), each labeled — so you read each SOC's numbers separately, not blended together.
+- **`raw`** — every worker's show-up day that year for this SOC, combined across all its vendor files. Columns: *Date show up, Month show up, Sub-con name (the vendor), Name, Clock in, shift name, Shift_id, team*.
+- **`New-Old Face`** — Old = worked ≥10 days at a single station that month (experienced), else New. By team, plus weekly/daily attendance.
+- **`Show Up`** — day-count buckets (1-5 / 6-10 / 11-15 / 16-20 / 21-30 days in a month). By team, plus weekly/daily attendance.
+- **`Consecutive`** — worked ≥3 days in a row: monthly and weekly. By team, plus daily attendance.
+- **`Rotation`** — worked at a station more than once and whether they were rotated to others: monthly and weekly. By team, plus daily attendance.
 
-**Important: all 7 tabs are wiped and rewritten every single day.** If you type anything directly into these tabs, it's gone the next morning. To correct something, fix it in the *source* file (the vendor's raw sheet), not here.
+"By team" means every station in that SOC's data gets its own rows. "Attendance" is simply how many distinct people showed up each week/day per team — the day/week view for the aspects that only make sense over a whole month.
+
+Two things the slide shows that this does **not** produce: the **"% Burmese"** figure and **capacity-per-station** targets — both need the total (non-Burmese) headcount, which these Burmese-only name lists don't contain. Also, clicking a summary number to see **the list of people behind it** is a planned future feature, not built yet.
+
+**Important: all 5 tabs in every SOC spreadsheet are wiped and rewritten every single day.** If you type anything directly into these tabs, it's gone the next morning. To correct something, fix it in the *source* file (the vendor's raw sheet), not here.
 
 ## If the daily run fails
 
@@ -46,7 +53,7 @@ Open the **Central** Drive folder. Inside it, one spreadsheet per year, named ju
 2. Common causes and what they mean:
    - *"no raw vendor spreadsheets found"* — the owning account can't see any files. Check the sharing step above.
    - *"doesn't match … pattern"* — a file was found but its name doesn't exactly follow `[DEPARTMENT YEAR]_Daily name list_VENDOR`. Fix the name.
-   - *"unrecognized department"* — a file's department code isn't one of SOCN/SOCE/SOCW/FSOCW. Check for a typo in the file name.
+   - *"unrecognized department"* — a file's department code isn't one of SOCN/SOCE/SOCW. Check for a typo in the file name.
    - *"duplicate (name,date)"* — the same worker appears on the same date in two vendor files **for the same department**. A human needs to look at the source data and decide which is right.
    - a message ending in *"…: <something about a date / team / column>"* prefixed with a file name and tab — a specific bad row in that vendor sheet; the message names the file and tab.
 3. To test without waiting for the schedule: in the editor, pick the **`dryRun`** function and Run it, then open **Executions** to read its log — it reports what it found (files, row counts) and writes nothing. To do a real run on demand, Run **`sync`**.
@@ -67,7 +74,7 @@ Once the project is owned by a durable account, nothing about the daily run depe
 
 ## Glossary
 
-- **Department (SOC)**: one of SOCN, SOCE, SOCW, FSOCW — the four groups this system tracks. Each now gets its own section in every summary tab.
+- **Department (SOC)**: one of SOCN, SOCE, SOCW — the three groups this system tracks. Each gets its own raw tab and its own `<DEPT> Summary` tab.
 - **Vendor** (a.k.a. "Sub-con"): a staffing agency that supplies workers (BTS, CYD, SPT, DSR, WAS, etc.). Not a physical location — just which agency the worker's file came through. Kept for traceability only; nothing is calculated "per vendor."
 - **Central folder**: the one Drive folder where every year's finished summary spreadsheet lives, and where the script auto-creates each new year's sheet.
 - **Apps Script**: Google's built-in automation tool. Our script is "standalone" (its own project, not attached to a sheet) and runs on a daily timer.

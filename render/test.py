@@ -17,6 +17,16 @@ INPUT CONTRACT (clean set, one row per worker per show-up day; clock-ins only):
     need them; that richness is not part of this contract.
 
 LOCKED DEFINITIONS
+  - Teams/stations are DATA-DRIVEN (distinct_teams): the distinct `team` values
+    present in each SOC's own clean set, not a fixed list. (The old hardcoded
+    OPERATIONAL_TEAMS/STATIONS_* remain only for the local mock render.)
+  - New/Old face (slide p3): per (month, worker), the MAX distinct days at any
+    single team. Old (experienced) if that max >= 10, else New. Scoped to a team
+    T, Old = present at T with >= 10 days at T. (NEWOLD_MIN_DAYS = 10.)
+  - Granularity: month (default), ISO week, or day, via a shared period key.
+    Bucket/rotation/consecutive logic is inherently multi-day; the day/week grain
+    for those is attendance_crosstab (distinct workers present per period, per
+    team) -- the shared non-degenerate daily/weekly view.
   - Show-up day = one clock-in on one date = 1. Days/worker/month = distinct dates.
   - Buckets 1-5,6-10,11-15,16-20,21-30. % over that scope's bucketed workers.
     ALL scope: days = total across teams. STATION scope: days = days in that station.
@@ -89,28 +99,37 @@ _KNOWN_SHIFT_TEAM = {
 
 
 def _repair_date_header_positions(header: list) -> list:
-    """A fragile header cell can itself be overwritten by a stray value -- not
-    one of _SHEETS_ERROR_SENTINELS, just a bare number or a time. Confirmed
-    live: BTS 'May 26' had "49" where the first วันที่ should be; PPO 'Feb 26'
-    had "11:00:00 AM" where เข้างาน (clock-in) should be. The column ORDER is
-    unaffected, only that one cell's text -- the locked schema (CLAUDE.md's
-    Input section) fixes the fragile columns by position relative to the two
-    anchor names that have never been seen corrupted, ค้นหา and 'shift name':
-    วันที่ = ค้นหา-1, เข้างาน = ค้นหา+1, second วันที่ = shift name+1.
-    Only ever consulted as a fallback (see _find_header_row/_resolve_header)
-    when strict name-matching has already failed for a row -- never touches
-    an already-working header."""
-    if "ค้นหา" not in header or "shift name" not in header:
+    """A fragile header cell can itself be overwritten by a stray value or left
+    blank -- not one of _SHEETS_ERROR_SENTINELS, just a bare number, a time, or
+    an empty string. Confirmed live: BTS 'May 26' had "49" where the first
+    วันที่ should be; PPO 'Feb 26' had "11:00:00 AM" where เข้างาน (clock-in)
+    should be; DSR 'Jan 26' had a BLANK ค้นหา (name) cell with real names
+    underneath. The column ORDER is unaffected, only that one cell's text -- the
+    locked schema (CLAUDE.md's Input section) fixes the fragile columns by
+    position. The block is located by EITHER anchor still intact: ค้นหา, or
+    'shift name' (fixed 2 columns to its right). ค้นหา itself can be the
+    corrupted cell, so it can't be the sole anchor. From the located name index:
+    วันที่ = name-1, ค้นหา = name, เข้างาน = name+1, shift name = name+2, second
+    วันที่ = name+3. Only ever consulted as a fallback (see _find_header_row/
+    _resolve_header) when strict name-matching has already failed -- never
+    touches an already-working header, and a mis-repair still has to pass the
+    superset check AND real date parsing downstream."""
+    if "ค้นหา" in header:
+        name_idx = header.index("ค้นหา")
+    elif "shift name" in header and header.index("shift name") >= 2:
+        name_idx = header.index("shift name") - 2   # ค้นหา sits 2 left of shift name
+    else:
         return header
     header = list(header)
-    name_idx = header.index("ค้นหา")
-    shift_idx = header.index("shift name")
     if name_idx - 1 >= 0:
         header[name_idx - 1] = "วันที่"
+    header[name_idx] = "ค้นหา"
     if name_idx + 1 < len(header):
         header[name_idx + 1] = "เข้างาน"
-    if shift_idx + 1 < len(header):
-        header[shift_idx + 1] = "วันที่"
+    if name_idx + 2 < len(header):
+        header[name_idx + 2] = "shift name"
+    if name_idx + 3 < len(header):
+        header[name_idx + 3] = "วันที่"
     return header
 
 
@@ -235,42 +254,25 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     # known sentinel. Confirmed live in [SOCE 2026]_Daily name list_BTS 'Jul 26'
     # row 2074, where a broken formula spilled the shift name ("FSOCE ") across
     # วันที่.1 and the rest of the row while วันที่ still held "09 Jul 26". A row
-    # with no valid date in EITHER column is still caught below (placeholder-drop
-    # or the "no usable date" throw); two DIFFERENT valid dates still trips the
-    # disagree throw.
+    # with no valid date in EITHER column is dropped-and-counted below; two
+    # DIFFERENT valid dates still trips the disagree throw.
     d1 = pd.to_datetime(_clear_sheets_errors(df["วันที่"]), format="mixed", dayfirst=True, errors="coerce")
     d2 = pd.to_datetime(_clear_sheets_errors(df["วันที่.1"]), format="%Y-%m-%d", errors="coerce")
     d1, d2 = d1.fillna(d2), d2.fillna(d1)
 
+    # A row with no usable date in EITHER column has no attributable calendar
+    # day (streaks in Summary_5 need a real day), so it can't be counted as a
+    # show-up -- DROP it and count it, rather than throwing and blocking the
+    # whole sync or fabricating a day. Per user decision (confirmed live: PNK
+    # 'Jul 26' had 109 rows with a full work record -- name/clock/shift/team --
+    # but both date cells simply blank; earlier CYD 'Feb 26' had 2 all-blank
+    # roster placeholders). The count is surfaced on df.attrs['dropped_no_date']
+    # so the caller logs it and the drop is never silent.
     unrecoverable = d1.isna() & d2.isna()
+    dropped_no_date = int(unrecoverable.sum())
     if unrecoverable.any():
-        # Confirmed live: [SOCE 2026]_Daily name list_CYD, tab Feb 26 -- 2
-        # rows have a name but every other field (date, team, shift,
-        # clock-in, Shift_id) genuinely blank. Not a broken formula, and not
-        # a real show-up (no date to attribute one to) -- a roster
-        # placeholder, same shape as the already-dropped fully-blank trailer
-        # rows, just with a name surviving the ค้นหา.notna() filter. Only
-        # drop when EVERYTHING else is also blank; a row missing just the
-        # date while team/shift/clock-in are populated looks like a real
-        # worked shift with an unknown date, which is a genuine gap worth
-        # stopping for, not silently discarding.
-        placeholder = (
-            unrecoverable
-            & df["team"].isna()
-            & df["shift name"].isna()
-            & df["เข้างาน"].isna()
-            & df["Shift_id"].isna()
-        )
-        if placeholder.any():
-            keep = ~placeholder
-            df, d1, d2, unrecoverable = df[keep], d1[keep], d2[keep], unrecoverable[keep]
-
-    if unrecoverable.any():
-        names = df.loc[unrecoverable, "ค้นหา"].head(5).tolist()
-        raise ValueError(
-            f"{int(unrecoverable.sum())} row(s) have no usable date in either วันที่ or วันที่.1 "
-            f"but other fields are populated -- stop, ask. First workers: {names}"
-        )
+        keep = ~unrecoverable
+        df, d1, d2 = df[keep], d1[keep], d2[keep]
 
     mismatch = d1 != d2
     if mismatch.any():
@@ -291,19 +293,28 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     # from whichever OTHER rows in THIS tab already have both, but only for
     # shift names that actually have a row needing backfill -- a shift name
     # is free to appear with more than one team elsewhere in real data as
-    # long as nothing missing depends on it. Ambiguous (multiple teams for a
-    # NEEDED shift name) still throws.
+    # long as nothing missing depends on it. When a NEEDED shift name maps to
+    # multiple teams, resolve to its MAJORITY team: team is an abbreviation of
+    # shift name, so the dominant pairing is the real mapping and the minority
+    # are data-entry noise (confirmed live: SPT 'Jul 26' "Outbound" -> OB x195
+    # with a scatter of stray teams, "Helper" -> Helper x9 with 3 stray). Only
+    # a genuine TIE for the top (no dominant team) is real ambiguity and throws.
     missing_team = df["team"].isna()
     if missing_team.any():
         needed = set(shift[missing_team])
         has_team = df["team"].notna()
-        learned = pd.DataFrame({"shift": shift[has_team], "team": df.loc[has_team, "team"]}).drop_duplicates()
-        relevant = learned[learned["shift"].isin(needed)]
-        ambiguous = relevant["shift"].duplicated(keep=False)
-        if ambiguous.any():
-            bad = sorted(relevant.loc[ambiguous, "shift"].unique())
-            raise ValueError(f"shift name(s) map to more than one team, can't backfill safely: {bad} -- stop, ask")
-        shift_to_team = relevant.set_index("shift")["team"]
+        pairs = pd.DataFrame({"shift": shift[has_team], "team": df.loc[has_team, "team"]})
+        pairs = pairs[pairs["shift"].isin(needed)]
+        resolved, tied = {}, []
+        for s, grp in pairs.groupby("shift"):
+            vc = grp["team"].value_counts()
+            if len(vc) > 1 and vc.iloc[0] == vc.iloc[1]:
+                tied.append(s)                 # no dominant team -> ambiguous
+            else:
+                resolved[s] = vc.index[0]      # majority team wins
+        if tied:
+            raise ValueError(f"shift name(s) map to multiple teams with no majority (a tie), can't backfill safely: {sorted(tied)} -- stop, ask")
+        shift_to_team = pd.Series(resolved, dtype=object)
 
         backfilled = shift[missing_team].map(shift_to_team).astype(df["team"].dtype)
         df.loc[missing_team, "team"] = backfilled
@@ -361,6 +372,7 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     dup = out.duplicated(subset=["name", "date"]).sum()
     if dup:
         raise ValueError(f"{dup} duplicate (name,date) rows survived dedup -- clean set must be one row per worker per day")
+    out.attrs["dropped_no_date"] = dropped_no_date   # surfaced for the caller to log
     return out
 
 
@@ -416,26 +428,45 @@ def _days_pwm(d, team=None):
     return x.groupby(["month", "name"]).size().rename("days").reset_index()
 
 
-def rotation_worker_table(df):
+def distinct_teams(df):
+    """The distinct teams present, sorted -- data-driven (replaces the hardcoded
+    OPERATIONAL_TEAMS; station lists differ per SOC)."""
+    return sorted(_prepare(df)["team"].unique())
+
+
+def _period_series(d, period):
+    """(sort_key, display_label) Series for 'month' (default), ISO 'week', or 'day'."""
+    if period == "week":
+        wk = d["iso_week"].astype(int)
+        key = d["iso_year"].astype(str) + "-W" + wk.map(lambda w: f"{w:02d}")
+        return key, "W" + wk.astype(str)
+    if period == "day":
+        key = d["date"].astype(str)
+        return key, key
+    return d["month"], d["month"].map(_month_label)
+
+
+def rotation_worker_table(df, period="month"):
     d = _prepare(df)
-    piv = d.pivot_table(index=["month", "name"], columns="team",
+    key, label = _period_series(d, period)
+    d = d.assign(_pk=key, _plabel=label)
+    piv = d.pivot_table(index=["_pk", "_plabel", "name"], columns="team",
                         values="date", aggfunc="count", fill_value=0)
     team_cols = list(piv.columns)
-    piv["Grand Total"] = piv[team_cols].sum(axis=1)
     piv["Rotation count"] = (piv[team_cols] > 0).sum(axis=1)
-    for t in OPERATIONAL_TEAMS:
-        if t in team_cols:
-            piv[f"Analyze {t}"] = ((piv[t] > 1) & (piv["Rotation count"] > 1)).map({True: "Rotated", False: ""})
-        else:
-            piv[f"Analyze {t}"] = ""
+    for t in team_cols:                        # data-driven: only teams present
+        piv[f"Analyze {t}"] = ((piv[t] > 1) & (piv["Rotation count"] > 1)).map({True: "Rotated", False: ""})
     return piv.reset_index()
 
 
-def rotation_summary(df):
-    wt = rotation_worker_table(df)
+def rotation_summary(df, period="month"):
+    wt = rotation_worker_table(df, period)
+    teams = distinct_teams(df)
     rows = []
-    for month, g in wt.groupby("month"):
-        for t in OPERATIONAL_TEAMS:
+    for pk, g in wt.groupby("_pk"):
+        # monthly keeps the ISO month key ("2026-03", unchanged); weekly is "W7"
+        label = pk if period == "month" else g["_plabel"].iloc[0]
+        for t in teams:
             if t not in g.columns:
                 continue
             in_team = g[g[t] >= 1]
@@ -445,12 +476,61 @@ def rotation_summary(df):
             rotated = int((in_team[f"Analyze {t}"] == "Rotated").sum())
             nonrot = pop - rotated
             oneday = int(((in_team[f"Analyze {t}"] != "Rotated") & (in_team[t] == 1)).sum())  # READING B
-            rows.append({"month": month, "team": t, "population": pop, "rotation": rotated,
+            rows.append({"month": label, "team": t, "population": pop, "rotation": rotated,
                          "non_rotation": nonrot, "oneday_nonrot": oneday,
                          "rotation%": round(rotated / pop * 100, 2),
                          "non_rotation%": round(nonrot / pop * 100, 2),
                          "oneday%": round(oneday / nonrot * 100, 2) if nonrot else float("nan")})
     return pd.DataFrame(rows)
+
+
+NEWOLD_MIN_DAYS = 10
+
+
+def new_old_monthly(df, team=None):
+    """New/Old face (slide p3): per (month, worker), the MAX distinct days at any
+    single team; Old (experienced) if that max >= 10, else New. With a team arg,
+    scope to that team. Returns (counts, pct) DataFrames shaped like showup_block
+    (rows Old/New, cols=month labels)."""
+    d = _prepare(df)
+    x = d if team is None else d[d["team"] == team]
+    months = _mcols(d)
+    labels = [_month_label(m) for m in months]
+    counts = pd.DataFrame(0, index=["Old", "New"], columns=labels)
+    if len(x):
+        per_team = x.groupby(["month", "name", "team"]).size().rename("days").reset_index()
+        max_days = per_team.groupby(["month", "name"])["days"].max().reset_index()
+        max_days["face"] = max_days["days"].map(lambda v: "Old" if v >= NEWOLD_MIN_DAYS else "New")
+        for m, ml in zip(months, labels):
+            g = max_days[max_days["month"] == m]
+            counts.loc["Old", ml] = int((g["face"] == "Old").sum())
+            counts.loc["New", ml] = int((g["face"] == "New").sum())
+    pct = pd.DataFrame(0.0, index=["Old %", "New %"], columns=labels)
+    for ml in labels:
+        tot = counts.loc["Old", ml] + counts.loc["New", ml]
+        pct.loc["Old %", ml] = round(counts.loc["Old", ml] / tot * 100, 2) if tot else 0.0
+        pct.loc["New %", ml] = round(counts.loc["New", ml] / tot * 100, 2) if tot else 0.0
+    return counts, pct
+
+
+def attendance_crosstab(df, period):
+    """Distinct workers present per period, per team, + an 'All' row across teams.
+    Serves the daily ('day') and weekly ('week') grains. team rows x period cols."""
+    d = _prepare(df)
+    teams = distinct_teams(df)
+    key, label = _period_series(d, period)
+    d = d.assign(_pk=key, _plabel=label)
+    period_keys = sorted(d["_pk"].unique())
+    labels = [d[d["_pk"] == k]["_plabel"].iloc[0] for k in period_keys]
+    counts = pd.DataFrame(0, index=teams, columns=labels)
+    for t in teams:
+        xt = d[d["team"] == t]
+        n = xt.groupby("_pk")["name"].nunique()
+        for k, lab in zip(period_keys, labels):
+            counts.loc[t, lab] = int(n.get(k, 0))
+    all_row = d.groupby("_pk")["name"].nunique()
+    all_series = pd.Series({lab: int(all_row.get(k, 0)) for k, lab in zip(period_keys, labels)})
+    return counts, all_series
 
 
 def _worker_month_stats(d, team=None):
@@ -601,20 +681,17 @@ def _test_garbage_date_col_recovered():
     """Confirmed live: [SOCE 2026]_Daily name list_BTS, tab 'Jul 26' row 2074 --
     a broken formula spilled the shift name ("FSOCE ") across วันที่.1 and the
     rest of the row while วันที่ still held a clean "09 Jul 26". The valid
-    sibling recovers the show-up day; only when BOTH date columns are
-    unrecoverable (and other fields are populated) does it stop and ask."""
+    sibling recovers the show-up day; when BOTH date columns are unrecoverable
+    the row is DROPPED (no attributable day) and counted, not thrown."""
     header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
     row = ["09 Jul 26", "BTS 0122 x", "19:00", "FSOCE ", "FSOCE ", "FSOCE ", "FSOCE ", "FSOCE "]
     out = _clean_raw(_rows_to_raw_df([header, row]))
     assert len(out) == 1 and out.iloc[0]["date"] == pd.Timestamp(2026, 7, 9)
 
     both_bad = ["junk", "cara", "09:00", "Inbound", "junk", "SITE", "SH-1", "IB"]
-    try:
-        _clean_raw(_rows_to_raw_df([header, both_bad]))
-    except Exception:
-        pass
-    else:
-        raise AssertionError("expected 'no usable date', not a silent guess")
+    good = ["10 Jul 26", "dave", "09:00", "Inbound", "2026-07-10", "SITE", "SH-2", "IB"]
+    out = _clean_raw(_rows_to_raw_df([header, both_bad, good]))
+    assert list(out["name"]) == ["dave"] and out.attrs["dropped_no_date"] == 1
     print("_test_garbage_date_col_recovered passed")
 
 
@@ -632,6 +709,22 @@ def _test_corrupted_clockin_header_repaired():
     assert len(out) == 1 and out.iloc[0]["date"] == pd.Timestamp(2026, 2, 9)
     assert out.iloc[0]["clockin"] == "09:00"
     print("_test_corrupted_clockin_header_repaired passed")
+
+
+def _test_blank_name_header_repaired():
+    """Confirmed live: [SOCW 2026]_Daily name list_DSR, tab 'Jan 26' -- the
+    ค้นหา (name) header cell was BLANK with real names underneath, while every
+    other column (incl. 'shift name') was intact. ค้นหา can't be the sole
+    anchor when it's the corrupted cell, so the repair anchors on 'shift name'
+    (2 cols right) and recovers ค้นหา by position."""
+    header = ["วันที่", "", "เข้างาน", "shift name", "วันที่", "DSR",
+              "Shift_id", "team", "กะ", "เวลาเข้า-ออกงาน"]
+    row = ["01 Jan 26", "DSRCW 0130 x", "23:00", "Small Sort", "2026-01-01", "DSR",
+           "SS_N_23", "SS", "N", "23:00-08:00"]
+    out = _clean_raw(_rows_to_raw_df([header, row]))
+    assert len(out) == 1 and out.iloc[0]["name"] == "DSRCW 0130 x"
+    assert out.iloc[0]["date"] == pd.Timestamp(2026, 1, 1)
+    print("_test_blank_name_header_repaired passed")
 
 
 def _test_ragged_rows_normalized():
@@ -684,18 +777,29 @@ def _test_team_learned_from_shift_name():
     teams = out.set_index("name")["team"]
     assert teams["ben"] == "OBD" and teams["dan"] == "FSOCE"
 
-    # ambiguous: same shift name, two different known teams -- must throw
-    ambiguous_rows = [
+    # majority vote: a needed shift with a dominant team + noise resolves to the
+    # dominant one (confirmed live: SPT 'Jul 26' "Outbound" -> OB x195 + strays)
+    majority_rows = [
+        ["9 Jul 26", "amy", "09:00", "Outbound", "2026-07-09", "SITE", "SH-1", "OB"],
+        ["9 Jul 26", "ben", "09:00", "Outbound", "2026-07-09", "SITE", "SH-2", "OB"],
+        ["9 Jul 26", "cara", "09:00", "Outbound", "2026-07-09", "SITE", "SH-3", "AdminA"],
+        ["9 Jul 26", "dan", "09:00", "Outbound", "2026-07-09", "SITE", "SH-4", ""],   # -> OB
+    ]
+    outm = _clean_raw(_rows_to_raw_df([header] + majority_rows))
+    assert outm.set_index("name")["team"]["dan"] == "OB"
+
+    # genuine tie (OBD x1 vs IB x1) has no dominant team -- must throw
+    tied_rows = [
         ["9 Jul 26", "amy", "09:00", "Mixed", "2026-07-09", "SITE", "SH-1", "OBD"],
         ["9 Jul 26", "ben", "09:00", "Mixed", "2026-07-09", "SITE", "SH-2", "IB"],
         ["9 Jul 26", "cara", "09:00", "Mixed", "2026-07-09", "SITE", "SH-3", ""],
     ]
     try:
-        _clean_raw(_rows_to_raw_df([header] + ambiguous_rows))
+        _clean_raw(_rows_to_raw_df([header] + tied_rows))
     except ValueError as e:
-        assert "more than one team" in str(e)
+        assert "no majority" in str(e)
     else:
-        raise AssertionError("expected ValueError for ambiguous shift name -> team mapping")
+        raise AssertionError("expected ValueError for a tied shift name -> team mapping")
 
     # no valid example anywhere and no _KNOWN_SHIFT_TEAM entry -- falls back
     # to the shift name itself as team, rather than throwing
@@ -740,13 +844,11 @@ def _test_sheets_error_sentinels_general():
     row_a = ["#VALUE!", "amy", "09:00", "Inbound", "2026-07-10", "SITE", "SH-1", "IB"]
     out_a = _clean_raw(_rows_to_raw_df([header, row_a]))
     assert out_a.iloc[0]["date"] == pd.Timestamp(2026, 7, 10)
-    # both date columns broken -- genuinely unrecoverable, must throw
+    # both date columns broken -- genuinely unrecoverable, DROPPED and counted
     row_b = ["#REF!", "ben", "09:00", "Inbound", "#N/A", "SITE", "SH-2", "IB"]
-    try:
-        _clean_raw(_rows_to_raw_df([header, row_b]))
-        raise AssertionError("expected ValueError for unrecoverable date")
-    except ValueError as e:
-        assert "no usable date" in str(e)
+    row_c = ["10 Jul 26", "dave", "09:00", "Inbound", "2026-07-10", "SITE", "SH-4", "IB"]
+    out_b = _clean_raw(_rows_to_raw_df([header, row_b, row_c]))
+    assert list(out_b["name"]) == ["dave"] and out_b.attrs["dropped_no_date"] == 1
     print("_test_sheets_error_sentinels_general passed")
 
 
@@ -754,21 +856,18 @@ def _test_blank_placeholder_row_dropped():
     """Confirmed live: [SOCE 2026]_Daily name list_CYD, tab 'Feb 26' -- 2
     rows have a name but every other field genuinely blank (no date, no
     team, no shift, no clock-in, no Shift_id). Not a real show-up (no date
-    to attribute one to) -- dropped, same as the already-dropped fully-blank
-    trailer rows. A row missing only the date, with other fields populated,
-    must still throw (real gap, not a placeholder)."""
+    to attribute one to) -- dropped. A row missing ONLY the date, with other
+    fields populated (PNK 'Jul 26'), is also dropped now (no attributable
+    day) and counted, not thrown."""
     header = ["วันที่", "ค้นหา", "เข้างาน", "shift name", "วันที่", "BTS", "Shift_id", "team"]
     placeholder_row = ["", "CYD 11502 THAE THAE", "", "", "", "SITE", "", ""]
     real_row = ["9 Jul 26", "zoe", "09:00", "Inbound", "2026-07-09", "SITE", "SH-9", "IB"]
     out = _clean_raw(_rows_to_raw_df([header, placeholder_row, real_row]))
-    assert len(out) == 1 and out.iloc[0]["name"] == "zoe"
+    assert len(out) == 1 and out.iloc[0]["name"] == "zoe" and out.attrs["dropped_no_date"] == 1
 
     partial_row = ["", "carol", "09:00", "Inbound", "", "SITE", "SH-3", "IB"]
-    try:
-        _clean_raw(_rows_to_raw_df([header, partial_row]))
-        raise AssertionError("expected ValueError -- other fields populated, not a placeholder")
-    except ValueError as e:
-        assert "other fields are populated" in str(e)
+    out2 = _clean_raw(_rows_to_raw_df([header, partial_row]))
+    assert len(out2) == 0 and out2.attrs["dropped_no_date"] == 1
     print("_test_blank_placeholder_row_dropped passed")
 
 
@@ -797,6 +896,7 @@ def _run_tests():
     _test_corrupted_date_header_repaired()
     _test_garbage_date_col_recovered()
     _test_corrupted_clockin_header_repaired()
+    _test_blank_name_header_repaired()
     _test_ragged_rows_normalized()
     _test_duplicate_header_row_dropped()
     _test_team_learned_from_shift_name()
@@ -815,6 +915,28 @@ def _run_tests():
     assert mar["usedto_<10"] + mar["usedto_>10"] == 5        # alice,carol,dave,frank,grace
     w = streak_week(df).set_index("week")
     assert w.loc["W10", ">=3"] == 4 and w.loc["W11", ">=3"] == 2 and w.loc["W14", ">=3"] == 1
+
+    # data-driven teams
+    assert distinct_teams(df) == ["IB", "MS"]
+    # New/Old face: only grace (12 days at IB in Mar) clears the 10-day bar
+    nc, _ = new_old_monthly(df)
+    assert nc.loc["Old", "Mar"] == 1 and nc.loc["New", "Mar"] == 7
+    ncIB, _ = new_old_monthly(df, "IB")
+    assert ncIB.loc["Old", "Mar"] == 1 and ncIB.loc["New", "Mar"] == 7
+    # split 5+6 across two teams (max 6 < 10) stays New despite 11 total days
+    split = pd.DataFrame(
+        [{"name": "zed", "team": "IB", "date": dt.date(2026, 6, d)} for d in (1, 2, 3, 4, 5)] +
+        [{"name": "zed", "team": "MS", "date": dt.date(2026, 6, d)} for d in (8, 9, 10, 11, 12, 15)])
+    sc, _ = new_old_monthly(split)
+    assert sc.loc["New", "Jun"] == 1 and sc.loc["Old", "Jun"] == 0
+    # attendance headcount: 6 distinct workers present on Mar-02, all IB
+    ad, ad_all = attendance_crosstab(df, "day")
+    assert ad.loc["IB", "2026-03-02"] == 6 and ad_all["2026-03-02"] == 6
+    _, aw_all = attendance_crosstab(df, "week")
+    assert aw_all["W10"] == 6
+    # weekly rotation reuses the monthly logic per ISO week (shape + fields)
+    rw = rotation_summary(df, "week")
+    assert len(rw) > 0 and str(rw.iloc[0]["month"]).startswith("W") and "population" in rw.columns
     print("All correctness self-tests passed.\n")
 
 
