@@ -285,9 +285,17 @@ sheets + central folder must be accessible to it. This replaces the old
 service-account/n8n-OAuth ownership risks with a single one — see
 docs/RUNBOOK.md.
 
-Scaling ceiling is now the **6-minute Apps Script execution limit** (not
-memory). Current data runs well inside it; if vendor growth ever exceeds it,
-the fallback is one-department-per-execution — deferred until measured.
+Scaling ceiling is now **execution time** (the Apps Script per-run limit — 6 min
+consumer / 30 min Workspace), not memory. Writes are the heavy part: the per-aspect
+Names files reach hundreds of thousands of rows, so `writeSummaryTab_` writes in
+**20k-row chunks** (a single `values.update` of the whole grid 500s with "Internal
+error encountered" — request too big — hit live after a 12-min run) and every write
+goes through `retryWrite_` (idempotent fixed-range writes, backoff 2/4/8s) to ride
+out transient 500s. If a full `sync` ever exceeds the execution limit anyway, the
+next levers, in order: (1) make the highest-volume drill-downs plain numbers —
+weekly Consecutive/Rotation, then per-team scopes — keeping the monthly All+team
+drill-downs (the slide-deck numbers); (2) one-department-per-execution. Both
+deferred until a run actually times out (vs. errors), since chunking may be enough.
 
 ### Superseded: Render + n8n (kept for reference, retired)
 

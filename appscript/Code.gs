@@ -133,6 +133,24 @@ function retryRead_(fn) {
   throw lastErr;
 }
 
+// retry an idempotent WRITE through transient Google API errors -- live runs hit
+// "Internal error encountered" (a 500) on values.update mid-sync. Every write here
+// targets a fixed range with fixed data (or a fixed grid resize), so repeating it
+// is safe. Backoff 2s/4s/8s (a touch longer than reads -- writes are heavier and
+// the 500s tend to be brief server hiccups). A truly fatal error (e.g. the 10M cap)
+// just exhausts the 4 tries and re-throws, same message.
+function retryWrite_(fn) {
+  var lastErr;
+  for (var attempt = 1; attempt <= 4; attempt++) {
+    try { return fn(); }
+    catch (e) {
+      lastErr = e;
+      if (attempt < 4) Utilities.sleep(2000 * Math.pow(2, attempt - 1));
+    }
+  }
+  throw lastErr;
+}
+
 // read every month tab of one vendor file in a single batchGet, capped to A:J
 // (only the first ~8 columns are used -- avoids junk/wide columns). Mirrors
 // n8n Build Ranges + Batch Read and app.py _batch_get_month_tabs.
@@ -600,19 +618,34 @@ function dedupByNameDate_(rows) {
 function writeSummaryTab_(ss, sheetId, tabName, grid, inputOption) {
   let width = 1;
   grid.forEach(function (r) { if (r.length > width) width = r.length; });
-  const rect = grid.map(function (r) {
-    const c = r.slice();
-    while (c.length < width) c.push('');
-    return c;
+  const rows = Math.max(1, grid.length);
+  const id = ss.getId();
+  // resize the grid to exactly the content (values.update does NOT auto-grow).
+  retryWrite_(function () {
+    return Sheets.Spreadsheets.batchUpdate({ requests: [{ updateSheetProperties: {
+      properties: { sheetId: sheetId, gridProperties: { rowCount: rows, columnCount: width } },
+      fields: 'gridProperties.rowCount,gridProperties.columnCount',
+    } }] }, id);
   });
-  const rows = Math.max(1, rect.length);
-  Sheets.Spreadsheets.batchUpdate({ requests: [{ updateSheetProperties: {
-    properties: { sheetId: sheetId, gridProperties: { rowCount: rows, columnCount: width } },
-    fields: 'gridProperties.rowCount,gridProperties.columnCount',
-  } }] }, ss.getId());
-  Sheets.Spreadsheets.Values.update(
-    { values: rect }, ss.getId(), quoted_(tabName) + '!A1',
-    { valueInputOption: inputOption || 'USER_ENTERED' });
+  // Write in ROW CHUNKS. A single values.update of a very large grid (the Names
+  // files reach hundreds of thousands of rows) fails with a 500 "Internal error"
+  // -- the request is simply too big. Chunking keeps each request small; each
+  // targets a fixed A<start> range so a retry is idempotent. Rows are padded to
+  // the common width per chunk (not up front) to avoid building one giant rect.
+  const io = inputOption || 'USER_ENTERED';
+  const CHUNK = 20000;
+  for (var start = 0; start < grid.length; start += CHUNK) {
+    const slice = grid.slice(start, start + CHUNK).map(function (r) {
+      const c = r.slice();
+      while (c.length < width) c.push('');
+      return c;
+    });
+    const at = start + 1;   // 1-based first row of this chunk
+    retryWrite_(function () {
+      return Sheets.Spreadsheets.Values.update(
+        { values: slice }, id, quoted_(tabName) + '!A' + at, { valueInputOption: io });
+    });
+  }
 }
 
 // ------------------------------------------------------------------ main sync
