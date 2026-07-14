@@ -33,19 +33,37 @@ If a file is missing any of this, the daily sync fails loudly (rather than silen
 
 ## Where results live
 
-Open the **Central** Drive folder. Inside it, **one spreadsheet per SOC per year**, named `<YEAR>_<DEPT>` — e.g. `2026_SOCN`, `2026_SOCE`, `2026_SOCW` (and `2027_SOCN`, … next year). The script creates each one itself. Each spreadsheet has **5 tabs**: one `raw` tab + one tab per analysis aspect.
+Open the **Central** Drive folder. Inside it, for each SOC each year there are several spreadsheets, all created by the script itself:
+
+- `<YEAR>_<DEPT>` — e.g. `2026_SOCN`, `2026_SOCE`, `2026_SOCW` — the **main results** file, with **5 tabs**: one `raw` tab + one tab per analysis aspect. This is the one you actually read.
+- `<YEAR>_<DEPT>_<ASPECT>_Names` — e.g. `2026_SOCN_ShowUp_Names`, `2026_SOCN_Rotation_Names` — a **drill-down** file for each aspect. You never open these directly; you reach them by clicking a number.
+
+There are separate drill-down files because a single Google spreadsheet can hold at most 10 million cells *across all its tabs*, and the "who's behind each number" detail is large enough to blow that limit if kept in one file. Giving each aspect its own **file** (not just another tab — tabs share one budget) is what keeps it under the limit.
 
 - **`raw`** — every worker's show-up day that year for this SOC, combined across all its vendor files. Columns: *Date show up, Month show up, Sub-con name (the vendor), Name, Clock in, shift name, Shift_id, team*.
-- **`New-Old Face`** — Old = worked ≥10 days at a single station that month (experienced), else New. By team, plus weekly/daily attendance.
-- **`Show Up`** — day-count buckets (1-5 / 6-10 / 11-15 / 16-20 / 21-30 days in a month). By team, plus weekly/daily attendance.
-- **`Consecutive`** — worked ≥3 days in a row: monthly and weekly. By team, plus daily attendance.
-- **`Rotation`** — worked at a station more than once and whether they were rotated to others: monthly and weekly. By team, plus daily attendance.
+- **`New-Old Face`** — Old = worked ≥10 days at a single station that month (experienced), else New. Monthly, by team.
+- **`Show Up`** — day-count buckets (1-5 / 6-10 / 11-15 / 16-20 / 21-30 days in a month), monthly, by team, **plus a daily head-count block** (how many distinct workers were present each day, per team and overall — plain numbers).
+- **`Consecutive`** — worked ≥3 days in a row: monthly and weekly, by team.
+- **`Rotation`** — worked at a station more than once and whether they were rotated to others: monthly and weekly, by team.
 
-"By team" means every station in that SOC's data gets its own rows. "Attendance" is simply how many distinct people showed up each week/day per team — the day/week view for the aspects that only make sense over a whole month.
+"By team" means every station in that SOC's data gets its own rows. Percentages are shown with a `%` sign (e.g. `45.11%`).
 
-Two things the slide shows that this does **not** produce: the **"% Burmese"** figure and **capacity-per-station** targets — both need the total (non-Burmese) headcount, which these Burmese-only name lists don't contain. Also, clicking a summary number to see **the list of people behind it** is a planned future feature, not built yet.
+**Click a number to see who's behind it.** Every count in the four analysis tabs is a **clickable link** (the one exception is the **daily head-count** block, which is plain numbers — for the roster of a single day, just filter the `raw` tab by that date). Click a count and that aspect's `_Names` file opens at a block listing exactly those people, shown with the **same columns as the raw tab** (Date show up, Month, Sub-con, Name, Clock in, shift name, Shift_id, team). The number of rows always equals the number you clicked — click a count of 3 and you get exactly 3 rows, one per person (their first show-up in that group). Groups are separated by two blank rows.
 
-**Important: all 5 tabs in every SOC spreadsheet are wiped and rewritten every single day.** If you type anything directly into these tabs, it's gone the next morning. To correct something, fix it in the *source* file (the vendor's raw sheet), not here.
+The slide's **"% Burmese"** figure and **capacity-per-station** targets are **not** produced — both need the total (non-Burmese) headcount, which these Burmese-only name lists don't contain.
+
+**Important: all of these files (every tab) are wiped and rewritten every single day.** If you type anything directly into these tabs, it's gone the next morning. To correct something, fix it in the *source* file (the vendor's raw sheet), not here.
+
+## How the data is cleaned
+
+The raw vendor sheets are messy (broken formulas, blank cells, duplicate rows, tabs that overlap at month boundaries). Before any number is counted, each month tab is cleaned by these rules. Every rule either fixes the row or drops it loudly — nothing wrong is silently counted.
+
+- **One show-up per person per day.** A worker is counted as present on a date if any row exists for them that date. If the same person appears twice on the same date (e.g. a double shift, or the same day showing up in two overlapping month tabs like `Mar 26` and `Apr 26`), those are collapsed to **one** show-up, keeping the earliest clock-in.
+- **Missing team is filled in from the shift name.** The `team` column is an abbreviation of the shift. When it's blank, the system fills it by learning the shift→team pairing from the other rows in the same tab that *do* have a team, using the most common pairing. If it still can't tell (a genuine tie), it stops and asks rather than guessing. As a last resort it uses a short list of known facts (e.g. shift `FSOCE` → team `FSOCE`), and failing that, the shift name itself as the team.
+- **Undated rows are dropped and counted.** Some rows have a full work record (name, clock-in, shift, team) but no date in either date column — there's no day to attribute the show-up to, so the row is dropped. The count of dropped rows is written to the run log, never hidden.
+- **Broken formula cells are recovered where possible.** Cells showing spreadsheet errors (`#REF!`, `#N/A`, `#VALUE!`, etc.) or a corrupted header cell are repaired from the other, intact copy of the same information (each row has the date in two columns; the header block has a fixed layout). If a date genuinely can't be recovered from either column, the row is dropped (see above). If the two date columns hold two *different* valid dates, it stops and asks.
+- **Some vendors are skipped on purpose.** Vendors listed in the `SKIP_VENDORS` script property (currently `PPO, WAS, RG, YSL, BigBoom`) are excluded — a deliberate, logged exclusion, so their absence from the totals is expected, not a bug.
+- **Only the file's own year is read.** A `[SOCN 2026]…` file is read only for its `… 26` month tabs; a leftover off-year tab (e.g. a stray `Dec 25`) is ignored.
 
 ## If the daily run fails
 
@@ -74,7 +92,7 @@ Once the project is owned by a durable account, nothing about the daily run depe
 
 ## Glossary
 
-- **Department (SOC)**: one of SOCN, SOCE, SOCW — the three groups this system tracks. Each gets its own raw tab and its own `<DEPT> Summary` tab.
+- **Department (SOC)**: one of SOCN, SOCE, SOCW — the three groups this system tracks. Each gets its own results file (`<YEAR>_<DEPT>`) plus one drill-down file per aspect (`<YEAR>_<DEPT>_<ASPECT>_Names`).
 - **Vendor** (a.k.a. "Sub-con"): a staffing agency that supplies workers (BTS, CYD, SPT, DSR, WAS, etc.). Not a physical location — just which agency the worker's file came through. Kept for traceability only; nothing is calculated "per vendor."
 - **Central folder**: the one Drive folder where every year's finished summary spreadsheet lives, and where the script auto-creates each new year's sheet.
 - **Apps Script**: Google's built-in automation tool. Our script is "standalone" (its own project, not attached to a sheet) and runs on a daily timer.

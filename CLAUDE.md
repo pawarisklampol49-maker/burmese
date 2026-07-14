@@ -189,45 +189,77 @@ department.) Some vendors are excluded via the `SKIP_VENDORS` Script Property
 (`PPO,WAS,RG,YSL,BigBoom`) — a loud, logged skip, so SOCN totals legitimately
 won't match the slide deck's "7 vendors / 5,298 names".
 
-**One spreadsheet PER SOC PER YEAR**, titled `<YEAR>_<DEPT>` (e.g. `2026_SOCN`,
-`2026_SOCE`, `2026_SOCW`), each created in the Central folder by the script
-itself. Each holds exactly **5 tabs**: one `raw` tab + **one tab per aspect**
-(`New-Old Face`, `Show Up`, `Consecutive`, `Rotation` — `ASPECT_TABS`). So there
-is no single combined yearly sheet anymore; each SOC's data lives in its own file.
-`findOrCreateSocSheet_` + `prepareSocSheet_` build the 5-tab shape; `sync` keys
-its streaming context by `(year, dept)`.
+**Per SOC per year**, created in the Central folder by the script itself:
+- `<YEAR>_<DEPT>` (e.g. `2026_SOCN`) — the main results file, **5 tabs**
+  (`SOC_TABS`): one `raw` tab + **one tab per aspect** (`New-Old Face`, `Show Up`,
+  `Consecutive`, `Rotation` — `ASPECT_TABS`).
+- `<YEAR>_<DEPT>_<ASPECT>_Names` (e.g. `2026_SOCN_ShowUp_Names`) — **one drill-down
+  file PER ASPECT** (4 of them; suffix via `ASPECT_NAME_SUFFIX`), each a single
+  `Names` tab.
 
-**Summaries follow the slide deck.** Each aspect tab stacks that aspect at
-monthly / weekly / daily grain, **grouped by team**:
-  - **New / Old face** (`newOldMonthly`) — per (month, worker) the MAX distinct
-    days at any single team; **Old** (experienced) if that max ≥ 10, else **New**
-    (rotation does not disqualify). Monthly, All + per team.
-  - **Show up** (`showupBlock`) — day-count buckets 1-5/6-10/11-15/16-20/21-30.
-    Monthly, All + per team.
-  - **3-day consecutive** (`streakMonthCrosstab` monthly + `streakWeek` weekly).
-  - **Rotation** (`rotationSummary`, monthly + weekly).
-  - within each aspect tab, the **weekly/daily** grain for the inherently-monthly
-    aspects (New/Old, Show up) is the **Attendance** headcount (`attendanceCrosstab`
-    — distinct workers present per week/day, per team); Consecutive carries its own
-    real weekly (`streakWeek`) and Rotation its own real weekly (`rotationSummary`
-    period `week`), each plus a daily attendance block. This is the "daily" the
-    user asked for — the bucket/rotation/consecutive metrics can't run on a single
-    day.
+The drill-down detail is in **separate spreadsheet files** because Google's
+10,000,000-cell cap is **per workbook** (shared across all tabs, NOT per tab). The
+detail is large — each counted person is a full 8-column raw row and every number
+is drillable at both the `All` scope and each team — so first a single combined
+file, then even a single dedicated `Names` file, overflowed the cap live
+(`batchUpdate ... above the limit of 10000000 cells`). Splitting `Names` into
+per-aspect *tabs* in one file would NOT help (same shared budget); only separate
+*files* add capacity, so each aspect gets its **own** file (its own 10M).
+`findOrCreateSheet_(folderId, title)` + `prepareSocSheet_` build the main 5-tab
+shape; `findOrCreateSheet_` + `prepareNamesSheet_` build each aspect's Names file;
+`sync` keys its streaming context by `(year, dept)` and holds `ss` + `namesFiles`
+(aspect → `{ss, gid}`).
+
+**Summaries follow the slide deck**, **grouped by team**, at only the grains that
+mean something (no daily for the bucket/rotation/consecutive aspects — they can't
+run on one day; the one daily view is a head count, below). Percentages render
+with a `%` sign (`pctCell_`, written USER_ENTERED so `"45.11%"` is a real percent
+number, not stuck text):
+  - **New / Old face** — per (month, worker) the MAX distinct days at any single
+    team; **Old** if that max ≥ 10, else **New**. **Monthly** only.
+  - **Show up** — day-count buckets 1-5/6-10/11-15/16-20/21-30, **monthly** (with
+    drill-down), PLUS a **daily head-count** block (`attendanceCrosstab(slim,'day')`
+    via `renderHeadcount_` — distinct workers present per day, per team + an `All`
+    row). The daily block is **PLAIN NUMBERS, not clickable**: a per-person daily
+    drill-down copies ~2× the entire raw log and overflowed even a dedicated Names
+    file; the daily roster is already the `raw` tab filtered by date. (The engine's
+    `attendanceMembers` remains, self-tested, but is unused by `Code.gs`.)
+  - **3-day consecutive** — **monthly** (`streakMonthCrosstab` categories) +
+    **weekly** (`streakWeek`, ≥3 consecutive).
+  - **Rotation** — **monthly + weekly** (`rotationSummary`, per team).
+
+**Drill-down (BUILT).** Every count in an aspect tab (except the daily head-count)
+is written as a **cross-file**
+`=HYPERLINK("https://docs.google.com/spreadsheets/d/<AspectNamesFileId>/edit#gid=<gid>&range=A<row>", count)`;
+clicking it opens **that aspect's** `<YEAR>_<DEPT>_<ASPECT>_Names` file at the
+number's block. Each aspect uses its OWN `namesCollector_(fileId, gid)` so its
+links target its own file. Each group is rendered as the **full 8 raw columns**
+(the `raw` header), **one row per counted person** (representative row = earliest
+`(date, clock-in)`, via `pickRep`), so the row count always equals the clicked
+number — a worker with 20 days is **one** row, not 20. Groups are separated by
+**two blank rows**. Rows come from the engine's **`*Members`** functions
+(`showupMembers`/`newOldMembers`/`streakMonthMembers`/`streakWeekMembers`/
+`rotationMembers`), which return **representative row objects** (not bare names)
+using the same grouping as the count functions and are **self-tested to satisfy
+`members.length === count`**. The `slim` slice carries the full raw-column set
+(`name/date/team/clockin/vendor/shift_name/shift_id/month`) so each member row can
+render every raw column. (Watch-item: if one aspect's detail ever exceeds its
+file's 10M — streak-weekly is the largest, workers × ISO weeks × All+team — the
+next fallback is to reduce that aspect's drill-down scope; the per-aspect split
+already removes the cross-aspect stacking that broke the single-file design.)
 
 Teams are **data-driven per SOC** (`distinctTeams` — the distinct `team` values
 in that SOC's own slice), not a fixed station list; abbreviations differ across
 SOCs (e.g. `OB` vs `OBD`) and each SOC is a separate file. The hardcoded
 `OPERATIONAL_TEAMS`/`STATIONS_*` remain only for the local `render/test.py` mock.
-Assembly: one `*TabGrid_` builder per aspect (`newOldTabGrid_`/`showUpTabGrid_`/
-`consecutiveTabGrid_`/`rotationTabGrid_`, dispatched by `aspectGridFor_`) +
-`writeSummaryTab_` in `Code.gs` (which resizes each tab to its actual grid before
-writing, since the daily-attendance section is wide — one column per calendar day).
+Assembly: one `*TabGrid_(slim, nc)` builder per aspect
+(`newOldTabGrid_`/`showUpTabGrid_`/`consecutiveTabGrid_`/`rotationTabGrid_`) whose
+count cells go through the shared `namesCollector_` (`nc`), then `writeSummaryTab_`
+(resizes each tab to its actual grid; aspect tabs USER_ENTERED for live
+`=HYPERLINK`, the `Names` tab RAW so a name starting with `=`/`-` stays literal).
 
-**Excluded / deferred:** slide p2 "% Burmese" and Cap.-per-station need total
-(non-Burmese) headcount we don't have (Burmese-only name lists) — out of scope.
-Drill-down ("click a cell → the list of people behind the number") is deferred;
-static tables only for now (a plain values-written Sheet can't do per-cell
-drill-down without extra machinery).
+**Excluded:** slide p2 "% Burmese" and Cap.-per-station need total (non-Burmese)
+headcount we don't have (Burmese-only name lists) — out of scope.
 
 `Code.gs` dedups one row per `(name,date)` (keeping the earliest clock-in, the
 same rule `cleanRaw` uses within a tab) both **per vendor file** before writing
@@ -243,7 +275,7 @@ collapses it — a show-up recorded in two tabs is one show-up, not an error.
 Still true from the old design (the raw side is unchanged): each SOC file's `raw`
 tab has the verbatim 8-col header `Date show up | Month show up | Sub-con name |
 Name | Clock in | shift name | Shift_id | team` (RAW), always written even if
-header-only; recompute-from-scratch every run (`prepareSocSheet_` clears all 5
+header-only; recompute-from-scratch every run (`prepareSocSheet_` clears all 6
 tabs first and deletes strays); year derived from each row's actual date.
 
 **Durable-account requirement (handoff-critical):** the script and its daily

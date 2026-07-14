@@ -533,6 +533,97 @@ def attendance_crosstab(df, period):
     return counts, all_series
 
 
+# ---------------------------------------------------------------- membership (drill-down)
+# The NAMES behind each summary count. Each *_members reuses the SAME grouping
+# as its count function, so names.length == count (asserted in _run_tests).
+def showup_members(df, team=None):
+    d = _prepare(df)
+    days = _days_pwm(d, team)
+    out = {}
+    for _, x in days.iterrows():
+        bucket = None
+        for lo, hi in BUCKETS:
+            if lo <= x["days"] <= hi:
+                bucket = f"{lo}-{hi}"
+        if bucket is None:
+            continue
+        out.setdefault(_month_label(x["month"]), {}).setdefault(bucket, []).append(x["name"])
+    return out
+
+
+def new_old_members(df, team=None):
+    d = _prepare(df)
+    x = d if team is None else d[d["team"] == team]
+    out = {}
+    if len(x):
+        per_team = x.groupby(["month", "name", "team"]).size().rename("days").reset_index()
+        maxd = per_team.groupby(["month", "name"])["days"].max().reset_index()
+        for _, row in maxd.iterrows():
+            ml = _month_label(row["month"])
+            face = "Old" if row["days"] >= NEWOLD_MIN_DAYS else "New"
+            out.setdefault(ml, {"Old": [], "New": []})[face].append(row["name"])
+    return out
+
+
+def streak_month_members(df, team=None):
+    d = _prepare(df)
+    st = _worker_month_stats(d, team)
+    out = {}
+    for _, x in st.iterrows():
+        o = out.setdefault(_month_label(x["month"]), {
+            "active": [], "<10": [], ">10": [], "usedto_<10": [], "usedto_>10": [],
+            "never_<10": [], "never_>10": []})
+        lt, gt, used = x["days"] < 10, x["days"] > 10, x["run"] >= 3
+        o["active"].append(x["name"])
+        if lt: o["<10"].append(x["name"])
+        if gt: o[">10"].append(x["name"])
+        if used and lt: o["usedto_<10"].append(x["name"])
+        if used and gt: o["usedto_>10"].append(x["name"])
+        if not used and lt: o["never_<10"].append(x["name"])
+        if not used and gt: o["never_>10"].append(x["name"])
+    return out
+
+
+def streak_week_members(df, team=None, min_run=3):
+    d = _prepare(df)
+    x = d if team is None else d[d["team"] == team]
+    out = {}
+    for (yr, wk), g in x.groupby(["iso_year", "iso_week"]):
+        o = out.setdefault(f"W{int(wk)}", {"active": [], ">=3": [], "<3": []})
+        for name, wr in g.groupby("name"):
+            o["active"].append(name)
+            run = _max_consecutive_run(list(wr["date"]))
+            (o[">=3"] if run >= min_run else o["<3"]).append(name)
+    return out
+
+
+def rotation_members(df, period="month"):
+    wt = rotation_worker_table(df, period)
+    teams = distinct_teams(df)
+    out = {}
+    for pk, g in wt.groupby("_pk"):
+        label = pk if period == "month" else g["_plabel"].iloc[0]
+        team_obj = {}
+        for t in teams:
+            if t not in g.columns:
+                continue
+            in_team = g[g[t] >= 1]
+            if not len(in_team):
+                continue
+            cell = {"population": [], "rotation": [], "non_rotation": [], "oneday_nonrot": []}
+            for _, r in in_team.iterrows():
+                cell["population"].append(r["name"])
+                if r[f"Analyze {t}"] == "Rotated":
+                    cell["rotation"].append(r["name"])
+                else:
+                    cell["non_rotation"].append(r["name"])
+                    if r[t] == 1:
+                        cell["oneday_nonrot"].append(r["name"])
+            team_obj[t] = cell
+        out[label] = team_obj
+    return out
+
+
 def _worker_month_stats(d, team=None):
     x = d if team is None else d[d["team"] == team]
     g = x.groupby(["month", "name"])
@@ -937,6 +1028,20 @@ def _run_tests():
     # weekly rotation reuses the monthly logic per ISO week (shape + fields)
     rw = rotation_summary(df, "week")
     assert len(rw) > 0 and str(rw.iloc[0]["month"]).startswith("W") and "population" in rw.columns
+
+    # drill-down membership: names.length must equal the summary count everywhere
+    shm = showup_members(df)
+    assert len(shm["Mar"]["1-5"]) == c.loc["1-5", "Mar"]
+    nom = new_old_members(df)
+    assert len(nom["Mar"]["Old"]) == nc.loc["Old", "Mar"] and len(nom["Mar"]["New"]) == nc.loc["New", "Mar"]
+    smm = streak_month_members(df)
+    assert len(smm["Mar"]["usedto_<10"]) + len(smm["Mar"]["usedto_>10"]) == 5
+    swm = streak_week_members(df)
+    assert len(swm["W10"][">=3"]) == 4 and len(swm["W11"][">=3"]) == 2
+    rom = rotation_members(df)
+    ib = rom["2026-03"]["IB"]
+    assert len(ib["population"]) == 8 and len(ib["rotation"]) == 1 and len(ib["oneday_nonrot"]) == 2
+    assert "grace" in ib["population"]
     print("All correctness self-tests passed.\n")
 
 

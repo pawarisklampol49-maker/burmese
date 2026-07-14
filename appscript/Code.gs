@@ -2,10 +2,10 @@
  * SOC worker-analysis sync -- standalone Google Apps Script.
  *
  * This is the whole automation: it discovers the vendor spreadsheets, cleans
- * every month tab with the shared engine (engine.gs -- a verbatim copy of
- * n8n/engine.js), and writes one central spreadsheet per year with 7 tabs
- * (4 raw department tabs + 3 summary tabs). It replaces the Render service and
- * the n8n workflow: everything runs inside Google, so the vendor data never
+ * every month tab with the shared engine (engine.gs), and writes, per SOC per
+ * year, a main results file "<YEAR>_<DEPT>" (raw tab + 4 aspect summary tabs) and
+ * a separate drill-down file "<YEAR>_<DEPT>_Names". It replaces the Render service
+ * and the n8n workflow: everything runs inside Google, so the vendor data never
  * leaves Google's servers and there is no memory limit to hit.
  *
  * It is a STANDALONE script (not bound to any sheet), so:
@@ -160,22 +160,39 @@ function readMonthTabs_(fileId, yearSuffix) {
 }
 
 // ------------------------------------------------------------------ central sheets
-// One spreadsheet PER SOC PER YEAR, titled "<YEAR>_<DEPT>" (e.g. "2026_SOCN"),
-// each holding exactly 5 tabs: one "raw" tab + one tab per summary aspect. Each
-// aspect gets its own tab (not stacked). ASPECT_TABS order = display order.
+// Per SOC per year, in the central folder:
+//   - "<YEAR>_<DEPT>"                  (e.g. "2026_SOCN") -- the main results file,
+//     5 tabs: "raw" + one per aspect.
+//   - "<YEAR>_<DEPT>_<ASPECT>_Names"   (e.g. "2026_SOCN_ShowUp_Names") -- ONE
+//     drill-down file PER ASPECT (4 of them), each a single "Names" tab.
+// The drill-down detail is split into SEPARATE spreadsheet files because Google's
+// 10,000,000-cell cap is PER WORKBOOK (shared across all tabs, NOT per tab). The
+// detail is large -- each counted person is a full 8-column raw row, and every
+// number is drillable at both the "All" scope and each team -- so a single detail
+// file overflowed the cap live. One file PER ASPECT gives each aspect its own 10M
+// budget (splitting into per-aspect *tabs* in one file would NOT help: same shared
+// budget). Every count in an aspect tab is a cross-file =HYPERLINK (full URL) that
+// opens that aspect's Names file at the number's block -- the full 8 raw columns,
+// one row per counted person, groups 2 blank rows apart.
 const RAW_TAB = 'raw';
 const ASPECT_TABS = ['New-Old Face', 'Show Up', 'Consecutive', 'Rotation'];
+const SOC_TABS = [RAW_TAB].concat(ASPECT_TABS);   // the main file's 5 tabs
+const NAMES_TAB = 'Names';                        // the sole tab in each Names file
+// aspect tab -> filename token for its drill-down file (no spaces/punctuation).
+const ASPECT_NAME_SUFFIX = {
+  'New-Old Face': 'NewOld', 'Show Up': 'ShowUp', 'Consecutive': 'Consecutive', 'Rotation': 'Rotation',
+};
 const RAW_TAB_HEADER = ['Date show up', 'Month show up', 'Sub-con name', 'Name',
                         'Clock in', 'shift name', 'Shift_id', 'team'];
 
 function socSheetTitle_(year, dept) { return String(year) + '_' + dept; }
+function socNamesTitle_(year, dept, suffix) { return socSheetTitle_(year, dept) + '_' + suffix + '_Names'; }
 
-// find the spreadsheet titled "<year>_<dept>" in the central folder, or CREATE it
+// find the spreadsheet with this exact title in the central folder, or CREATE it
 // (the standalone-script payoff: runs as the user, so create/move works where
 // the service account's ~0-quota gc.create() failed).
-function findOrCreateSocSheet_(folderId, year, dept) {
+function findOrCreateSheet_(folderId, title) {
   const folder = DriveApp.getFolderById(folderId);
-  const title = socSheetTitle_(year, dept);
   const it = folder.getFilesByName(title);
   const matches = [];
   while (it.hasNext()) matches.push(it.next());
@@ -200,8 +217,8 @@ function findOrCreateSocSheet_(folderId, year, dept) {
 // on the write path is Advanced Service so ordering is deterministic.
 function prepareSocSheet_(ss) {
   const id = ss.getId();
-  SpreadsheetApp.flush();   // commit the create/move from findOrCreateSocSheet_ first
-  const allTitles = [RAW_TAB].concat(ASPECT_TABS);
+  SpreadsheetApp.flush();   // commit the create/move from findOrCreateSheet_ first
+  const allTitles = SOC_TABS.slice();   // raw + 4 aspects (the Names file is separate)
   const keep = {};
   allTitles.forEach(function (t) { keep[t] = true; });
 
@@ -255,6 +272,38 @@ function prepareSocSheet_(ss) {
   return sheetIds;
 }
 
+// reset the separate Names file to a single "Names" tab (baseline grid, cleared),
+// deleting any strays (default "Sheet1", old layout). Same Advanced-Sheets-only
+// discipline as prepareSocSheet_. Returns the Names tab's sheetId (gid), needed to
+// build the cross-file =HYPERLINK targets. writeSummaryTab_ resizes it at write time.
+function prepareNamesSheet_(ss) {
+  const id = ss.getId();
+  SpreadsheetApp.flush();   // commit the create/move first
+  const meta = Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  const existing = {};
+  (meta.sheets || []).forEach(function (s) { existing[s.properties.title] = s.properties.sheetId; });
+
+  const requests = [];
+  if (NAMES_TAB in existing) {
+    requests.push({ updateSheetProperties: {
+      properties: { sheetId: existing[NAMES_TAB], gridProperties: { rowCount: 1, columnCount: 1 } },
+      fields: 'gridProperties.rowCount,gridProperties.columnCount',
+    } });
+  } else {
+    requests.push({ addSheet: { properties: { title: NAMES_TAB, gridProperties: { rowCount: 1, columnCount: 1 } } } });
+  }
+  Object.keys(existing).forEach(function (t) {
+    if (t !== NAMES_TAB) requests.push({ deleteSheet: { sheetId: existing[t] } });
+  });
+  if (requests.length) Sheets.Spreadsheets.batchUpdate({ requests: requests }, id);
+  Sheets.Spreadsheets.Values.batchClear({ ranges: [quoted_(NAMES_TAB)] }, id);
+
+  const meta2 = Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  let gid = null;
+  (meta2.sheets || []).forEach(function (s) { if (s.properties.title === NAMES_TAB) gid = s.properties.sheetId; });
+  return gid;
+}
+
 // append cleaned rows to this SOC sheet's single "raw" tab (RAW, INSERT_ROWS
 // auto-grows the grid). Called once per vendor file feeding this SOC.
 function appendRawRows_(ss, rows) {
@@ -273,171 +322,248 @@ function appendRawRows_(ss, rows) {
 function blank_(v) { return v == null ? '' : v; }
 
 // ------------------------------------------------------------------ summaries
-// One tab PER SOC ("<DEPT> Summary"), stacking the 4 aspects (New/Old face, Show
-// up, 3-day consecutive, Rotation) grouped by team, at the grains the slide uses:
-// monthly (primary) + weekly (consecutive p8, rotation) + a shared weekly/daily
-// attendance headcount (the day/week grain for the inherently-monthly aspects).
-// numbers stay numbers so the tab holds real numbers (USER_ENTERED). Engine
-// functions (showupBlock, newOldMonthly, rotationSummary, streakMonthCrosstab,
-// streakWeek, attendanceCrosstab, distinctTeams) and BUCKETS come from engine.gs
-// -- read INSIDE functions, never at top level, since cross-file const load order
-// isn't guaranteed (BUCKETS could be in its temporal dead zone at load time).
-const ROTATION_COLS = ['month', 'team', 'population', 'rotation', 'non_rotation',
-                       'oneday_nonrot', 'rotation%', 'non_rotation%', 'oneday%'];
-const STREAK_COLS = ['month', 'active', '<10', '>10',
-                     'usedto_<10', 'usedto_>10', 'never_<10', 'never_>10'];
+// One tab PER ASPECT (monthly for all; Consecutive & Rotation also weekly; Show Up
+// also carries a daily head-count block, the one metric meaningful per day). Every
+// COUNT is a =HYPERLINK that jumps to the people behind it, listed in the Names tab
+// (the drill-down). Members are one REPRESENTATIVE raw row per counted person and
+// come from the engine's *Members functions, asserted (self-tests) to match the
+// counts. Engine globals (showupMembers, newOldMembers, streakMonthMembers,
+// streakWeekMembers, rotationMembers, attendanceMembers, distinctTeams, monthLabel,
+// round2, BUCKETS) come from engine.gs -- read INSIDE functions, never at top level
+// (cross-file const load order isn't guaranteed). No daily view for the bucket/
+// rotation/consecutive aspects: those can't run on a single day.
 
-function numCell_(v) { return v == null ? '' : v; }
-
-// wide count+% block for Show up (rows = buckets + Sum, cols = months then %).
-function showupGrid_(slim) {
-  const bucketOrder = BUCKETS.map(function (b) { return b[0] + '-' + b[1]; }).concat(['Sum Month']);
-  const res = showupBlock(slim);
-  const ml = res.monthLabels;
-  const grid = [['bucket'].concat(ml, ml.map(function (m) { return m + ' %'; }))];
-  bucketOrder.forEach(function (b) {
-    const row = [b];
-    ml.forEach(function (m) { row.push(numCell_(res.counts[b][m])); });
-    ml.forEach(function (m) { row.push(numCell_(res.pct[b][m])); });
-    grid.push(row);
-  });
-  return grid;
+// chronological month labels present in the slice ("2026-03" sorts, then -> "Mar").
+function monthOrder_(slim) {
+  const seen = {};
+  slim.forEach(function (r) { seen[r.date.month] = true; });
+  return Object.keys(seen).sort().map(monthLabel);
 }
 
-// wide New/Old block (rows Old, New counts then Old %, New %, cols = months).
-function newOldGrid_(slim) {
-  const res = newOldMonthly(slim);
-  const ml = res.monthLabels;
-  const grid = [['face'].concat(ml, ml.map(function (m) { return m + ' %'; }))];
-  ['Old', 'New'].forEach(function (f) {
-    const row = [f];
-    ml.forEach(function (m) { row.push(numCell_(res.counts[f][m])); });
-    ml.forEach(function (m) { row.push(numCell_(res.pct[f + ' %'][m])); });
-    grid.push(row);
-  });
-  return grid;
+// The Names tab collector, shared across all 4 aspect tabs of one SOC. Each count
+// registers its group ONCE (header + names, single column) and every summary cell
+// that references it links to the same block. link() returns the HYPERLINK string
+// (or a plain 0 for an empty count, no link). Groups accrue in first-seen order;
+// their Names-tab row is known immediately, so no backfill is needed.
+// one member rendered as the 8 raw columns (same mapping appendRawRows_ uses), so
+// the drill-down shows the full raw context, not a bare name. Members are engine
+// row objects carrying {date, month, vendor, name, clockin, shift_name, shift_id,
+// team} -- the slim slice is widened in sync() to include all of these.
+function rawRowCells_(r) {
+  return [r.date.key, blank_(r.month), blank_(r.vendor), blank_(r.name),
+          blank_(r.clockin), blank_(r.shift_name), blank_(r.shift_id), blank_(r.team)];
 }
 
-function objRowsGrid_(objs, cols) {
-  const grid = [cols.slice()];
-  objs.forEach(function (o) { grid.push(cols.map(function (c) { return numCell_(o[c]); })); });
-  return grid;
-}
-
-// weekly consecutive as metric rows x week cols (slide p8 orientation).
-function streakWeekGrid_(slim, team) {
-  const wk = streakWeek(slim, team);
-  const weeks = wk.map(function (r) { return r.week; });
-  const grid = [['metric'].concat(weeks)];
-  ['active', '>=3', '<3', '>=3%'].forEach(function (metric) {
-    grid.push([metric].concat(wk.map(function (r) { return numCell_(r[metric]); })));
-  });
-  return grid;
-}
-
-// attendance headcount: All + per-team rows x period (day|week) cols.
-function attendanceGrid_(slim, period) {
-  const res = attendanceCrosstab(slim, period);
-  const pl = res.periodLabels;
-  const grid = [['team'].concat(pl)];
-  grid.push(['All'].concat(pl.map(function (p) { return numCell_(res.allRow[p]); })));
-  res.teams.forEach(function (t) {
-    grid.push([t].concat(pl.map(function (p) { return numCell_(res.counts[t][p]); })));
-  });
-  return grid;
-}
-
-// Each aspect is its OWN tab. A tab stacks the aspect at monthly / weekly / daily
-// grain, grouped by team. Where the metric is inherently monthly (buckets,
-// new/old), the weekly/daily grain is the attendance headcount (distinct workers
-// present per week/day, per team) -- the shared non-degenerate day/week view.
-// gridAppender_ returns a {push,label,spacer,byTeam,grid} builder over one grid.
-function gridBuilder_(slim) {
-  const grid = [];
+function namesCollector_(namesFileId, namesGid) {
+  const rows = [['DETAIL -- the people behind each number (opened by clicking a count in a summary tab)']];
+  const keyToRow = {};
+  // cross-file link: the detail lives in a SEPARATE spreadsheet (its own 10M
+  // budget), so this is a full-URL HYPERLINK to that file's Names tab at the
+  // group's row, not an in-workbook "#gid" anchor. Clicking opens the Names file.
+  const base = 'https://docs.google.com/spreadsheets/d/' + namesFileId + '/edit#gid=' + namesGid + '&range=A';
   return {
-    grid: grid,
-    push: function (rows) { rows.forEach(function (r) { grid.push(r); }); },
-    label: function (t) { grid.push([t]); },
-    spacer: function () { grid.push([]); },
-    byTeam: function (fn) {
-      distinctTeams(slim).forEach(function (t) {
-        grid.push(['  team: ' + t]);
-        fn(slim.filter(function (r) { return r.team === t; })).forEach(function (r) { grid.push(r); });
-      });
+    rows: rows,
+    // members: engine ROW objects (one per counted person), so the row count in
+    // the block equals the number clicked. Each group is: a title row (the
+    // HYPERLINK target), the raw-column header, one row per member, then 2 blank
+    // rows separating it from the next group.
+    link: function (count, key, title, members) {
+      if (!count) return 0;
+      if (!(key in keyToRow)) {
+        keyToRow[key] = rows.length + 1;           // 1-based title row (the link target)
+        rows.push([title + '  (' + members.length + ')']);
+        rows.push(RAW_TAB_HEADER.slice());
+        members.forEach(function (m) { rows.push(rawRowCells_(m)); });
+        rows.push([]);
+        rows.push([]);
+      }
+      return '=HYPERLINK("' + base + keyToRow[key] + '",' + count + ')';
     },
   };
 }
 
-// shared weekly + daily attendance headcount block (the day/week grain).
-function attendanceBlock_(b, slim) {
-  b.spacer();
-  b.label('WEEKLY  (attendance headcount by team)');
-  b.push(attendanceGrid_(slim, 'week'));
-  b.spacer();
-  b.label('DAILY  (attendance headcount by team)');
-  b.push(attendanceGrid_(slim, 'day'));
-}
+// percent cell WITH a "%" sign. Written USER_ENTERED, so "45.11%" lands as a real
+// percentage number (Sheets stores 0.4511, displays 45.11%). Blank when den == 0.
+function pctCell_(num, den) { return den ? round2(num / den * 100) + '%' : ''; }
 
-function newOldTabGrid_(slim) {
-  const b = gridBuilder_(slim);
-  if (!slim.length) return [['(no rows for this SOC)']];
-  b.label('NEW / OLD FACE  (monthly; Old = >=10 days at one station)');
-  b.push(newOldGrid_(slim));
-  b.byTeam(newOldGrid_);
-  attendanceBlock_(b, slim);
-  return b.grid;
-}
-
-function showUpTabGrid_(slim) {
-  const b = gridBuilder_(slim);
-  if (!slim.length) return [['(no rows for this SOC)']];
-  b.label('SHOW UP  (monthly; day-count buckets)');
-  b.push(showupGrid_(slim));
-  b.byTeam(showupGrid_);
-  attendanceBlock_(b, slim);
-  return b.grid;
-}
-
-function consecutiveTabGrid_(slim) {
-  const b = gridBuilder_(slim);
-  if (!slim.length) return [['(no rows for this SOC)']];
-  b.label('3-DAY CONSECUTIVE  (monthly)');
-  b.push(objRowsGrid_(streakMonthCrosstab(slim), STREAK_COLS));
-  distinctTeams(slim).forEach(function (t) {
-    b.grid.push(['  team: ' + t]);
-    objRowsGrid_(streakMonthCrosstab(slim, t), STREAK_COLS).forEach(function (r) { b.grid.push(r); });
+// ---- Show up (monthly day-count buckets) ------------------------------------
+function renderShowup_(grid, nc, slim, scope, mem, months) {
+  const buckets = BUCKETS.map(function (b) { return b[0] + '-' + b[1]; });
+  grid.push([scope]);
+  grid.push(['bucket'].concat(months, months.map(function (m) { return m + ' %'; })));
+  const sums = {};
+  months.forEach(function (m) {
+    var s = 0; buckets.forEach(function (bk) { s += ((mem[m] && mem[m][bk]) || []).length; }); sums[m] = s;
   });
-  b.spacer();
-  b.label('3-DAY CONSECUTIVE  (weekly; >=3 consecutive)');
-  b.push(streakWeekGrid_(slim));
-  b.byTeam(function (s) { return streakWeekGrid_(s); });
-  b.spacer();
-  b.label('DAILY  (attendance headcount by team)');
-  b.push(attendanceGrid_(slim, 'day'));
-  return b.grid;
+  buckets.forEach(function (bk) {
+    const row = [bk];
+    months.forEach(function (m) {
+      const names = (mem[m] && mem[m][bk]) || [];
+      row.push(nc.link(names.length, scope + '|showup|' + m + '|' + bk,
+        'Show up | ' + m + ' | ' + bk + ' days | ' + scope, names));
+    });
+    months.forEach(function (m) { row.push(pctCell_(((mem[m] && mem[m][bk]) || []).length, sums[m])); });
+    grid.push(row);
+  });
+  const sumRow = ['Sum Month'];
+  months.forEach(function (m) {
+    var names = []; buckets.forEach(function (bk) { names = names.concat((mem[m] && mem[m][bk]) || []); });
+    sumRow.push(nc.link(names.length, scope + '|showup|' + m + '|sum',
+      'Show up | ' + m + ' | all buckets | ' + scope, names));
+  });
+  months.forEach(function () { sumRow.push('100%'); });
+  grid.push(sumRow);
+  grid.push([]);
 }
 
-function rotationTabGrid_(slim) {
-  const b = gridBuilder_(slim);
+// Daily head count: distinct workers present each day, per team + an All row.
+// The one metric that's meaningful at the daily grain (buckets/rotation/streaks
+// can't run on a single day). PLAIN COUNTS, not clickable: a per-person daily
+// drill-down copies ~2x the entire raw log (one block per day x team, plus per
+// day x All) and overflows even a dedicated Names file's 10M-cell cap (hit live).
+// The daily roster is already the raw tab, filtered by date -- no drill-down needed.
+function renderHeadcount_(grid, slim) {
+  const ct = attendanceCrosstab(slim, 'day');           // {teams, periodLabels, counts, allRow}
+  const days = ct.periodLabels;                          // sorted YYYY-MM-DD
+  grid.push(['DAILY HEAD COUNT  (distinct workers present each day -- plain counts; the daily roster is the raw tab, filtered by date)'], []);
+  grid.push(['team'].concat(days));
+  ct.teams.forEach(function (t) {
+    const row = ['team ' + t];
+    days.forEach(function (d) { row.push((ct.counts[t] && ct.counts[t][d]) || 0); });
+    grid.push(row);
+  });
+  const allRow = ['All'];
+  days.forEach(function (d) { allRow.push(ct.allRow[d] || 0); });
+  grid.push(allRow);
+  grid.push([]);
+}
+
+function showUpTabGrid_(slim, nc) {
   if (!slim.length) return [['(no rows for this SOC)']];
-  b.label('ROTATION  (monthly; per team)');
-  b.push(objRowsGrid_(rotationSummary(slim), ROTATION_COLS));
-  b.spacer();
-  b.label('ROTATION  (weekly; per team)');
-  b.push(objRowsGrid_(rotationSummary(slim, 'week'), ROTATION_COLS));
-  b.spacer();
-  b.label('DAILY  (attendance headcount by team)');
-  b.push(attendanceGrid_(slim, 'day'));
-  return b.grid;
+  const grid = [['SHOW UP  (monthly day-count buckets; click a number to see those people)'], []];
+  const months = monthOrder_(slim);
+  renderShowup_(grid, nc, slim, 'All', showupMembers(slim), months);
+  distinctTeams(slim).forEach(function (t) {
+    renderShowup_(grid, nc, slim, 'team ' + t, showupMembers(slim, t), months);
+  });
+  renderHeadcount_(grid, slim);
+  return grid;
 }
 
-// aspect tab name -> its grid builder, in ASPECT_TABS order.
-function aspectGridFor_(tabName, slim) {
-  if (tabName === 'New-Old Face') return newOldTabGrid_(slim);
-  if (tabName === 'Show Up') return showUpTabGrid_(slim);
-  if (tabName === 'Consecutive') return consecutiveTabGrid_(slim);
-  if (tabName === 'Rotation') return rotationTabGrid_(slim);
-  throw new Error('unknown aspect tab: ' + tabName);
+// ---- New / Old face (monthly) -----------------------------------------------
+function renderNewOld_(grid, nc, scope, mem, months) {
+  grid.push([scope]);
+  grid.push(['face'].concat(months, months.map(function (m) { return m + ' %'; })));
+  ['Old', 'New'].forEach(function (face) {
+    const row = [face];
+    months.forEach(function (m) {
+      const names = (mem[m] && mem[m][face]) || [];
+      row.push(nc.link(names.length, scope + '|newold|' + m + '|' + face,
+        'New/Old | ' + m + ' | ' + face + ' | ' + scope, names));
+    });
+    months.forEach(function (m) {
+      const o = (mem[m] && mem[m].Old || []).length, n = (mem[m] && mem[m].New || []).length;
+      row.push(pctCell_(face === 'Old' ? o : n, o + n));
+    });
+    grid.push(row);
+  });
+  grid.push([]);
+}
+
+function newOldTabGrid_(slim, nc) {
+  if (!slim.length) return [['(no rows for this SOC)']];
+  const grid = [['NEW / OLD FACE  (monthly; Old = >=10 days at one station; click a number to see those people)'], []];
+  const months = monthOrder_(slim);
+  renderNewOld_(grid, nc, 'All', newOldMembers(slim), months);
+  distinctTeams(slim).forEach(function (t) {
+    renderNewOld_(grid, nc, 'team ' + t, newOldMembers(slim, t), months);
+  });
+  return grid;
+}
+
+// ---- 3-day consecutive (monthly + weekly) -----------------------------------
+const STREAK_CATS = ['active', '<10', '>10', 'usedto_<10', 'usedto_>10', 'never_<10', 'never_>10'];
+const STREAKW_CATS = ['active', '>=3', '<3'];
+
+function renderStreakMonth_(grid, nc, scope, mem, months) {
+  grid.push([scope]);
+  grid.push(['month'].concat(STREAK_CATS));
+  months.forEach(function (m) {
+    const row = [m];
+    STREAK_CATS.forEach(function (cat) {
+      const names = (mem[m] && mem[m][cat]) || [];
+      row.push(nc.link(names.length, scope + '|streakM|' + m + '|' + cat,
+        'Consecutive (monthly) | ' + m + ' | ' + cat + ' | ' + scope, names));
+    });
+    grid.push(row);
+  });
+  grid.push([]);
+}
+
+function renderStreakWeek_(grid, nc, scope, mem) {
+  const weeks = Object.keys(mem).sort(function (a, b) { return parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10); });
+  grid.push([scope]);
+  grid.push(['week'].concat(STREAKW_CATS));
+  weeks.forEach(function (w) {
+    const row = [w];
+    STREAKW_CATS.forEach(function (cat) {
+      const names = (mem[w] && mem[w][cat]) || [];
+      row.push(nc.link(names.length, scope + '|streakW|' + w + '|' + cat,
+        'Consecutive (weekly) | ' + w + ' | ' + cat + ' | ' + scope, names));
+    });
+    grid.push(row);
+  });
+  grid.push([]);
+}
+
+function consecutiveTabGrid_(slim, nc) {
+  if (!slim.length) return [['(no rows for this SOC)']];
+  const grid = [['3-DAY CONSECUTIVE  (monthly; click a number to see those people)'], []];
+  const months = monthOrder_(slim);
+  renderStreakMonth_(grid, nc, 'All', streakMonthMembers(slim), months);
+  distinctTeams(slim).forEach(function (t) {
+    renderStreakMonth_(grid, nc, 'team ' + t, streakMonthMembers(slim, t), months);
+  });
+  grid.push(['3-DAY CONSECUTIVE  (weekly; >=3 consecutive)'], []);
+  renderStreakWeek_(grid, nc, 'All', streakWeekMembers(slim));
+  distinctTeams(slim).forEach(function (t) {
+    renderStreakWeek_(grid, nc, 'team ' + t, streakWeekMembers(slim, t));
+  });
+  return grid;
+}
+
+// ---- Rotation (monthly + weekly) --------------------------------------------
+const ROT_COUNT_COLS = ['population', 'rotation', 'non_rotation', 'oneday_nonrot'];
+
+function rotationDisp_(label) { return /^\d{4}-\d{2}$/.test(label) ? monthLabel(label) : label; }
+
+function renderRotation_(grid, nc, mem, grain) {
+  grid.push(['period', 'team'].concat(ROT_COUNT_COLS, ['rotation%', 'non_rotation%', 'oneday%']));
+  Object.keys(mem).forEach(function (label) {
+    const disp = rotationDisp_(label), teamObj = mem[label];
+    Object.keys(teamObj).sort().forEach(function (t) {
+      const cell = teamObj[t];
+      const pop = cell.population.length, rot = cell.rotation.length,
+            non = cell.non_rotation.length, one = cell.oneday_nonrot.length;
+      const row = [disp, t];
+      ROT_COUNT_COLS.forEach(function (col) {
+        row.push(nc.link(cell[col].length, grain + '|' + label + '|' + t + '|' + col,
+          'Rotation (' + grain + ') | ' + disp + ' | ' + t + ' | ' + col, cell[col]));
+      });
+      row.push(pctCell_(rot, pop), pctCell_(non, pop), non ? round2(one / non * 100) + '%' : '');
+      grid.push(row);
+    });
+  });
+  grid.push([]);
+}
+
+function rotationTabGrid_(slim, nc) {
+  if (!slim.length) return [['(no rows for this SOC)']];
+  const grid = [['ROTATION  (monthly, per team; click a number to see those people)'], []];
+  renderRotation_(grid, nc, rotationMembers(slim), 'monthly');
+  grid.push(['ROTATION  (weekly, per team)'], []);
+  renderRotation_(grid, nc, rotationMembers(slim, 'week'), 'weekly');
+  return grid;
 }
 
 // collapse to one row per (name, date), keeping the earliest clock-in (garbled/
@@ -465,11 +591,13 @@ function dedupByNameDate_(rows) {
   return out;
 }
 
-// resize a summary tab to its actual grid, then write it. values.update (unlike
+// resize a tab to its actual grid, then write it. values.update (unlike
 // values.append) does NOT auto-grow, so the grid must be sized first; sizing to
-// exactly the content also keeps the workbook well under the 10M-cell cap (the
-// daily-attendance section makes some tabs wide -- one column per calendar day).
-function writeSummaryTab_(ss, sheetId, tabName, grid) {
+// exactly the content also keeps the workbook well under the 10M-cell cap. The
+// aspect tabs use USER_ENTERED (so the =HYPERLINK counts become live links); the
+// Names tab passes RAW so a worker name that happens to start with "="/"-"/"+"
+// is stored literally, not misread as a formula.
+function writeSummaryTab_(ss, sheetId, tabName, grid, inputOption) {
   let width = 1;
   grid.forEach(function (r) { if (r.length > width) width = r.length; });
   const rect = grid.map(function (r) {
@@ -484,7 +612,7 @@ function writeSummaryTab_(ss, sheetId, tabName, grid) {
   } }] }, ss.getId());
   Sheets.Spreadsheets.Values.update(
     { values: rect }, ss.getId(), quoted_(tabName) + '!A1',
-    { valueInputOption: 'USER_ENTERED' });
+    { valueInputOption: inputOption || 'USER_ENTERED' });
 }
 
 // ------------------------------------------------------------------ main sync
@@ -500,9 +628,17 @@ function sync() {
   function socCtx_(year, dept) {
     const k = year + SEP + dept;
     if (!socData[k]) {
-      const ss = findOrCreateSocSheet_(conf.folderId, year, dept);
+      // main file (raw + aspects) and one SEPARATE Names file PER ASPECT (each its
+      // own 10M budget). All created/reset once per (year, dept).
+      const ss = findOrCreateSheet_(conf.folderId, socSheetTitle_(year, dept));
       const sheetIds = prepareSocSheet_(ss);
-      socData[k] = { ss: ss, sheetIds: sheetIds, slim: [], year: year, dept: dept };
+      const namesFiles = {};   // aspect tab -> { ss, gid }
+      ASPECT_TABS.forEach(function (tab) {
+        const nss = findOrCreateSheet_(conf.folderId, socNamesTitle_(year, dept, ASPECT_NAME_SUFFIX[tab]));
+        namesFiles[tab] = { ss: nss, gid: prepareNamesSheet_(nss) };
+      });
+      socData[k] = { ss: ss, sheetIds: sheetIds, namesFiles: namesFiles,
+        slim: [], year: year, dept: dept };
     }
     return socData[k];
   }
@@ -541,27 +677,42 @@ function sync() {
       // show-up as 'Apr 26', confirmed live for SPT). Keeps earliest clock-in.
       const rows = dedupByNameDate_(rowsByYear[y]);
       appendRawRows_(ctx.ss, rows);
+      // slim slice carries the full raw-column set (not just name/date/team) so the
+      // Names drill-down can render every raw column for each counted person.
       rows.forEach(function (r) {
-        ctx.slim.push({ name: r.name, date: r.date, team: r.team, clockin: r.clockin });
+        ctx.slim.push({ name: r.name, date: r.date, team: r.team, clockin: r.clockin,
+          vendor: r.vendor, shift_name: r.shift_name, shift_id: r.shift_id, month: r.month });
       });
     });
   });
 
-  // per (year, dept): dedup the slim slice, then write the 4 aspect tabs into that
-  // SOC's own spreadsheet. Per-file dedup above already removes within-vendor
-  // overlap; this final dedup guarantees the engine's one-row-per-(name,date)
-  // contract before the summaries.
+  // per (year, dept): dedup the slim slice, then for each aspect write its summary
+  // tab (to the MAIN file; its counts are cross-file links into that aspect's own
+  // Names file) and its Names tab (to that aspect's SEPARATE file). Per-file dedup
+  // above already removes within-vendor overlap; this final dedup guarantees the
+  // engine's one-row-per-(name,date) contract before the summaries. Each aspect
+  // gets its OWN collector so its links target its OWN Names file.
+  const aspectGrids = {
+    'New-Old Face': newOldTabGrid_, 'Show Up': showUpTabGrid_,
+    'Consecutive': consecutiveTabGrid_, 'Rotation': rotationTabGrid_,
+  };
   const result = {};
   Object.keys(socData).forEach(function (k) {
     const ctx = socData[k];
     const slim = dedupByNameDate_(ctx.slim);
+    const namesIds = {};
     ASPECT_TABS.forEach(function (tab) {
-      writeSummaryTab_(ctx.ss, ctx.sheetIds[tab], tab, aspectGridFor_(tab, slim));
+      const nf = ctx.namesFiles[tab];
+      const nc = namesCollector_(nf.ss.getId(), nf.gid);
+      writeSummaryTab_(ctx.ss, ctx.sheetIds[tab], tab, aspectGrids[tab](slim, nc));
+      writeSummaryTab_(nf.ss, nf.gid, NAMES_TAB, nc.rows, 'RAW');
+      namesIds[tab] = nf.ss.getId();
     });
     const names = {};
     slim.forEach(function (r) { names[r.name] = true; });
     result[socSheetTitle_(ctx.year, ctx.dept)] = {
-      spreadsheetId: ctx.ss.getId(), rows: slim.length, workers: Object.keys(names).length };
+      spreadsheetId: ctx.ss.getId(), namesSpreadsheetIds: namesIds,
+      rows: slim.length, workers: Object.keys(names).length };
   });
 
   Logger.log(JSON.stringify(result, null, 2));
@@ -708,7 +859,7 @@ function debugPNK() { return debugBadDates('PNK', 'Jul 26', 'SOCN'); }
 function createYearSheet(year) {
   const conf = cfg_();
   const dept = conf.departments[0];
-  const ss = findOrCreateSocSheet_(conf.folderId, String(year), dept);
+  const ss = findOrCreateSheet_(conf.folderId, socSheetTitle_(String(year), dept));
   Logger.log('Sheet id for ' + socSheetTitle_(year, dept) + ': ' + ss.getId());
   return ss.getId();
 }

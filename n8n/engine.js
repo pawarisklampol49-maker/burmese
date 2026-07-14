@@ -590,6 +590,124 @@ function attendanceCrosstab(rows, period) {
   return { teams: teams, periodLabels: periodLabels, counts: counts, allRow: allRow };
 }
 
+// ------------------------------------------------------------------ membership
+// The NAMES behind each summary count -- the drill-down. Each *Members function
+// reuses the SAME grouping helper as its count function, so names and counts
+// can't drift (self-tests assert members[...].length === the count). Keyed by the
+// same labels the summary uses (month label, "W7", team, bucket, category).
+
+// Show up: {monthLabel: {bucketLabel: [names]}}. Same bucketing as showupBlock;
+// a worker with days outside 1-30 lands in no bucket (matches the count).
+function showupMembers(rows, team) {
+  const d = prepare(rows);
+  const days = daysPerMonthWorker(d, team);
+  const out = {};
+  days.forEach((x) => {
+    let bucket = null;
+    BUCKETS.forEach((b) => { if (x.days >= b[0] && x.days <= b[1]) bucket = b[0] + "-" + b[1]; });
+    if (bucket == null) return;
+    const ml = monthLabel(x.month);
+    (out[ml] = out[ml] || {});
+    (out[ml][bucket] = out[ml][bucket] || []).push(x.name);
+  });
+  return out;
+}
+
+// New/Old: {monthLabel: {"Old"|"New": [names]}}. Same >=10-days-at-one-team rule.
+function newOldMembers(rows, team) {
+  const d = prepare(rows);
+  const x = team == null ? d : d.filter((r) => r.team === team);
+  const g = groupBy(x, (r) => r.date.month + SEP + r.name);
+  const out = {};
+  for (const rs of g.values()) {
+    const ml = monthLabel(rs[0].date.month);
+    const byTeam = groupBy(rs, (r) => r.team);
+    let maxDays = 0;
+    for (const trs of byTeam.values()) {
+      const dd = new Set(trs.map((r) => r.date.key)).size;
+      if (dd > maxDays) maxDays = dd;
+    }
+    const face = maxDays >= NEWOLD_MIN_DAYS ? "Old" : "New";
+    (out[ml] = out[ml] || { Old: [], New: [] })[face].push(rs[0].name);
+  }
+  return out;
+}
+
+// Consecutive (monthly): {monthLabel: {category: [names]}} for the same
+// categories as streakMonthCrosstab (active/<10/>10/usedto_*/never_*).
+function streakMonthMembers(rows, team) {
+  const d = prepare(rows);
+  const st = workerMonthStats(d, team);
+  const out = {};
+  st.forEach((x) => {
+    const ml = monthLabel(x.month);
+    const o = (out[ml] = out[ml] || {
+      active: [], "<10": [], ">10": [], "usedto_<10": [], "usedto_>10": [], "never_<10": [], "never_>10": [],
+    });
+    const lt = x.days < 10, gt = x.days > 10, used = x.run >= 3;
+    o.active.push(x.name);
+    if (lt) o["<10"].push(x.name);
+    if (gt) o[">10"].push(x.name);
+    if (used && lt) o["usedto_<10"].push(x.name);
+    if (used && gt) o["usedto_>10"].push(x.name);
+    if (!used && lt) o["never_<10"].push(x.name);
+    if (!used && gt) o["never_>10"].push(x.name);
+  });
+  return out;
+}
+
+// Consecutive (weekly): {weekLabel: {"active"|">=3"|"<3": [names]}}.
+function streakWeekMembers(rows, team, minRun) {
+  minRun = minRun || 3;
+  const d = prepare(rows);
+  const x = team == null ? d : d.filter((r) => r.team === team);
+  const g = groupBy(x, (r) => r.date.iso.year + SEP + r.date.iso.week);
+  const out = {};
+  for (const rs of g.values()) {
+    const wk = "W" + rs[0].date.iso.week;
+    const o = (out[wk] = out[wk] || { active: [], ">=3": [], "<3": [] });
+    const byWorker = groupBy(rs, (r) => r.name);
+    for (const [name, wr] of byWorker) {
+      o.active.push(name);
+      const run = maxConsecutiveRun(wr.map((r) => r.date.dayNum));
+      if (run >= minRun) o[">=3"].push(name); else o["<3"].push(name);
+    }
+  }
+  return out;
+}
+
+// Rotation: {label: {team: {"population"|"rotation"|"non_rotation"|"oneday_nonrot":
+// [names]}}}. label = ISO month ("2026-03") monthly, "W7" weekly -- matches
+// rotationSummary. Same Reading-B oneday rule.
+function rotationMembers(rows, period) {
+  period = period || "month";
+  const wt = rotationWorkerTable(rows, period);
+  const teams = distinctTeams(prepare(rows));
+  const byPeriod = groupBy(wt, (r) => r.periodKey);
+  const out = {};
+  for (const pk of Array.from(byPeriod.keys()).sort()) {
+    const g = byPeriod.get(pk);
+    const label = period === "month" ? pk : g[0].label;
+    const teamObj = {};
+    for (const t of teams) {
+      const inTeam = g.filter((r) => (r.teamCount[t] || 0) >= 1);
+      if (!inTeam.length) continue;
+      const cell = { population: [], rotation: [], non_rotation: [], oneday_nonrot: [] };
+      inTeam.forEach((r) => {
+        cell.population.push(r.name);
+        if (r.analyze[t] === "Rotated") { cell.rotation.push(r.name); }
+        else {
+          cell.non_rotation.push(r.name);
+          if ((r.teamCount[t] || 0) === 1) cell.oneday_nonrot.push(r.name);
+        }
+      });
+      teamObj[t] = cell;
+    }
+    out[label] = teamObj;
+  }
+  return out;
+}
+
 function workerMonthStats(d, team) {
   const x = team == null ? d : d.filter((r) => r.team === team);
   const g = groupBy(x, (r) => r.date.month + SEP + r.name);
@@ -849,6 +967,23 @@ function runSelfTests() {
   assert(rw.length > 0 && rw[0].month[0] === "W" && "population" in rw[0], "weekly rotation shape");
   ok("test_rotation_weekly");
 
+  // drill-down membership: names.length must equal the summary count everywhere
+  const shM = showupMembers(df);
+  assert(shM["Mar"]["1-5"].length === sb.counts["1-5"]["Mar"], "showup members == count");
+  const noM = newOldMembers(df);
+  assert(noM["Mar"].Old.length === nof.counts.Old["Mar"] &&
+         noM["Mar"].New.length === nof.counts.New["Mar"], "newold members == count");
+  const smM = streakMonthMembers(df);
+  assert(smM["Mar"]["usedto_<10"].length + smM["Mar"]["usedto_>10"].length === 5, "streak-month members == count");
+  const swM = streakWeekMembers(df);
+  assert(swM["W10"][">=3"].length === 4 && swM["W11"][">=3"].length === 2, "streak-week members == count");
+  const roM = rotationMembers(df);
+  assert(roM["2026-03"]["IB"].population.length === 8 &&
+         roM["2026-03"]["IB"].rotation.length === 1 &&
+         roM["2026-03"]["IB"].oneday_nonrot.length === 2, "rotation members == count");
+  assert(roM["2026-03"]["IB"].population.indexOf("grace") >= 0, "rotation members list the actual names");
+  ok("test_membership_matches_counts");
+
   log.push("ALL SELF-TESTS PASSED");
   return [{ json: { passed: true, log: log } }];
 }
@@ -864,6 +999,8 @@ if (typeof module !== "undefined") {
     showupBlock: showupBlock, rotationSummary: rotationSummary, streakMonthCrosstab: streakMonthCrosstab,
     streakWeek: streakWeek, makeDate: makeDate, monthLabel: monthLabel, runSelfTests: runSelfTests,
     distinctTeams: distinctTeams, newOldMonthly: newOldMonthly, attendanceCrosstab: attendanceCrosstab,
+    showupMembers: showupMembers, newOldMembers: newOldMembers, streakMonthMembers: streakMonthMembers,
+    streakWeekMembers: streakWeekMembers, rotationMembers: rotationMembers,
     OPERATIONAL_TEAMS: OPERATIONAL_TEAMS, BUCKETS: BUCKETS,
   };
 }
