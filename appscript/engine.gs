@@ -19,6 +19,9 @@
 // ------------------------------------------------------------------ constants
 const OPERATIONAL_TEAMS = ["CBS", "IB", "mCBS", "MS", "OBI", "OBS", "OBC", "OBD"];
 const BUCKETS = [[1, 5], [6, 10], [11, 15], [16, 20], [21, 30]];
+// weekly analog of BUCKETS: an ISO week has at most 7 days, so the monthly
+// buckets can't apply. User-confirmed grouping for the weekly Show Up view.
+const WEEK_BUCKETS = [[1, 2], [3, 4], [5, 7]];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 // group-key separator: a control char that never appears in real data, so
 // composite keys are unique even when a worker name contains spaces. Keys
@@ -774,6 +777,73 @@ function attendanceMembers(rows, period) {
   return out;
 }
 
+// Show up (weekly): {weekLabel: {bucketLabel: [rows]}} -- distinct show-up days
+// per (ISO week, worker), bucketed into WEEK_BUCKETS. Same one-rep-row-per-worker
+// rule as showupMembers. Every day count 1..7 lands in a bucket, so the bucket
+// sum for a week equals that week's distinct-worker head count.
+function showupWeekMembers(rows, team) {
+  const d = prepare(rows);
+  const x = team == null ? d : d.filter((r) => r.team === team);
+  const g = groupBy(x, (r) => r.date.iso.year + SEP + r.date.iso.week + SEP + r.name);
+  const out = {};
+  for (const rs of g.values()) {
+    const days = new Set(rs.map((r) => r.date.key)).size;
+    let bucket = null;
+    WEEK_BUCKETS.forEach((b) => { if (days >= b[0] && days <= b[1]) bucket = b[0] + "-" + b[1]; });
+    if (bucket == null) continue;
+    const wk = "W" + rs[0].date.iso.week;
+    (out[wk] = out[wk] || {});
+    (out[wk][bucket] = out[wk][bucket] || []).push(pickRep(rs));
+  }
+  return out;
+}
+
+// New/Old presence by "day" or ISO "week": {periodLabel: {"Old"|"New": [rows]}}.
+// The user's rule: "showed up that day and he is old face -> count him as old
+// face". The VERDICT stays the monthly newOldFace_ one (a worker's whole month,
+// all teams -- there is no weekly/daily >=10-days rule); the day/week grain only
+// changes WHICH presence is counted. Rotated workers (verdict null) are excluded,
+// exactly like the monthly tab. A week can straddle two months (the only
+// cross-month grain): the verdict of the month of the worker's EARLIEST show-up
+// in that week decides -- affects boundary weeks only.
+function newOldPresence(rows, period, team) {
+  const d = prepare(rows);
+  const face = {};   // month+SEP+name -> "Old"|"New"|null, over ALL teams
+  for (const [k, rs] of groupBy(d, (r) => r.date.month + SEP + r.name)) face[k] = newOldFace_(rs);
+  const x = team == null ? d : d.filter((r) => r.team === team);
+  const out = {};
+  for (const rs of groupBy(x, (r) => periodKey(r.date, period) + SEP + r.name).values()) {
+    const rep = pickRep(rs);
+    const f = face[rep.date.month + SEP + rep.name];
+    if (f == null) continue;   // rotated that month -> the Rotation tab's turf
+    const label = periodLabel(periodKey(rep.date, period), period);
+    (out[label] = out[label] || { Old: [], New: [] })[f].push(rep);
+  }
+  return out;
+}
+
+// Rotation daily presence: {dayKey: {team: {"rotation"|"non_rotation": [rows]}}}.
+// After cleaning a worker has exactly ONE team per day (double shifts keep the
+// earliest clock-in), so nobody can rotate WITHIN a day; this projects the
+// MONTHLY verdict onto each present day (user-confirmed): a worker at team T on
+// day D counts as rotation iff their month's analyze at T is "Rotated" -- the
+// same Reading-B rule as rotationSummary, so a single day at T stays non-rotated
+// even for a multi-team worker. rotation + non_rotation partition that day's
+// head count at T. The member row is the worker's own row for that day.
+function rotationPresenceDay(rows) {
+  const d = prepare(rows);
+  const rot = {};   // month+SEP+name -> analyze map (team -> "Rotated"|"")
+  rotationWorkerTable(rows, "month").forEach((r) => { rot[r.periodKey + SEP + r.name] = r.analyze; });
+  const out = {};
+  d.forEach((r) => {
+    const analyze = rot[r.date.month + SEP + r.name];
+    const teamObj = (out[r.date.key] = out[r.date.key] || {});
+    const cell = (teamObj[r.team] = teamObj[r.team] || { rotation: [], non_rotation: [] });
+    cell[analyze && analyze[r.team] === "Rotated" ? "rotation" : "non_rotation"].push(r);
+  });
+  return out;
+}
+
 function workerMonthStats(d, team) {
   const x = team == null ? d : d.filter((r) => r.team === team);
   const g = groupBy(x, (r) => r.date.month + SEP + r.name);
@@ -1074,6 +1144,34 @@ function runSelfTests() {
   assert(amW["W10"].All.length === 6, "attendance members weekly == count");
   ok("test_membership_matches_counts");
 
+  // day/week presence grains: Show Up weekly buckets, New/Old daily+weekly,
+  // Rotation daily -- presence-scoped projections of the locked MONTHLY rules.
+  const swk = showupWeekMembers(df);
+  assert(swk["W10"]["1-2"].length === 2 && swk["W10"]["5-7"].length === 4, "showup week W10 buckets");
+  assert(!swk["W10"]["3-4"], "showup week W10 has no 3-4 workers");
+  assert(swk["W11"]["1-2"].length === 1 && swk["W11"]["3-4"].length === 1 && swk["W11"]["5-7"].length === 1, "showup week W11");
+  assert(swk["W14"]["3-4"].length === 1 && swk["W14"]["3-4"][0].name === "henry", "showup week W14 spans Mar/Apr");
+  const w10sum = ["1-2", "3-4", "5-7"].reduce((s, b) => s + ((swk["W10"] && swk["W10"][b]) || []).length, 0);
+  assert(w10sum === amW["W10"].All.length, "showup week bucket sum == weekly head count");
+  const swkIB = showupWeekMembers(df, "IB");
+  assert(swkIB["W10"]["1-2"].length === 3 && swkIB["W10"]["5-7"].length === 3, "showup week IB-scoped (dave: 2 IB days -> 1-2)");
+
+  const nopD = newOldPresence(df, "day");
+  assert(nopD["2026-03-02"].Old.length === 1 && nopD["2026-03-02"].New.length === 3, "newold daily Mar-02 (rotated bob/dave excluded)");
+  assert(nopD["2026-03-02"].Old[0].name === "grace", "newold daily Old is grace");
+  assert(nopD["2026-04-01"].New.length === 1, "newold daily Apr-01 (henry, Apr verdict)");
+  const nopW = newOldPresence(df, "week");
+  assert(nopW["W10"].Old.length === 1 && nopW["W10"].New.length === 3, "newold weekly W10");
+  assert(nopW["W14"].New.length === 1, "newold weekly W14 (cross-month week, verdict from earliest day's month)");
+
+  const rpd = rotationPresenceDay(df);
+  assert(rpd["2026-03-02"]["IB"].rotation.length === 1 && rpd["2026-03-02"]["IB"].non_rotation.length === 5,
+         "rotation daily Mar-02 IB (dave rotated; bob 1-day-at-IB non-rotated per Reading B)");
+  assert(rpd["2026-03-04"]["MS"].rotation.length === 1 && rpd["2026-03-04"]["MS"].rotation[0].name === "dave", "rotation daily Mar-04 MS");
+  assert(rpd["2026-03-02"]["IB"].rotation.length + rpd["2026-03-02"]["IB"].non_rotation.length ===
+         amD["2026-03-02"]["IB"].length, "rotation daily partitions the day's head count");
+  ok("test_presence_grains");
+
   log.push("ALL SELF-TESTS PASSED");
   return [{ json: { passed: true, log: log } }];
 }
@@ -1091,6 +1189,7 @@ if (typeof module !== "undefined") {
     distinctTeams: distinctTeams, newOldMonthly: newOldMonthly, attendanceCrosstab: attendanceCrosstab,
     showupMembers: showupMembers, newOldMembers: newOldMembers, streakMonthMembers: streakMonthMembers,
     streakWeekMembers: streakWeekMembers, rotationMembers: rotationMembers, attendanceMembers: attendanceMembers,
-    OPERATIONAL_TEAMS: OPERATIONAL_TEAMS, BUCKETS: BUCKETS,
+    showupWeekMembers: showupWeekMembers, newOldPresence: newOldPresence, rotationPresenceDay: rotationPresenceDay,
+    OPERATIONAL_TEAMS: OPERATIONAL_TEAMS, BUCKETS: BUCKETS, WEEK_BUCKETS: WEEK_BUCKETS,
   };
 }

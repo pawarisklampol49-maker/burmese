@@ -177,9 +177,18 @@ function readMonthTabs_(fileId, yearSuffix) {
     .filter(function (t) { return isMonthTab_(t) && monthTabYear_(t) === yearSuffix; });
   if (!titles.length) return { titles: [], valuesByTitle: {} };
   const ranges = titles.map(function (t) { return quoted_(t) + '!A:J'; });
-  const resp = retryRead_(function () {
-    return Sheets.Spreadsheets.Values.batchGet(fileId, { ranges: ranges, majorDimension: 'ROWS' });
-  });
+  let resp;
+  try {
+    resp = retryRead_(function () {
+      return Sheets.Spreadsheets.Values.batchGet(fileId, { ranges: ranges, majorDimension: 'ROWS' });
+    });
+  } catch (e) {
+    // The metadata get() above already succeeded on this fileId, so the file EXISTS
+    // and is readable -- a 404 here is NOT "file missing". Name the file id and the
+    // exact month tabs requested so the culprit can be opened and inspected directly.
+    throw new Error('batchGet failed for spreadsheet ' + fileId + ' on tabs ' +
+      JSON.stringify(titles) + ' -- ' + e.message);
+  }
   const vr = resp.valueRanges || [];
   const valuesByTitle = {};
   titles.forEach(function (t, i) { valuesByTitle[t] = (vr[i] && vr[i].values) || []; });
@@ -349,22 +358,46 @@ function appendRawRows_(ss, rows) {
 function blank_(v) { return v == null ? '' : v; }
 
 // ------------------------------------------------------------------ summaries
-// One tab PER ASPECT (monthly for all; Consecutive & Rotation also weekly; Show Up
-// also carries a daily head-count block, the one metric meaningful per day). Every
-// COUNT is a =HYPERLINK that jumps to the people behind it, listed in the Names tab
-// (the drill-down). Members are one REPRESENTATIVE raw row per counted person and
-// come from the engine's *Members functions, asserted (self-tests) to match the
-// counts. Engine globals (showupMembers, newOldMembers, streakMonthMembers,
-// streakWeekMembers, rotationMembers, attendanceMembers, distinctTeams, monthLabel,
-// round2, BUCKETS) come from engine.gs -- read INSIDE functions, never at top level
-// (cross-file const load order isn't guaranteed). No daily view for the bucket/
-// rotation/consecutive aspects: those can't run on a single day.
+// One tab PER ASPECT, each carrying every grain that means something (user
+// request: day/week/month everywhere it can): Show Up = monthly buckets + WEEKLY
+// buckets (1-2/3-4/5-7 days) + daily head count; New/Old = monthly + weekly +
+// daily (presence counted by the MONTHLY verdict); Rotation = monthly + weekly +
+// daily (presence by the monthly Reading-B status -- a worker has one team per
+// day, so nothing can rotate WITHIN a day); Consecutive = monthly + weekly only
+// (user: keep as is). DAILY blocks are PLAIN NUMBERS -- a per-person daily
+// drill-down copies ~2x the raw log and overflowed a Names file live; the daily
+// roster is the raw tab filtered by date. Monthly/weekly COUNTS are =HYPERLINKs
+// to the people behind them in that aspect's Names file. Members are one
+// REPRESENTATIVE raw row per counted person and come from the engine's *Members/
+// *Presence functions, asserted (self-tests) to match the counts. Engine globals
+// (showupMembers, showupWeekMembers, newOldMembers, newOldPresence,
+// streakMonthMembers, streakWeekMembers, rotationMembers, rotationPresenceDay,
+// distinctTeams, monthLabel, round2, BUCKETS, WEEK_BUCKETS) come from engine.gs
+// -- read INSIDE functions, never at top level (cross-file const load order
+// isn't guaranteed).
 
 // chronological month labels present in the slice ("2026-03" sorts, then -> "Mar").
 function monthOrder_(slim) {
   const seen = {};
   slim.forEach(function (r) { seen[r.date.month] = true; });
   return Object.keys(seen).sort().map(monthLabel);
+}
+
+// all show-up days present in the slice, sorted ("YYYY-MM-DD" sorts = chronological).
+// Shared column set for every daily block, so columns align across scopes.
+function dayOrder_(slim) {
+  const seen = {};
+  slim.forEach(function (r) { seen[r.date.key] = true; });
+  return Object.keys(seen).sort();
+}
+
+// all ISO weeks present in the slice as "W<n>" labels, numerically sorted -- the
+// shared column set for the weekly Show Up / New-Old sections (same labels the
+// engine's week-keyed members use).
+function weeksOf_(slim) {
+  const seen = {};
+  slim.forEach(function (r) { seen['W' + r.date.iso.week] = true; });
+  return sortPeriodKeys_(Object.keys(seen));
 }
 
 // ---- visualization: fixed team scope + cell formatting -----------------------
@@ -530,6 +563,7 @@ function pctCell_(num, den) { const n = pctNum_(num, den); return n == null ? ''
 // hit live. Same reason every other engine global is read inside functions, never
 // at Code.gs's top level (see the summaries-section comment above).
 function showupBucketLabels_() { return BUCKETS.map(function (b) { return b[0] + '-' + b[1]; }); }
+function weekBucketLabels_() { return WEEK_BUCKETS.map(function (b) { return b[0] + '-' + b[1]; }); }
 
 // per-scope, per-month denominator: total across all buckets for that month
 // (excludes days outside 1-30). Shared by both the by-team and by-bucket tables
@@ -568,6 +602,36 @@ function renderShowup_(grid, formats, nc, scope, mem, months) {
   const sumRow = ['Sum Month'];
   months.forEach(function (m) { sumRow.push(sums[m]); });
   months.forEach(function () { sumRow.push('100%'); });
+  grid.push(sumRow);
+  grid.push([]);
+}
+
+// Weekly analog of the by-team table: one block per scope, WEEK_BUCKETS
+// (1-2/3-4/5-7 days) as rows, ISO weeks as columns (counts, then %). Same
+// layout rules as renderShowup_, including the plain (never linked) sum row.
+function renderShowupWeek_(grid, formats, nc, scope, mem, weeks) {
+  const buckets = weekBucketLabels_();
+  const headerRow = grid.length;
+  grid.push([scope]);
+  fmtCell_(formats, headerRow, 0, { bg: isAllScope_(scope) ? FMT.headerAllBg : FMT.headerTeamBg, bold: true });
+  grid.push(['bucket'].concat(weeks, weeks.map(function (w) { return w + ' %'; })));
+  const sums = {};
+  weeks.forEach(function (w) {
+    var s = 0; buckets.forEach(function (bk) { s += ((mem[w] && mem[w][bk]) || []).length; }); sums[w] = s;
+  });
+  buckets.forEach(function (bk) {
+    const row = [bk];
+    weeks.forEach(function (w) {
+      const names = (mem[w] && mem[w][bk]) || [];
+      row.push(nc.link(names.length, scope + '|showupW|' + w + '|' + bk,
+        'Show up (weekly) | ' + w + ' | ' + bk + ' days | ' + scope, names));
+    });
+    weeks.forEach(function (w) { row.push(pctCell_(((mem[w] && mem[w][bk]) || []).length, sums[w])); });
+    grid.push(row);
+  });
+  const sumRow = ['Sum Week'];
+  weeks.forEach(function (w) { sumRow.push(sums[w]); });
+  weeks.forEach(function () { sumRow.push('100%'); });
   grid.push(sumRow);
   grid.push([]);
 }
@@ -672,10 +736,16 @@ function showUpTabGrid_(slim, nc, dept) {
   });
   renderShowupByBucket_(grid, formats, bucketScopes, months);
 
+  // weekly day-count buckets (1-2/3-4/5-7 -- a week has at most 7 days), same
+  // scope blocks as the monthly table, ISO weeks as columns, counts clickable.
+  grid.push(['SHOW UP  (weekly day-count buckets; click a number to see those people)'], []);
+  const weeks = weeksOf_(slim);
+  scopes.forEach(function (sc) {
+    renderShowupWeek_(grid, formats, nc, sc.label, showupWeekMembers(sc.natSlim, sc.team), weeks);
+  });
+
   // daily head count -- all days present across the SOC, sorted
-  const daySet = {};
-  slim.forEach(function (r) { daySet[r.date.key] = true; });
-  renderHeadcount_(grid, scopes, Object.keys(daySet).sort());
+  renderHeadcount_(grid, scopes, dayOrder_(slim));
   return { grid: grid, formats: formats };
 }
 
@@ -728,6 +798,27 @@ function renderNewOldByCategory_(grid, formats, scopes, months) {
   });
 }
 
+// Daily New/Old presence, PLAIN NUMBERS (same no-daily-drill-down rule as the
+// head count): one table per face, scopes as rows, days as columns. The verdict
+// is the MONTHLY one -- "showed up that day and he is old face -> count him as
+// old face" (user's rule); rotated workers are excluded like everywhere else on
+// this tab, so Old + New per day <= that day's head count.
+function renderFaceDaily_(grid, scopes, days) {
+  const memByScope = scopes.map(function (sc) {
+    return { label: sc.label, mem: newOldPresence(sc.natSlim, 'day', sc.team) };
+  });
+  NEWOLD_FACES.forEach(function (face) {
+    grid.push(['DAILY ' + face.toUpperCase() + ' FACE  (present that day, ' + face + ' by their month verdict)']);
+    grid.push(['team'].concat(days));
+    memByScope.forEach(function (s) {
+      const row = [s.label];
+      days.forEach(function (d) { row.push(((s.mem[d] && s.mem[d][face]) || []).length); });
+      grid.push(row);
+    });
+    grid.push([]);
+  });
+}
+
 function newOldTabGrid_(slim, nc, dept) {
   if (!slim.length) return { grid: [['(no rows for this SOC)']], formats: [] };
   const grid = [['NEW / OLD FACE  (monthly; Old = fixed to one station AND >=10 days; <10 days = New; rotated workers excluded -- see Rotation tab; click a number to see those people)'], []];
@@ -746,6 +837,19 @@ function newOldTabGrid_(slim, nc, dept) {
     return { label: sc.label, mem: newOldMembers(sc.natSlim, sc.team) };
   });
   renderNewOldByCategory_(grid, formats, catScopes, months);
+
+  // weekly: same blocks as the monthly table, ISO weeks as columns. The verdict
+  // stays MONTHLY (there is no weekly >=10-days rule); the week only picks WHO
+  // was present. Reuses renderNewOld_ verbatim -- mem is keyed by week label.
+  grid.push(['NEW / OLD FACE  (weekly -- workers present that ISO week, by their month verdict; click a number to see those people)'], []);
+  const weeks = weeksOf_(slim);
+  scopes.forEach(function (sc) {
+    renderNewOld_(grid, formats, nc, sc.label, newOldPresence(sc.natSlim, 'week', sc.team), weeks);
+  });
+
+  // daily: plain counts (not clickable -- see renderHeadcount_'s rationale)
+  grid.push(['NEW / OLD FACE  (daily -- workers present each day, by their month verdict; plain counts: the daily roster is the raw tab, filtered by date)'], []);
+  renderFaceDaily_(grid, scopes, dayOrder_(slim));
 
   return { grid: grid, formats: formats };
 }
@@ -970,6 +1074,29 @@ function renderRotationTrend_(grid, formats, natTeams, memByNat, periodKeys, dis
   renderTrendPctBlock_(grid, formats, 'Non rotation worker who come to work only 1 day in a month', FMT.oneDayFg, '', rowsFor('oneday'), periods);
 }
 
+// Daily rotation presence, PLAIN NUMBERS (same no-daily-drill-down rule as the
+// head count): one table per status, (team x nationality) as rows, days as
+// columns. A worker has exactly ONE team per day, so nothing rotates WITHIN a
+// day -- each cell counts workers present at that team that day by their MONTH
+// Reading-B status (user-confirmed), and rotation + non_rotation per (day, team)
+// partition that day's head count at the team.
+function renderRotationDaily_(grid, natTeams, dayByNat, days) {
+  [['DAILY ROTATION  (present that day, rotated within that month)', 'rotation'],
+   ['DAILY NON ROTATION  (present that day, not rotated that month)', 'non_rotation']].forEach(function (spec) {
+    grid.push([spec[0]]);
+    grid.push(['team'].concat(days));
+    natTeams.forEach(function (nt) {
+      const mem = dayByNat[nt.nat];
+      const row = [nt.label];
+      days.forEach(function (d) {
+        row.push(((mem[d] && mem[d][nt.team] && mem[d][nt.team][spec[1]]) || []).length);
+      });
+      grid.push(row);
+    });
+    grid.push([]);
+  });
+}
+
 function rotationTabGrid_(slim, nc, dept) {   // no "All <dept>" row (would double-count rotators); split by nationality
   if (!slim.length) return { grid: [['(no rows for this SOC)']], formats: [] };
   const grid = [['ROTATION  (monthly, per team; click a number to see those people)'], []];
@@ -978,12 +1105,14 @@ function rotationTabGrid_(slim, nc, dept) {   // no "All <dept>" row (would doub
   const nats = presentNationalities_(slim);
   const natTeams = natTeams_(teams, nats);   // "IB Burmese", "IB Thai", "CBS Burmese", ...
 
-  // rotationMembers per nationality (keyed by period -> team -> members)
-  const monthByNat = {}, weekByNat = {};
+  // rotationMembers per nationality (keyed by period -> team -> members);
+  // rotationPresenceDay per nationality for the daily block.
+  const monthByNat = {}, weekByNat = {}, dayByNat = {};
   nats.forEach(function (n) {
     const ns = filterNat_(slim, n);
     monthByNat[n] = rotationMembers(ns);
     weekByNat[n] = rotationMembers(ns, 'week');
+    dayByNat[n] = rotationPresenceDay(ns);
   });
 
   const monthKeys = unionPeriodKeys_(monthByNat);   // ISO "YYYY-MM", chronological
@@ -996,6 +1125,10 @@ function rotationTabGrid_(slim, nc, dept) {   // no "All <dept>" row (would doub
   renderRotationDetail_(grid, formats, nc, natTeams, weekByNat, weekKeys, function (k) { return k; }, 'rotW');
   grid.push(['ROTATION  (weekly trend summary)'], []);
   renderRotationTrend_(grid, formats, natTeams, weekByNat, weekKeys, function (k) { return k; });
+
+  // daily: plain counts (not clickable -- see renderHeadcount_'s rationale)
+  grid.push(['ROTATION  (daily, per team -- plain counts: the daily roster is the raw tab, filtered by date)'], []);
+  renderRotationDaily_(grid, natTeams, dayByNat, dayOrder_(slim));
 
   return { grid: grid, formats: formats };
 }
@@ -1121,17 +1254,41 @@ function writeSummaryTab_(ss, sheetId, tabName, grid, inputOption, formats) {
 }
 
 // ------------------------------------------------------------------ main sync
-function sync() {
+// ONE DEPARTMENT PER EXECUTION. Measured live (2026-07-15, half-year data): a full
+// all-departments sync took 29.7 min -- 23 min of it reading the 28 vendor files +
+// appending raw rows, ~7 min summaries -- so a full year would blow the ~30-min
+// execution ceiling. The three SOCs share nothing (separate vendor files in,
+// separate central files out), so the daily schedule runs one dept per execution
+// (~1/3 the work, and bounded: a year's file set caps at 12 months). Triggers
+// can't pass arguments, so each dept gets a thin named wrapper; installTrigger()
+// installs one staggered daily trigger per department.
+function syncSOCN() { return runSync_('SOCN'); }
+function syncSOCE() { return runSync_('SOCE'); }
+function syncSOCW() { return runSync_('SOCW'); }
+
+// manual all-departments run (smoke tests / small data). The daily schedule uses
+// the per-dept wrappers above -- on full data this one exceeds the execution limit.
+function sync() { return runSync_(null); }
+
+function runSync_(deptFilter) {
   // ---- timing instrumentation: pinpoint where a long run spends its time so the
-  // right lever gets pulled (chunk size is minor; drill-down VOLUME is the cost).
-  // Read the Executions log after a run to see the read/append vs summary/names
-  // breakdown per SOC. Remove once the hotspot is confirmed and cut.
+  // right lever gets pulled. Measured: read+append dominates (78%), not the Names
+  // writes. Keep until the per-dept split is confirmed comfortably under the limit.
   const T0 = Date.now();
   function since_() { return ((Date.now() - T0) / 1000).toFixed(1) + 's'; }
 
   const conf = cfg_();
-  const files = discoverFiles_(conf.departments, conf.thaiVendors);
-  Logger.log('[t] discovery done: ' + files.length + ' files @ ' + since_());
+  let files = discoverFiles_(conf.departments, conf.thaiVendors);
+  if (deptFilter) {
+    // discovery stays global (cheap, and keeps its strict validation over EVERY
+    // file title); the filter only narrows which files this execution processes.
+    files = files.filter(function (f) { return f.dept === deptFilter; });
+    if (!files.length) {
+      throw new Error("no raw vendor spreadsheets found for department '" + deptFilter + "'");
+    }
+  }
+  Logger.log('[t] discovery done: ' + files.length + ' files' +
+    (deptFilter ? ' for ' + deptFilter : '') + ' @ ' + since_());
 
   // stream: per file, append its raw rows to that (year, dept) sheet's raw tab and
   // release; keep only the slim {name,date,team,clockin} slice for the summaries.
@@ -1157,7 +1314,14 @@ function sync() {
   }
 
   files.forEach(function (f) {
-    const read = readMonthTabs_(f.id, f.year.slice(-2));
+    const tf = Date.now();
+    let read;
+    try {
+      read = readMonthTabs_(f.id, f.year.slice(-2));
+    } catch (e) {
+      throw new Error("reading '" + f.name + "' (id=" + f.id + ", dept=" + f.dept +
+        ", vendor=" + f.vendor + "): " + e.message);
+    }
     if (!read.titles.length) {
       throw new Error("'" + f.name + "' (dept=" + f.dept + ", vendor=" + f.vendor +
         ") has no month tabs -- schema drift or an empty file");
@@ -1184,6 +1348,7 @@ function sync() {
         (rowsByYear[y] = rowsByYear[y] || []).push(r);
       });
     });
+    let fileRows = 0;
     Object.keys(rowsByYear).forEach(function (y) {
       const ctx = socCtx_(y, f.dept);
       // dedup one row per (name,date) across THIS file's tabs before writing the
@@ -1191,6 +1356,7 @@ function sync() {
       // show-up as 'Apr 26', confirmed live for SPT). Keeps earliest clock-in.
       const rows = dedupByNameDate_(rowsByYear[y]);
       appendRawRows_(ctx.ss, rows);
+      fileRows += rows.length;
       // slim slice carries the full raw-column set (not just name/date/team) so the
       // Names drill-down can render every raw column for each counted person.
       rows.forEach(function (r) {
@@ -1199,6 +1365,8 @@ function sync() {
           nationality: r.nationality });
       });
     });
+    Logger.log('[t] ' + f.dept + '/' + f.vendor + ': ' + read.titles.length + ' tabs, ' +
+      fileRows + ' rows, ' + ((Date.now() - tf) / 1000).toFixed(1) + 's @ ' + since_());
   });
 
   // per (year, dept): dedup the slim slice, then for each aspect write its summary
@@ -1389,11 +1557,25 @@ function createYearSheet(year) {
   return ss.getId();
 }
 
-// install (idempotently) the daily time-based trigger on sync().
+// install (idempotently) ONE daily time-based trigger PER DEPARTMENT, staggered
+// an hour apart (11:00 / 12:00 / 13:00) -- a full all-departments sync exceeds
+// the execution-time limit on full data, so each dept runs in its own execution
+// (see the note above runSync_). Deletes any previous sync/syncDEPT triggers
+// first. Departments come from RAW_DEPARTMENTS; each must have a syncDEPT
+// wrapper (triggers can't pass arguments), so a dept without one is a hard
+// error here, not a silent no-trigger.
 function installTrigger() {
+  const conf = cfg_();
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === 'sync') ScriptApp.deleteTrigger(t);
+    if (/^sync/.test(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
   });
-  ScriptApp.newTrigger('sync').timeBased().everyDays(1).atHour(11).create();
-  Logger.log('Daily trigger installed (runs sync() ~11:00 in the project time zone).');
+  conf.departments.forEach(function (d, i) {
+    const fn = 'sync' + d;
+    if (typeof globalThis[fn] !== 'function') {
+      throw new Error("no trigger wrapper '" + fn + "' for department '" + d +
+        "' -- add `function " + fn + "() { return runSync_('" + d + "'); }` to Code.gs");
+    }
+    ScriptApp.newTrigger(fn).timeBased().everyDays(1).atHour(11 + i).create();
+    Logger.log('Daily trigger installed: ' + fn + '() ~' + (11 + i) + ':00 (project time zone).');
+  });
 }

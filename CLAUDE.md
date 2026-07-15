@@ -158,8 +158,18 @@ setup and nothing to re-paste when 2027 rolls over.
 
 - `appscript/engine.gs` — **verbatim copy** of `n8n/engine.js`. That file is
   plain JS and its Node footer is guarded by `typeof module !== "undefined"`,
-  so it runs unchanged under GAS V8. Keep `n8n/engine.js` canonical; re-copy
-  on any change (one source of the cleaning + metric logic, no fork).
+  so it runs unchanged under GAS V8. In practice edits now land in `engine.gs`
+  first (it's the deployed one) and are copied back — the direction doesn't
+  matter, **keeping the two byte-identical does** (`diff` must be empty; one
+  source of the cleaning + metric logic, no fork). 2026-07-15: found they had
+  silently drifted (the rep-row `*Members` + `newOldFace_` changes existed only
+  in `engine.gs`); refreshed `n8n/engine.js` from `engine.gs`. NOTE:
+  `render/test.py`'s Python engine mirror is STALE from that same point (it
+  still returns bare names from `*Members` and predates `newOldFace_`) and is
+  no longer a parity check for the engine — the checks are `engine.gs`'s own
+  `runSelfTests()` (run it in GAS after every paste) plus targeted local
+  transcriptions of new logic; test.py's docstring remains the spec for the
+  locked metric definitions.
 - **Write path is Advanced Sheets Service ONLY, never SpreadsheetApp.** Mixing
   the two on one spreadsheet silently corrupts output: `SpreadsheetApp` buffers
   writes and flushes them lazily (often at script end), so a `SpreadsheetApp`
@@ -217,11 +227,18 @@ shape; `findOrCreateSheet_` + `prepareNamesSheet_` build each aspect's Names fil
 `sync` keys its streaming context by `(year, dept)` and holds `ss` + `namesFiles`
 (aspect → `{ss, gid}`).
 
-**Summaries follow the slide deck**, **grouped by team**, at only the grains that
-mean something (no daily for the bucket/rotation/consecutive aspects — they can't
-run on one day; the one daily view is a head count, below). Percentages render
-with a `%` sign (`pctCell_`, written USER_ENTERED so `"45.11%"` is a real percent
-number, not stuck text):
+**Summaries follow the slide deck**, **grouped by team**. **Every aspect now
+carries day + week + month grains except Consecutive** (month + week — the user's
+explicit "keep it as it is"; added 2026-07-15 per user request). A metric that
+can't literally run on one day (buckets need a span; nothing rotates WITHIN a day
+since a worker has ONE team per day) gets a **presence projection** instead: the
+daily view counts workers PRESENT that day by their MONTHLY verdict — the user's
+rule, "shows up that day and he is old face → count him as old face". **All daily
+blocks are PLAIN NUMBERS** (a per-person daily drill-down copies ~2× the raw log
+and overflowed a Names file live — the daily roster is the `raw` tab filtered by
+date); monthly and weekly counts are clickable. Percentages render with a `%`
+sign (`pctCell_`, written USER_ENTERED so `"45.11%"` is a real percent number,
+not stuck text):
   - **New / Old face** — the user's **operational experience rule** (`newOldFace_`
     in engine.gs), per (month, worker). Only classifies workers **fixed to one
     station** that month: **Old (experienced)** = one station AND **≥10 days**;
@@ -232,18 +249,31 @@ number, not stuck text):
     fixed-station-only," so rotated is now dropped, not folded into New.)
     Classification uses the worker's WHOLE month (all teams), so team-scoping only
     changes WHO is counted (present at T) + the rep row shown, never the verdict.
-    **Monthly** only. Same two-table + trend + `All <DEPT>` + `visibleTeams_`
-    treatment as Show Up. (NOT tenure/range — that was a mid-conversation detour
+    **Monthly + weekly + daily.** Monthly = the same two-table + trend + `All
+    <DEPT>` + `visibleTeams_` treatment as Show Up. Weekly and daily are
+    **presence projections of the monthly verdict** (`newOldPresence` in
+    engine.gs): who was present that ISO week / that day, counted Old/New by
+    their month's verdict — rotated workers stay excluded, so Old + New per day ≤
+    that day's head count. A week can straddle two months (the only cross-month
+    grain); the verdict of the month of the worker's EARLIEST show-up in that
+    week decides. Weekly reuses `renderNewOld_` verbatim (mem keyed by `W<n>`),
+    clickable; daily is two plain tables (`renderFaceDaily_`, scopes as rows,
+    days as columns). (NOT tenure/range — that was a mid-conversation detour
     the user corrected.)
   - **Show up** — day-count buckets 1-5/6-10/11-15/16-20/21-30, **monthly** (with
-    drill-down), PLUS a **daily head-count** block (`renderHeadcount_` — distinct
-    workers present per day, one row per nationality scope). The daily block is
-    **PLAIN NUMBERS, not clickable**: a per-person daily drill-down copies ~2× the
-    entire raw log and overflowed even a dedicated Names file; the daily roster is
-    already the `raw` tab filtered by date. `renderHeadcount_` now computes distinct
-    names/day straight from the slice (no `attendanceCrosstab`); the engine's
-    `attendanceCrosstab`/`attendanceMembers` remain, self-tested, but are unused by
-    `Code.gs`.
+    drill-down), PLUS a **weekly bucket table** and a **daily head-count** block.
+    Weekly (`renderShowupWeek_`/`showupWeekMembers`, user-confirmed buckets
+    `WEEK_BUCKETS` = **1-2 / 3-4 / 5-7** days — the monthly buckets can't apply
+    to a ≤7-day week): same per-scope blocks as monthly, ISO weeks as columns,
+    counts clickable, plain `Sum Week` row; every 1..7-day count lands in a
+    bucket, so a week's bucket sum == its distinct head count (self-tested).
+    Daily head count (`renderHeadcount_` — distinct workers present per day, one
+    row per nationality scope) is **PLAIN NUMBERS, not clickable**: a per-person
+    daily drill-down copies ~2× the entire raw log and overflowed even a
+    dedicated Names file; the daily roster is already the `raw` tab filtered by
+    date. `renderHeadcount_` computes distinct names/day straight from the slice
+    (no `attendanceCrosstab`); the engine's `attendanceCrosstab`/
+    `attendanceMembers` remain, self-tested, but are unused by `Code.gs`.
 
     **The combined row is `All <DEPT>`, department-dynamic** (`allLabel_(dept)` →
     `All SOCN`/`All SOCE`/`All SOCW`), NOT a hardcoded `"All SOCN"` — the same code
@@ -361,8 +391,19 @@ number, not stuck text):
     - **Weekly** gets the same two-part treatment (per-week detail blocks +
       trend summary) by extension/consistency with monthly — the reference
       screenshots only showed monthly, so this is inferred, not confirmed.
+    - **Daily** (`renderRotationDaily_`/`rotationPresenceDay`, plain numbers):
+      a worker has exactly ONE team per day (the dedup keeps the earliest
+      clock-in), so nothing can rotate WITHIN a day — the user confirmed the
+      daily block should count **workers present at team T that day by their
+      MONTH's Reading-B status at T** ("month rotators present that day",
+      chosen over week-status and over an "away from home team today" metric).
+      Two tables (DAILY ROTATION / DAILY NON ROTATION), (team × nationality) as
+      rows, days as columns; the two counts partition that day's head count at
+      the team (self-tested). Plain, not clickable — same 10M rationale as the
+      head count.
 
-**Drill-down (BUILT).** Every count in an aspect tab (except the daily head-count)
+**Drill-down (BUILT).** Every monthly/weekly count in an aspect tab (every DAILY
+block — head count, daily New/Old, daily Rotation — is plain, see above)
 is written as a **cross-file**
 `=HYPERLINK("https://docs.google.com/spreadsheets/d/<AspectNamesFileId>/edit#gid=<gid>&range=A<row>", count)`;
 clicking it opens **that aspect's** `<YEAR>_<DEPT>_<ASPECT>_Names` file at the
@@ -372,15 +413,18 @@ links target its own file. Each group is rendered as the **full 8 raw columns**
 `(date, clock-in)`, via `pickRep`), so the row count always equals the clicked
 number — a worker with 20 days is **one** row, not 20. Groups are separated by
 **two blank rows**. Rows come from the engine's **`*Members`** functions
-(`showupMembers`/`newOldMembers`/`streakMonthMembers`/`streakWeekMembers`/
-`rotationMembers`), which return **representative row objects** (not bare names)
+(`showupMembers`/`showupWeekMembers`/`newOldMembers`/`newOldPresence`/
+`streakMonthMembers`/`streakWeekMembers`/`rotationMembers`), which return
+**representative row objects** (not bare names)
 using the same grouping as the count functions and are **self-tested to satisfy
 `members.length === count`**. The `slim` slice carries the full raw-column set
 (`name/date/team/clockin/vendor/shift_name/shift_id/month`) so each member row can
 render every raw column. (Watch-item: if one aspect's detail ever exceeds its
-file's 10M — streak-weekly is the largest, workers × ISO weeks × All+team — the
-next fallback is to reduce that aspect's drill-down scope; the per-aspect split
-already removes the cross-aspect stacking that broke the single-file design.)
+file's 10M — the weekly grains are the largest: streak-weekly, and now showup-
+weekly + newold-weekly, each ≈ workers × ISO weeks × All+team in its own file —
+the next fallback is to reduce that aspect's drill-down scope; the per-aspect
+split already removes the cross-aspect stacking that broke the single-file
+design.)
 
 Teams are **data-driven per SOC** (`distinctTeams` — the distinct `team` values
 in that SOC's own slice), not a fixed station list; abbreviations differ across
@@ -420,16 +464,29 @@ service-account/n8n-OAuth ownership risks with a single one — see
 docs/RUNBOOK.md.
 
 Scaling ceiling is now **execution time** (the Apps Script per-run limit — 6 min
-consumer / 30 min Workspace), not memory. Writes are the heavy part: the per-aspect
-Names files reach hundreds of thousands of rows, so `writeSummaryTab_` writes in
-**20k-row chunks** (a single `values.update` of the whole grid 500s with "Internal
-error encountered" — request too big — hit live after a 12-min run) and every write
-goes through `retryWrite_` (idempotent fixed-range writes, backoff 2/4/8s) to ride
-out transient 500s. If a full `sync` ever exceeds the execution limit anyway, the
-next levers, in order: (1) make the highest-volume drill-downs plain numbers —
-weekly Consecutive/Rotation, then per-team scopes — keeping the monthly All+team
-drill-downs (the slide-deck numbers); (2) one-department-per-execution. Both
-deferred until a run actually times out (vs. errors), since chunking may be enough.
+consumer / 30 min Workspace), not memory. **One department per execution** is the
+current design: a full all-departments run on HALF a year's data measured 29.7 min
+live (2026-07-15, `[t]` timing logs) — **23 min (78%) of it in the read+raw-append
+phase** across the 28 vendor files, only ~7 min in all summaries+Names writes — so
+a full year would blow the ceiling. The three SOCs share nothing (separate vendor
+files in, separate central files out), so the daily schedule is three staggered
+triggers (`installTrigger`, 11:00/12:00/13:00) on thin wrappers `syncSOCN`/
+`syncSOCE`/`syncSOCW` → `runSync_(dept)` (triggers can't pass arguments; a dept in
+`RAW_DEPARTMENTS` without a wrapper is a hard error at install). Discovery stays
+global (cheap, keeps strict validation over every title); only processing is
+filtered. `sync()` remains the manual all-departments entry (smoke tests — exceeds
+the limit on full data). Per-run work is bounded: a year's file set caps at 12
+months, so ~20 min/dept at full year is the worst case. NOT pulled (measured to be
+minor levers): cutting drill-down links — the entire summaries+Names phase is only
+~7 min — and chunk-size tuning (`writeSummaryTab_` writes in **50k-row chunks**;
+the binding limit there is the ~10MB per-REQUEST payload cap — a single
+`values.update` of a whole Names grid 500s "Internal error encountered", hit live
+after a 12-min run — NOT the 10M-cell workbook cap, which is per-file total). Every
+write still goes through `retryWrite_` (idempotent fixed-range writes, backoff
+2/4/8s) to ride out transient 500s; `readMonthTabs_` failures name the file id +
+tabs (a persistent `batchGet` 404 with a healthy metadata `get` was seen live —
+under diagnosis). If a dept run ever exceeds the limit anyway, the remaining lever
+is UrlFetchApp.fetchAll-parallelized reads (the 23 min is per-file sequential I/O).
 
 ### Superseded: Render + n8n (kept for reference, retired)
 
