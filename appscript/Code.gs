@@ -680,9 +680,10 @@ function showUpTabGrid_(slim, nc, dept) {
 }
 
 // ---- New / Old face (monthly) -----------------------------------------------
-// Old (experienced) = fixed to ONE station AND >=10 days that month; New = rotated
-// (even if >10 days) or <10 days -- the rotation-aware rule from engine.gs
-// (newOldFace_). Same two-table + trend treatment as Show Up.
+// Old (experienced) = fixed to ONE station AND >=10 days that month; New = fixed to
+// ONE station AND <10 days. ROTATED workers (>1 station) are EXCLUDED from both --
+// they belong to the Rotation tab -- the rule from engine.gs (newOldFace_ returns
+// null for rotated). Same two-table + trend treatment as Show Up.
 const NEWOLD_FACES = ['Old', 'New'];
 
 // Table A: grouped BY TEAM -- one block per scope (All <DEPT>, then each team),
@@ -711,8 +712,8 @@ function renderNewOld_(grid, formats, nc, scope, mem, months) {
 // Table B: grouped BY FACE (Old block, then New block) -- rows = All <DEPT> + each
 // team, columns = months (% only), with the shared last-two-months trend flag.
 function renderNewOldByCategory_(grid, formats, scopes, months) {
-  const titles = { Old: 'Old face (experienced: fixed >=10 days at one station)',
-                   New: 'New face (inexperienced: rotated, or <10 days)' };
+  const titles = { Old: 'Old face (experienced: one station, >=10 days)',
+                   New: 'New face (inexperienced: one station, <10 days)' };
   const colors = { Old: FMT.increaseFg, New: FMT.oneDayFg };
   NEWOLD_FACES.forEach(function (face) {
     const rows = scopes.map(function (s) {
