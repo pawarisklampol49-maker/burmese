@@ -33,9 +33,19 @@ function initProperties() {
   PropertiesService.getScriptProperties().setProperties({
     CENTRAL_FOLDER_ID: '1oDCnJmwIjedcHNtSyd_Hr-B5HDhZIN4K',
     RAW_DEPARTMENTS: 'SOCN,SOCE,SOCW',
-    SKIP_VENDORS: 'PPO,WAS,RG,YSL,BigBoom',
+    // Vendors that supply THAI workers. Everything NOT in this list is treated as
+    // BURMESE (the user's chosen default -- no fail-fast). Summaries split each
+    // scope into "... Burmese" / "... Thai" rows. Add a new Thai vendor here (no
+    // code change); a new vendor left off the list simply counts as Burmese.
+    THAI_VENDORS: 'PPO,WAS,RG,YSL,BigBoom',
   });
   Logger.log('Script properties set.');
+}
+// deletes the retired SKIP_VENDORS property (those 5 are now Thai, not skipped).
+// One-time cleanup helper -- harmless to run more than once.
+function migrateSkipVendors() {
+  PropertiesService.getScriptProperties().deleteProperty('SKIP_VENDORS');
+  Logger.log('Removed retired SKIP_VENDORS property.');
 }
 
 function cfg_() {
@@ -45,15 +55,18 @@ function cfg_() {
   if (!folderId) throw new Error('Script Property CENTRAL_FOLDER_ID is not set -- run initProperties()');
   if (!deptsRaw) throw new Error('Script Property RAW_DEPARTMENTS is not set -- run initProperties()');
   const departments = deptsRaw.split(',').map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean);
-  // Vendors to skip entirely (an intentional, config-driven exclusion -- NOT the
-  // silent auto-skip that caused the 7.3x undercount; a matched-but-skipped file
-  // is logged, not dropped quietly). Compared case-insensitively on the vendor
-  // token parsed from the title. Empty/unset = skip nothing.
-  const skipRaw = props.getProperty('SKIP_VENDORS') || '';
-  const skipVendors = {};
-  skipRaw.split(',').map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean)
-    .forEach(function (v) { skipVendors[v] = true; });
-  return { folderId: folderId, departments: departments, skipVendors: skipVendors };
+  // Thai-vendor allowlist (case-insensitive on the vendor token parsed from the
+  // title). A vendor in this set -> its workers are Thai; anything else -> Burmese.
+  const thaiRaw = props.getProperty('THAI_VENDORS') || '';
+  const thaiVendors = {};
+  thaiRaw.split(',').map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean)
+    .forEach(function (v) { thaiVendors[v] = true; });
+  return { folderId: folderId, departments: departments, thaiVendors: thaiVendors };
+}
+
+// Burmese unless the vendor is in the Thai allowlist (user's chosen default).
+function nationalityOf_(vendor, thaiVendors) {
+  return thaiVendors[String(vendor).toUpperCase()] ? 'Thai' : 'Burmese';
 }
 
 // ------------------------------------------------------------------ discovery
@@ -62,10 +75,9 @@ const RAW_TITLE_RE = /^\[([A-Za-z]+)\s+(\d{4})\]_Daily name list_(.+)$/;
 // mirrors render/app.py _list_raw_candidates + _parse_raw_title / n8n Parse Titles:
 // a loose match that fails the strict pattern or has an unknown department is a
 // HARD ERROR (silent-skip is what caused the original 7.3x undercount).
-function discoverFiles_(knownDepts, skipVendors) {
+function discoverFiles_(knownDepts, thaiVendors) {
   const known = {};
   knownDepts.forEach(function (d) { known[d] = true; });
-  const skip = skipVendors || {};
   const q = 'title contains "_Daily name list_" and ' +
             'mimeType = "application/vnd.google-apps.spreadsheet" and trashed = false';
   const it = DriveApp.searchFiles(q);
@@ -80,17 +92,14 @@ function discoverFiles_(knownDepts, skipVendors) {
     }
     const dept = m[1].toUpperCase();
     const vendor = m[3].trim();
-    // config-driven skip (loud): drop excluded vendors before the dept check, so
-    // a skipped vendor never has to have a recognized department. Logged, not silent.
-    if (skip[vendor.toUpperCase()]) {
-      Logger.log("SKIP vendor '" + vendor + "' -- '" + name + "' (in SKIP_VENDORS)");
-      continue;
-    }
     if (!known[dept]) {
       throw new Error("unrecognized department '" + dept + "' parsed from '" + name +
         "' -- expected one of " + JSON.stringify(Object.keys(known).sort()));
     }
-    out.push({ id: f.getId(), name: name, dept: dept, year: m[2], vendor: vendor });
+    // every discovered vendor is INCLUDED now (no skip). Tag its nationality:
+    // Thai if listed in THAI_VENDORS, else Burmese.
+    out.push({ id: f.getId(), name: name, dept: dept, year: m[2], vendor: vendor,
+      nationality: nationalityOf_(vendor, thaiVendors || {}) });
   }
   if (!out.length) {
     throw new Error('no raw vendor spreadsheets found -- check they are shared with ' +
@@ -358,6 +367,112 @@ function monthOrder_(slim) {
   return Object.keys(seen).sort().map(monthLabel);
 }
 
+// ---- visualization: fixed team scope + cell formatting -----------------------
+// The 8 operational teams the user wants summaries scoped to (per-request, Show Up
+// only for now -- see CLAUDE.md). This is DIFFERENT from distinctTeams(slim): that
+// stays data-driven (used for the "raw"/drill-down side); VIS_TEAMS is a fixed
+// allowlist that filters OUT noise teams (a stray "Helper", or a shift-name-as-team
+// fallback) from the visualized summary. Order here is the display order.
+const VIS_TEAMS = ['IB', 'CBS', 'mCBS', 'MS', 'OBI', 'OBC', 'OBS', 'OBD'];
+
+// the VIS_TEAMS that actually appear in this SOC's data, in VIS_TEAMS order.
+function visibleTeams_(slim) {
+  const present = {};
+  distinctTeams(slim).forEach(function (t) { present[t] = true; });
+  return VIS_TEAMS.filter(function (t) { return present[t]; });
+}
+
+// the "All <DEPT>" scope label -- the combined (not-grouped-by-team) row. Dept is
+// SOCN/SOCE/SOCW, so this is "All SOCN"/"All SOCE"/"All SOCW", NOT a hardcoded
+// "All SOCN" (that was a bug -- the same code runs for all three SOCs).
+function allLabel_(dept) { return 'All ' + dept; }
+// is this scope the combined "All <DEPT>" row (vs a single team)? Team names are
+// the fixed VIS_TEAMS list, none of which start with "All ", so the prefix test
+// reliably distinguishes the two without threading the exact label everywhere.
+// (Works with the nationality suffix too: "All SOCN Burmese" still starts "All ".)
+function isAllScope_(scope) { return /^All /.test(scope); }
+
+// ---- nationality (Thai / Burmese) --------------------------------------------
+// Each summary scope is split by worker nationality (from the vendor, see
+// nationalityOf_), interleaved per base scope: "All <DEPT> Burmese",
+// "All <DEPT> Thai", "IB Burmese", "IB Thai", ... A base/nationality pair with no
+// rows is skipped, so a Burmese-only SOC shows no empty Thai blocks.
+const NATIONALITIES = ['Burmese', 'Thai'];   // display order, Burmese first
+
+function presentNationalities_(slim) {
+  const seen = {};
+  slim.forEach(function (r) { seen[r.nationality] = true; });
+  return NATIONALITIES.filter(function (n) { return seen[n]; });
+}
+function filterNat_(slim, nat) {
+  return slim.filter(function (r) { return r.nationality === nat; });
+}
+
+// base scopes (All <DEPT> + each visible team) x present nationalities ->
+// [{ label, natSlim, team }], team null for the All scope.
+function natScopes_(slim, teams, allLabel) {
+  const nats = presentNationalities_(slim);
+  const byNat = {};
+  nats.forEach(function (n) { byNat[n] = filterNat_(slim, n); });
+  const bases = [{ name: allLabel, team: null }]
+    .concat(teams.map(function (t) { return { name: t, team: t }; }));
+  const out = [];
+  bases.forEach(function (base) {
+    nats.forEach(function (n) {
+      const ns = byNat[n];
+      const hasRows = base.team == null ? ns.length > 0 : ns.some(function (r) { return r.team === base.team; });
+      if (hasRows) out.push({ label: base.name + ' ' + n, natSlim: ns, team: base.team });
+    });
+  });
+  return out;
+}
+
+// team x nationality rows for the Rotation tab (which has no All scope), interleaved
+// per team: "IB Burmese", "IB Thai", "CBS Burmese", ...
+function natTeams_(teams, nats) {
+  const out = [];
+  teams.forEach(function (t) { nats.forEach(function (n) { out.push({ team: t, nat: n, label: t + ' ' + n }); }); });
+  return out;
+}
+
+// sort period keys: ISO months ("2026-03") sort lexically = chronologically;
+// week keys ("W7") need numeric sort on the number after "W".
+function sortPeriodKeys_(keys) {
+  if (keys.length && /^W/.test(keys[0])) {
+    return keys.slice().sort(function (a, b) { return parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10); });
+  }
+  return keys.slice().sort();
+}
+function unionPeriodKeys_(memByNat) {
+  const s = {};
+  Object.keys(memByNat).forEach(function (n) { Object.keys(memByNat[n]).forEach(function (k) { s[k] = true; }); });
+  return sortPeriodKeys_(Object.keys(s));
+}
+
+// cell background/font colors, matching the reference layout the user shared.
+const FMT = {
+  headerAllBg: '#c9daf8',       // light blue -- the "All SOCN" scope header
+  headerTeamBg: '#fce5cd',      // light orange -- a per-team scope header
+  headerBucketBg: '#f3f3f3',    // light gray -- a bucket-group header (table B)
+  increaseBg: '#d9ead3', increaseFg: '#38761d',   // light green bg / dark green text
+  decreaseBg: '#f4cccc', decreaseFg: '#cc0000',   // light red bg / dark red text
+  oneDayFg: '#b45f06',          // dark orange -- the "1 day in month" block title
+};
+// a month-over-month move of at least this many percentage points is "notable"
+// enough to flag with color + border in the by-bucket trend table.
+const TREND_THRESHOLD_PTS = 5;
+
+// format instructions are collected as plain objects with grid-relative (0-based)
+// row/col -- the actual sheetId isn't known until write time, so building real
+// Sheets API requests happens in writeSummaryTab_, not here.
+function fmtCell_(formats, row, col, opts) {
+  formats.push(Object.assign({ row: row, col: col }, opts));
+}
+function fmtRange_(formats, row, colStart, colEnd, opts) {
+  // colStart/colEnd inclusive, 0-based -- used for the trend box border.
+  formats.push(Object.assign({ row: row, col: colStart, colEnd: colEnd }, opts));
+}
+
 // The Names tab collector, shared across all 4 aspect tabs of one SOC. Each count
 // registers its group ONCE (header + names, single column) and every summary cell
 // that references it links to the same block. link() returns the HYPERLINK string
@@ -400,19 +515,43 @@ function namesCollector_(namesFileId, namesGid) {
   };
 }
 
+// numeric percentage (or null when den == 0) -- shared by pctCell_ (display, with
+// a "%" sign) and the trend-detection logic in renderShowupByBucket_, which needs
+// the raw number to compute a month-over-month delta.
+function pctNum_(num, den) { return den ? round2(num / den * 100) : null; }
 // percent cell WITH a "%" sign. Written USER_ENTERED, so "45.11%" lands as a real
 // percentage number (Sheets stores 0.4511, displays 45.11%). Blank when den == 0.
-function pctCell_(num, den) { return den ? round2(num / den * 100) + '%' : ''; }
+function pctCell_(num, den) { const n = pctNum_(num, den); return n == null ? '' : n + '%'; }
 
 // ---- Show up (monthly day-count buckets) ------------------------------------
-function renderShowup_(grid, nc, slim, scope, mem, months) {
-  const buckets = BUCKETS.map(function (b) { return b[0] + '-' + b[1]; });
-  grid.push([scope]);
-  grid.push(['bucket'].concat(months, months.map(function (m) { return m + ' %'; })));
+// a FUNCTION, not a top-level const: BUCKETS comes from engine.gs, and Apps
+// Script loads .gs files in filename order ("Code.gs" before "engine.gs"), so a
+// top-level `const X = BUCKETS.map(...)` here throws "BUCKETS is not defined" --
+// hit live. Same reason every other engine global is read inside functions, never
+// at Code.gs's top level (see the summaries-section comment above).
+function showupBucketLabels_() { return BUCKETS.map(function (b) { return b[0] + '-' + b[1]; }); }
+
+// per-scope, per-month denominator: total across all buckets for that month
+// (excludes days outside 1-30). Shared by both the by-team and by-bucket tables
+// so their percentages are computed identically.
+function showupSums_(mem, months) {
+  const buckets = showupBucketLabels_();
   const sums = {};
   months.forEach(function (m) {
     var s = 0; buckets.forEach(function (bk) { s += ((mem[m] && mem[m][bk]) || []).length; }); sums[m] = s;
   });
+  return sums;
+}
+
+// Table A: grouped BY TEAM -- one block per scope (All, then each visible team),
+// buckets as rows, months as columns (counts, then %).
+function renderShowup_(grid, formats, nc, scope, mem, months) {
+  const buckets = showupBucketLabels_();
+  const headerRow = grid.length;
+  grid.push([scope]);
+  fmtCell_(formats, headerRow, 0, { bg: isAllScope_(scope) ? FMT.headerAllBg : FMT.headerTeamBg, bold: true });
+  grid.push(['bucket'].concat(months, months.map(function (m) { return m + ' %'; })));
+  const sums = showupSums_(mem, months);
   buckets.forEach(function (bk) {
     const row = [bk];
     months.forEach(function (m) {
@@ -423,56 +562,137 @@ function renderShowup_(grid, nc, slim, scope, mem, months) {
     months.forEach(function (m) { row.push(pctCell_(((mem[m] && mem[m][bk]) || []).length, sums[m])); });
     grid.push(row);
   });
+  // plain number, not a link: this is just the buckets above added together --
+  // linking it would duplicate every one of those already-linked names a second
+  // time in the Names file for no reason ("same data, waste of memory").
   const sumRow = ['Sum Month'];
-  months.forEach(function (m) {
-    var names = []; buckets.forEach(function (bk) { names = names.concat((mem[m] && mem[m][bk]) || []); });
-    sumRow.push(nc.link(names.length, scope + '|showup|' + m + '|sum',
-      'Show up | ' + m + ' | all buckets | ' + scope, names));
-  });
+  months.forEach(function (m) { sumRow.push(sums[m]); });
   months.forEach(function () { sumRow.push('100%'); });
   grid.push(sumRow);
   grid.push([]);
 }
 
-// Daily head count: distinct workers present each day, per team + an All row.
-// The one metric that's meaningful at the daily grain (buckets/rotation/streaks
-// can't run on a single day). PLAIN COUNTS, not clickable: a per-person daily
-// drill-down copies ~2x the entire raw log (one block per day x team, plus per
-// day x All) and overflows even a dedicated Names file's 10M-cell cap (hit live).
-// The daily roster is already the raw tab, filtered by date -- no drill-down needed.
-function renderHeadcount_(grid, slim) {
-  const ct = attendanceCrosstab(slim, 'day');           // {teams, periodLabels, counts, allRow}
-  const days = ct.periodLabels;                          // sorted YYYY-MM-DD
-  grid.push(['DAILY HEAD COUNT  (distinct workers present each day -- plain counts; the daily roster is the raw tab, filtered by date)'], []);
-  grid.push(['team'].concat(days));
-  ct.teams.forEach(function (t) {
-    const row = ['team ' + t];
-    days.forEach(function (d) { row.push((ct.counts[t] && ct.counts[t][d]) || 0); });
-    grid.push(row);
+// Generic "label x month" percentage block with a last-two-months trend flag
+// (color + box + increases/decreases label past TREND_THRESHOLD_PTS). Shared by
+// Show Up's by-bucket table, New/Old's by-category table, and Rotation's trend
+// summary so the trend RULE lives in exactly one place. `rows`: [{label, pct:
+// {monthLabel: numberOrNull}}]. `title`/`titleColor` (optional) push one colored
+// title row first. Any row whose label is an "All <DEPT> ..." scope gets its label
+// cell highlighted (both nationality All-rows, via isAllScope_).
+function renderTrendPctBlock_(grid, formats, title, titleColor, colHeaderLabel, rows, months) {
+  const firstMonthCol = 1, lastMonthCol = firstMonthCol + months.length - 1;
+  const trendCol = firstMonthCol + months.length;   // one column past the % values
+  if (title) {
+    const r = grid.length;
+    grid.push([title]);
+    fmtCell_(formats, r, 0, { fg: titleColor, bold: true });
+  }
+  grid.push([colHeaderLabel || ''].concat(months));
+
+  rows.forEach(function (row) {
+    const gridRow = [row.label];
+    months.forEach(function (m) { const n = row.pct[m]; gridRow.push(n == null ? '' : n + '%'); });
+    const rowIdx = grid.length;
+    grid.push(gridRow);
+    if (isAllScope_(row.label)) fmtCell_(formats, rowIdx, 0, { bg: FMT.headerAllBg, bold: true });
+
+    // trend flag: last two months only, both present, delta past threshold.
+    if (months.length >= 2) {
+      const prevM = months[months.length - 2], lastM = months[months.length - 1];
+      const prevN = row.pct[prevM], lastN = row.pct[lastM];
+      if (prevN != null && lastN != null && Math.abs(lastN - prevN) >= TREND_THRESHOLD_PTS) {
+        const up = lastN > prevN;
+        const bg = up ? FMT.increaseBg : FMT.decreaseBg, fg = up ? FMT.increaseFg : FMT.decreaseFg;
+        fmtCell_(formats, rowIdx, lastMonthCol - 1, { bg: bg, fg: fg });   // prev-month cell
+        fmtCell_(formats, rowIdx, lastMonthCol, { bg: bg, fg: fg });      // last-month cell
+        fmtRange_(formats, rowIdx, lastMonthCol - 1, lastMonthCol, { border: true });
+        gridRow[trendCol] = up ? 'increases' : 'decreases';
+        fmtCell_(formats, rowIdx, trendCol, { fg: fg, bold: true });
+      }
+    }
   });
-  const allRow = ['All'];
-  days.forEach(function (d) { allRow.push(ct.allRow[d] || 0); });
-  grid.push(allRow);
   grid.push([]);
 }
 
-function showUpTabGrid_(slim, nc) {
-  if (!slim.length) return [['(no rows for this SOC)']];
-  const grid = [['SHOW UP  (monthly day-count buckets; click a number to see those people)'], []];
-  const months = monthOrder_(slim);
-  renderShowup_(grid, nc, slim, 'All', showupMembers(slim), months);
-  distinctTeams(slim).forEach(function (t) {
-    renderShowup_(grid, nc, slim, 'team ' + t, showupMembers(slim, t), months);
+// Table B: grouped BY BUCKET (the "date range" view) -- one block per bucket,
+// rows = All + each visible team, columns = months (% only, matches the
+// reference layout), via the shared trend block above.
+function renderShowupByBucket_(grid, formats, scopes, months) {
+  // scopes: [{label, mem}, ...] -- the "All <DEPT>" scope first, then each visible team.
+  showupBucketLabels_().forEach(function (bk, bi) {
+    const titleRow = grid.length;
+    grid.push(['Show up >=' + BUCKETS[bi][0] + ' and <=' + BUCKETS[bi][1] + ' days']);
+    fmtCell_(formats, titleRow, 0, { bg: FMT.headerBucketBg, bold: true });
+    const rows = scopes.map(function (s) {
+      const sums = showupSums_(s.mem, months);
+      const pct = {};
+      months.forEach(function (m) { pct[m] = pctNum_(((s.mem[m] && s.mem[m][bk]) || []).length, sums[m]); });
+      return { label: s.label, pct: pct };
+    });
+    renderTrendPctBlock_(grid, formats, null, null, 'team', rows, months);
   });
-  renderHeadcount_(grid, slim);
-  return grid;
+}
+
+// Daily head count: distinct workers present each day, per nationality scope (All
+// <DEPT> + each team, split Burmese/Thai). PLAIN COUNTS, not clickable: a
+// per-person daily drill-down copies ~2x the entire raw log and overflows even a
+// dedicated Names file's 10M cap (hit live) -- the daily roster is already the raw
+// tab, filtered by date. Computed directly from the slice (distinct names per day)
+// so it needs no engine helper.
+function renderHeadcount_(grid, natScopes, days) {
+  grid.push(['DAILY HEAD COUNT  (distinct workers present each day -- plain counts; the daily roster is the raw tab, filtered by date)'], []);
+  grid.push(['team'].concat(days));
+  natScopes.forEach(function (sc) {
+    const rows = sc.team == null ? sc.natSlim : sc.natSlim.filter(function (r) { return r.team === sc.team; });
+    const perDay = {};   // day -> { name: true }
+    rows.forEach(function (r) { (perDay[r.date.key] = perDay[r.date.key] || {})[r.name] = true; });
+    const row = [sc.label];
+    days.forEach(function (d) { row.push(perDay[d] ? Object.keys(perDay[d]).length : 0); });
+    grid.push(row);
+  });
+  grid.push([]);
+}
+
+function showUpTabGrid_(slim, nc, dept) {
+  if (!slim.length) return { grid: [['(no rows for this SOC)']], formats: [] };
+  const grid = [['SHOW UP  (monthly day-count buckets; click a number to see those people)'], []];
+  const formats = [];
+  const months = monthOrder_(slim);
+  const teams = visibleTeams_(slim);   // fixed 8-team scope (see VIS_TEAMS)
+  const scopes = natScopes_(slim, teams, allLabel_(dept));   // All <DEPT> + teams, split Burmese/Thai
+
+  scopes.forEach(function (sc) {
+    renderShowup_(grid, formats, nc, sc.label, showupMembers(sc.natSlim, sc.team), months);
+  });
+
+  grid.push(['SHOW UP BY DATE RANGE  (same data, grouped by bucket -- teams as rows; colored cells flag a >=' +
+    TREND_THRESHOLD_PTS + '-point move from the prior month)'], []);
+  const bucketScopes = scopes.map(function (sc) {
+    return { label: sc.label, mem: showupMembers(sc.natSlim, sc.team) };
+  });
+  renderShowupByBucket_(grid, formats, bucketScopes, months);
+
+  // daily head count -- all days present across the SOC, sorted
+  const daySet = {};
+  slim.forEach(function (r) { daySet[r.date.key] = true; });
+  renderHeadcount_(grid, scopes, Object.keys(daySet).sort());
+  return { grid: grid, formats: formats };
 }
 
 // ---- New / Old face (monthly) -----------------------------------------------
-function renderNewOld_(grid, nc, scope, mem, months) {
+// Old (experienced) = fixed to ONE station AND >=10 days that month; New = rotated
+// (even if >10 days) or <10 days -- the rotation-aware rule from engine.gs
+// (newOldFace_). Same two-table + trend treatment as Show Up.
+const NEWOLD_FACES = ['Old', 'New'];
+
+// Table A: grouped BY TEAM -- one block per scope (All <DEPT>, then each team),
+// Old/New as rows, months as columns (counts, then %).
+function renderNewOld_(grid, formats, nc, scope, mem, months) {
+  const headerRow = grid.length;
   grid.push([scope]);
+  fmtCell_(formats, headerRow, 0, { bg: isAllScope_(scope) ? FMT.headerAllBg : FMT.headerTeamBg, bold: true });
   grid.push(['face'].concat(months, months.map(function (m) { return m + ' %'; })));
-  ['Old', 'New'].forEach(function (face) {
+  NEWOLD_FACES.forEach(function (face) {
     const row = [face];
     months.forEach(function (m) {
       const names = (mem[m] && mem[m][face]) || [];
@@ -480,7 +700,7 @@ function renderNewOld_(grid, nc, scope, mem, months) {
         'New/Old | ' + m + ' | ' + face + ' | ' + scope, names));
     });
     months.forEach(function (m) {
-      const o = (mem[m] && mem[m].Old || []).length, n = (mem[m] && mem[m].New || []).length;
+      const o = ((mem[m] && mem[m].Old) || []).length, n = ((mem[m] && mem[m].New) || []).length;
       row.push(pctCell_(face === 'Old' ? o : n, o + n));
     });
     grid.push(row);
@@ -488,100 +708,295 @@ function renderNewOld_(grid, nc, scope, mem, months) {
   grid.push([]);
 }
 
-function newOldTabGrid_(slim, nc) {
-  if (!slim.length) return [['(no rows for this SOC)']];
-  const grid = [['NEW / OLD FACE  (monthly; Old = >=10 days at one station; click a number to see those people)'], []];
-  const months = monthOrder_(slim);
-  renderNewOld_(grid, nc, 'All', newOldMembers(slim), months);
-  distinctTeams(slim).forEach(function (t) {
-    renderNewOld_(grid, nc, 'team ' + t, newOldMembers(slim, t), months);
+// Table B: grouped BY FACE (Old block, then New block) -- rows = All <DEPT> + each
+// team, columns = months (% only), with the shared last-two-months trend flag.
+function renderNewOldByCategory_(grid, formats, scopes, months) {
+  const titles = { Old: 'Old face (experienced: fixed >=10 days at one station)',
+                   New: 'New face (inexperienced: rotated, or <10 days)' };
+  const colors = { Old: FMT.increaseFg, New: FMT.oneDayFg };
+  NEWOLD_FACES.forEach(function (face) {
+    const rows = scopes.map(function (s) {
+      const pct = {};
+      months.forEach(function (m) {
+        const o = ((s.mem[m] && s.mem[m].Old) || []).length, n = ((s.mem[m] && s.mem[m].New) || []).length;
+        pct[m] = pctNum_(face === 'Old' ? o : n, o + n);
+      });
+      return { label: s.label, pct: pct };
+    });
+    renderTrendPctBlock_(grid, formats, titles[face], colors[face], 'team', rows, months);
   });
-  return grid;
+}
+
+function newOldTabGrid_(slim, nc, dept) {
+  if (!slim.length) return { grid: [['(no rows for this SOC)']], formats: [] };
+  const grid = [['NEW / OLD FACE  (monthly; Old = fixed to one station AND >=10 days; <10 days = New; rotated workers excluded -- see Rotation tab; click a number to see those people)'], []];
+  const formats = [];
+  const months = monthOrder_(slim);
+  const teams = visibleTeams_(slim);   // fixed 8-team scope, same as Show Up/Consecutive
+  const scopes = natScopes_(slim, teams, allLabel_(dept));   // All <DEPT> + teams, split Burmese/Thai
+
+  scopes.forEach(function (sc) {
+    renderNewOld_(grid, formats, nc, sc.label, newOldMembers(sc.natSlim, sc.team), months);
+  });
+
+  grid.push(['NEW / OLD FACE BY CATEGORY  (teams as rows; colored cells flag a >=' +
+    TREND_THRESHOLD_PTS + '-point move from the prior month)'], []);
+  const catScopes = scopes.map(function (sc) {
+    return { label: sc.label, mem: newOldMembers(sc.natSlim, sc.team) };
+  });
+  renderNewOldByCategory_(grid, formats, catScopes, months);
+
+  return { grid: grid, formats: formats };
 }
 
 // ---- 3-day consecutive (monthly + weekly) -----------------------------------
-const STREAK_CATS = ['active', '<10', '>10', 'usedto_<10', 'usedto_>10', 'never_<10', 'never_>10'];
-const STREAKW_CATS = ['active', '>=3', '<3'];
+// Layout matches the user's reference sheet: per scope, a COUNTS section (3
+// blocks -- the plain <10/>10 split, then that same split conditioned on "ever
+// had a >=3-day run" vs "never did"), then a PERCENTAGES section mirroring it.
+// Block 2 and block 3 percentages share block 1's denominator (that month's
+// total active headcount) -- confirmed against the reference numbers -- since
+// all three blocks partition the SAME population, just by a different question.
+// Each block's Total/sum row is a PLAIN NUMBER, never a link: it's a
+// recombination of the two cells already linked right above it, so linking it
+// again would duplicate that same member list into the Names file a second
+// time for nothing -- exactly the "same data, waste of memory" the user flagged.
+// Only the six core category cells (the real distinct groups) are drillable.
 
-function renderStreakMonth_(grid, nc, scope, mem, months) {
-  grid.push([scope]);
-  grid.push(['month'].concat(STREAK_CATS));
+// total active workers that month/week = low + high (== the 'active' category).
+function streakActive_(mem, key) { return ((mem[key] && mem[key]['<10']) || []).length + ((mem[key] && mem[key]['>10']) || []).length; }
+
+function renderStreakCountBlock_(grid, formats, nc, scope, mem, months, title, titleColor, lowKey, highKey, keyPrefix) {
+  if (title) {
+    const r = grid.length;
+    grid.push([title]);
+    fmtCell_(formats, r, 0, { fg: titleColor, bold: true });
+  }
+  grid.push([''].concat(months));
+  const lowRow = ['Show up < 10 days'], highRow = ['Show up > 10 days'];
   months.forEach(function (m) {
-    const row = [m];
-    STREAK_CATS.forEach(function (cat) {
-      const names = (mem[m] && mem[m][cat]) || [];
-      row.push(nc.link(names.length, scope + '|streakM|' + m + '|' + cat,
-        'Consecutive (monthly) | ' + m + ' | ' + cat + ' | ' + scope, names));
-    });
-    grid.push(row);
+    const lowNames = (mem[m] && mem[m][lowKey]) || [];
+    const highNames = (mem[m] && mem[m][highKey]) || [];
+    lowRow.push(nc.link(lowNames.length, scope + '|streakM|' + m + '|' + lowKey,
+      'Consecutive (monthly) | ' + m + ' | ' + lowKey + ' | ' + scope, lowNames));
+    highRow.push(nc.link(highNames.length, scope + '|streakM|' + m + '|' + highKey,
+      'Consecutive (monthly) | ' + m + ' | ' + highKey + ' | ' + scope, highNames));
   });
+  grid.push(lowRow, highRow);
+  const totalRow = ['Total'];
+  months.forEach(function (m) {
+    totalRow.push(((mem[m] && mem[m][lowKey]) || []).length + ((mem[m] && mem[m][highKey]) || []).length);
+  });
+  grid.push(totalRow);
   grid.push([]);
 }
 
-function renderStreakWeek_(grid, nc, scope, mem) {
-  const weeks = Object.keys(mem).sort(function (a, b) { return parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10); });
+function renderStreakPctBlock_(grid, formats, mem, months, title, titleColor, lowKey, highKey) {
+  if (title) {
+    const r = grid.length;
+    grid.push([title]);
+    fmtCell_(formats, r, 0, { fg: titleColor, bold: true });
+  }
+  grid.push([''].concat(months));
+  const lowRow = ['Show up < 10 days'], highRow = ['Show up > 10 days'];
+  months.forEach(function (m) {
+    const denom = streakActive_(mem, m);
+    lowRow.push(pctCell_(((mem[m] && mem[m][lowKey]) || []).length, denom));
+    highRow.push(pctCell_(((mem[m] && mem[m][highKey]) || []).length, denom));
+  });
+  grid.push(lowRow, highRow);
+  grid.push([]);
+}
+
+function renderStreakMonth_(grid, formats, nc, scope, mem, months) {
+  const headerRow = grid.length;
   grid.push([scope]);
-  grid.push(['week'].concat(STREAKW_CATS));
-  weeks.forEach(function (w) {
-    const row = [w];
-    STREAKW_CATS.forEach(function (cat) {
-      const names = (mem[w] && mem[w][cat]) || [];
-      row.push(nc.link(names.length, scope + '|streakW|' + w + '|' + cat,
-        'Consecutive (weekly) | ' + w + ' | ' + cat + ' | ' + scope, names));
-    });
-    grid.push(row);
+  fmtCell_(formats, headerRow, 0, { bg: isAllScope_(scope) ? FMT.headerAllBg : FMT.headerTeamBg, bold: true });
+
+  renderStreakCountBlock_(grid, formats, nc, scope, mem, months, null, null, '<10', '>10', 'streakM');
+  renderStreakCountBlock_(grid, formats, nc, scope, mem, months,
+    'Used to work for at least 3 consecutive days (at least one period)', FMT.increaseFg, 'usedto_<10', 'usedto_>10', 'streakM');
+  renderStreakCountBlock_(grid, formats, nc, scope, mem, months,
+    'Never work for at least 3 consecutive days (at least one period)', FMT.decreaseFg, 'never_<10', 'never_>10', 'streakM');
+
+  renderStreakPctBlock_(grid, formats, mem, months, null, null, '<10', '>10');
+  renderStreakPctBlock_(grid, formats, mem, months,
+    'Used to work for at least 3 consecutive days (at least one period)', FMT.increaseFg, 'usedto_<10', 'usedto_>10');
+  renderStreakPctBlock_(grid, formats, mem, months,
+    'Never work for at least 3 consecutive days (at least one period)', FMT.decreaseFg, 'never_<10', 'never_>10');
+
+  // validation row: block2 + block3 should sum to 100% -- they partition the same
+  // population as block1, just split by a different question (streak history).
+  const totalPctRow = [''];
+  months.forEach(function (m) {
+    const denom = streakActive_(mem, m);
+    const n = ((mem[m] && mem[m]['usedto_<10']) || []).length + ((mem[m] && mem[m]['usedto_>10']) || []).length +
+              ((mem[m] && mem[m]['never_<10']) || []).length + ((mem[m] && mem[m]['never_>10']) || []).length;
+    totalPctRow.push(pctCell_(n, denom));
   });
+  grid.push(totalPctRow);
   grid.push([]);
 }
 
-function consecutiveTabGrid_(slim, nc) {
-  if (!slim.length) return [['(no rows for this SOC)']];
+function weekOrder_(mem) {
+  return Object.keys(mem).sort(function (a, b) { return parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10); });
+}
+
+// weekly: transposed vs the old layout -- categories as ROWS (">=3 days
+// consecutive" / "< 3 days and non-consecutive"), weeks as COLUMNS, counts then
+// percentages. Same "no link on the derived total" rule as the monthly blocks.
+function renderStreakWeek_(grid, formats, nc, scope, mem) {
+  const weeks = weekOrder_(mem);
+  const headerRow = grid.length;
+  grid.push([scope]);
+  fmtCell_(formats, headerRow, 0, { bg: isAllScope_(scope) ? FMT.headerAllBg : FMT.headerTeamBg, bold: true });
+
+  grid.push([''].concat(weeks));
+  const hiRow = ['>=3 days consecutive'], loRow = ['< 3 days and non-consecutive'];
+  weeks.forEach(function (w) {
+    const hiNames = (mem[w] && mem[w]['>=3']) || [];
+    const loNames = (mem[w] && mem[w]['<3']) || [];
+    hiRow.push(nc.link(hiNames.length, scope + '|streakW|' + w + '|>=3',
+      'Consecutive (weekly) | ' + w + ' | >=3 | ' + scope, hiNames));
+    loRow.push(nc.link(loNames.length, scope + '|streakW|' + w + '|<3',
+      'Consecutive (weekly) | ' + w + ' | <3 | ' + scope, loNames));
+  });
+  grid.push(hiRow, loRow);
+  const totalRow = ['Total'];
+  weeks.forEach(function (w) {
+    totalRow.push(((mem[w] && mem[w]['>=3']) || []).length + ((mem[w] && mem[w]['<3']) || []).length);
+  });
+  grid.push(totalRow);
+  grid.push([]);
+
+  grid.push([''].concat(weeks));
+  const hiPctRow = ['>=3 days consecutive'], loPctRow = ['< 3 days and non-consecutive'];
+  weeks.forEach(function (w) {
+    const denom = ((mem[w] && mem[w]['>=3']) || []).length + ((mem[w] && mem[w]['<3']) || []).length;
+    hiPctRow.push(pctCell_(((mem[w] && mem[w]['>=3']) || []).length, denom));
+    loPctRow.push(pctCell_(((mem[w] && mem[w]['<3']) || []).length, denom));
+  });
+  grid.push(hiPctRow, loPctRow);
+  grid.push([]);
+}
+
+function consecutiveTabGrid_(slim, nc, dept) {
+  if (!slim.length) return { grid: [['(no rows for this SOC)']], formats: [] };
   const grid = [['3-DAY CONSECUTIVE  (monthly; click a number to see those people)'], []];
+  const formats = [];
   const months = monthOrder_(slim);
-  renderStreakMonth_(grid, nc, 'All', streakMonthMembers(slim), months);
-  distinctTeams(slim).forEach(function (t) {
-    renderStreakMonth_(grid, nc, 'team ' + t, streakMonthMembers(slim, t), months);
+  const teams = visibleTeams_(slim);   // fixed 8-team scope, same as Show Up
+  const scopes = natScopes_(slim, teams, allLabel_(dept));   // All <DEPT> + teams, split Burmese/Thai
+
+  scopes.forEach(function (sc) {
+    renderStreakMonth_(grid, formats, nc, sc.label, streakMonthMembers(sc.natSlim, sc.team), months);
   });
-  grid.push(['3-DAY CONSECUTIVE  (weekly; >=3 consecutive)'], []);
-  renderStreakWeek_(grid, nc, 'All', streakWeekMembers(slim));
-  distinctTeams(slim).forEach(function (t) {
-    renderStreakWeek_(grid, nc, 'team ' + t, streakWeekMembers(slim, t));
+
+  grid.push(['3-DAY CONSECUTIVE  (weekly)'], []);
+  scopes.forEach(function (sc) {
+    renderStreakWeek_(grid, formats, nc, sc.label, streakWeekMembers(sc.natSlim, sc.team));
   });
-  return grid;
+  return { grid: grid, formats: formats };
 }
 
 // ---- Rotation (monthly + weekly) --------------------------------------------
-const ROT_COUNT_COLS = ['population', 'rotation', 'non_rotation', 'oneday_nonrot'];
+// Redesigned to match the user's reference sheet: per-period DETAIL blocks (one
+// block per month/week, teams as rows, 7 columns in the reference's order), plus
+// a TREND-SUMMARY section (3 stacked blocks -- Rotation%, Non Rotation%, and the
+// "show up only 1 day" % -- teams as rows, periods as columns) via the SAME
+// last-two-months trend rule as Show Up's by-bucket table (renderTrendPctBlock_).
+// No "All SOCN" row: rotation is inherently about movement BETWEEN teams, so an
+// aggregate would double-count a worker who rotated across several -- the
+// reference sheet doesn't show one either.
+const ROT_DETAIL_COLS = ['Non Rotation', 'Rotation', 'Non Rotation and show up 1 day in month',
+                         'Non Rotation and show up 1 day in month', 'Total', 'Non Rotation', 'Rotation'];
 
-function rotationDisp_(label) { return /^\d{4}-\d{2}$/.test(label) ? monthLabel(label) : label; }
-
-function renderRotation_(grid, nc, mem, grain) {
-  grid.push(['period', 'team'].concat(ROT_COUNT_COLS, ['rotation%', 'non_rotation%', 'oneday%']));
-  Object.keys(mem).forEach(function (label) {
-    const disp = rotationDisp_(label), teamObj = mem[label];
-    Object.keys(teamObj).sort().forEach(function (t) {
-      const cell = teamObj[t];
-      const pop = cell.population.length, rot = cell.rotation.length,
-            non = cell.non_rotation.length, one = cell.oneday_nonrot.length;
-      const row = [disp, t];
-      ROT_COUNT_COLS.forEach(function (col) {
-        row.push(nc.link(cell[col].length, grain + '|' + label + '|' + t + '|' + col,
-          'Rotation (' + grain + ') | ' + disp + ' | ' + t + ' | ' + col, cell[col]));
-      });
-      row.push(pctCell_(rot, pop), pctCell_(non, pop), non ? round2(one / non * 100) + '%' : '');
-      grid.push(row);
-    });
-  });
-  grid.push([]);
+function rotationCell_(mem, periodLabel, team) {
+  return (mem[periodLabel] && mem[periodLabel][team]) ||
+    { population: [], rotation: [], non_rotation: [], oneday_nonrot: [] };
 }
 
-function rotationTabGrid_(slim, nc) {
-  if (!slim.length) return [['(no rows for this SOC)']];
+// one block per period: (team x nationality) as rows, the 7 reference columns.
+// Total (col 5) is PLAIN, not linked -- it's Non Rotation + Rotation recombined,
+// and linking a recombination duplicates those same names in the Names file for
+// nothing (the same "waste of memory" issue fixed elsewhere this session). memByNat
+// maps nationality -> its rotationMembers; each natTeam row reads its own nat's mem.
+function renderRotationDetail_(grid, formats, nc, natTeams, memByNat, periodKeys, dispFn, grainKey) {
+  periodKeys.forEach(function (pk) {
+    const disp = dispFn(pk);
+    grid.push([''].concat(ROT_DETAIL_COLS.map(function () { return disp; })));
+    grid.push([''].concat(ROT_DETAIL_COLS));
+    natTeams.forEach(function (nt) {
+      const cell = rotationCell_(memByNat[nt.nat], pk, nt.team);
+      const pop = cell.population.length, rot = cell.rotation.length,
+            non = cell.non_rotation.length, one = cell.oneday_nonrot.length;
+      const row = [nt.label];
+      row.push(nc.link(non, grainKey + '|' + pk + '|' + nt.label + '|non_rotation',
+        'Rotation (' + grainKey + ') | ' + disp + ' | ' + nt.label + ' | Non Rotation', cell.non_rotation));
+      row.push(nc.link(rot, grainKey + '|' + pk + '|' + nt.label + '|rotation',
+        'Rotation (' + grainKey + ') | ' + disp + ' | ' + nt.label + ' | Rotation', cell.rotation));
+      row.push(nc.link(one, grainKey + '|' + pk + '|' + nt.label + '|oneday',
+        'Rotation (' + grainKey + ') | ' + disp + ' | ' + nt.label + ' | Non Rotation and show up 1 day', cell.oneday_nonrot));
+      row.push(pctCell_(one, non));
+      row.push(pop);
+      row.push(pctCell_(non, pop));
+      row.push(pctCell_(rot, pop));
+      grid.push(row);
+    });
+    grid.push([]);
+  });
+}
+
+// trend-summary: 3 stacked blocks (Rotation%, Non Rotation%, 1-day-only%),
+// (team x nationality) as rows, periods as columns -- not linked (derived straight
+// from the detail blocks above; same anti-duplication reasoning).
+function renderRotationTrend_(grid, formats, natTeams, memByNat, periodKeys, dispFn) {
+  const periods = periodKeys.map(dispFn);
+  function rowsFor(metric) {
+    return natTeams.map(function (nt) {
+      const pct = {};
+      periodKeys.forEach(function (pk) {
+        const cell = rotationCell_(memByNat[nt.nat], pk, nt.team);
+        const pop = cell.population.length, rot = cell.rotation.length,
+              non = cell.non_rotation.length, one = cell.oneday_nonrot.length;
+        pct[dispFn(pk)] = metric === 'rotation' ? pctNum_(rot, pop)
+          : metric === 'non_rotation' ? pctNum_(non, pop) : pctNum_(one, non);
+      });
+      return { label: nt.label, pct: pct };
+    });
+  }
+  renderTrendPctBlock_(grid, formats, 'Rotation', null, '', rowsFor('rotation'), periods);
+  renderTrendPctBlock_(grid, formats, 'Non Rotation', FMT.increaseFg, '', rowsFor('non_rotation'), periods);
+  renderTrendPctBlock_(grid, formats, 'Non rotation worker who come to work only 1 day in a month', FMT.oneDayFg, '', rowsFor('oneday'), periods);
+}
+
+function rotationTabGrid_(slim, nc, dept) {   // no "All <dept>" row (would double-count rotators); split by nationality
+  if (!slim.length) return { grid: [['(no rows for this SOC)']], formats: [] };
   const grid = [['ROTATION  (monthly, per team; click a number to see those people)'], []];
-  renderRotation_(grid, nc, rotationMembers(slim), 'monthly');
+  const formats = [];
+  const teams = visibleTeams_(slim);
+  const nats = presentNationalities_(slim);
+  const natTeams = natTeams_(teams, nats);   // "IB Burmese", "IB Thai", "CBS Burmese", ...
+
+  // rotationMembers per nationality (keyed by period -> team -> members)
+  const monthByNat = {}, weekByNat = {};
+  nats.forEach(function (n) {
+    const ns = filterNat_(slim, n);
+    monthByNat[n] = rotationMembers(ns);
+    weekByNat[n] = rotationMembers(ns, 'week');
+  });
+
+  const monthKeys = unionPeriodKeys_(monthByNat);   // ISO "YYYY-MM", chronological
+  renderRotationDetail_(grid, formats, nc, natTeams, monthByNat, monthKeys, monthLabel, 'rotM');
+  grid.push(['ROTATION  (monthly trend summary)'], []);
+  renderRotationTrend_(grid, formats, natTeams, monthByNat, monthKeys, monthLabel);
+
   grid.push(['ROTATION  (weekly, per team)'], []);
-  renderRotation_(grid, nc, rotationMembers(slim, 'week'), 'weekly');
-  return grid;
+  const weekKeys = unionPeriodKeys_(weekByNat);     // "W7" ...
+  renderRotationDetail_(grid, formats, nc, natTeams, weekByNat, weekKeys, function (k) { return k; }, 'rotW');
+  grid.push(['ROTATION  (weekly trend summary)'], []);
+  renderRotationTrend_(grid, formats, natTeams, weekByNat, weekKeys, function (k) { return k; });
+
+  return { grid: grid, formats: formats };
 }
 
 // collapse to one row per (name, date), keeping the earliest clock-in (garbled/
@@ -609,13 +1024,48 @@ function dedupByNameDate_(rows) {
   return out;
 }
 
+// hex "#rrggbb" -> {red,green,blue} in 0..1, the shape the Sheets API wants.
+function hexColor_(hex) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return { red: ((n >> 16) & 255) / 255, green: ((n >> 8) & 255) / 255, blue: (n & 255) / 255 };
+}
+
+// turn one abstract format instruction (grid-relative row/col from fmtCell_ /
+// fmtRange_) into real Sheets API request(s) against this tab's sheetId.
+function formatRequests_(sheetId, f) {
+  const out = [];
+  const endCol = (f.colEnd == null ? f.col : f.colEnd) + 1;
+  if (f.bg != null || f.fg != null || f.bold != null) {
+    const cell = { userEnteredFormat: {} };
+    const fields = [];
+    if (f.bg != null) { cell.userEnteredFormat.backgroundColor = hexColor_(f.bg); fields.push('userEnteredFormat.backgroundColor'); }
+    if (f.fg != null || f.bold != null) {
+      cell.userEnteredFormat.textFormat = {};
+      if (f.fg != null) { cell.userEnteredFormat.textFormat.foregroundColor = hexColor_(f.fg); fields.push('userEnteredFormat.textFormat.foregroundColor'); }
+      if (f.bold != null) { cell.userEnteredFormat.textFormat.bold = f.bold; fields.push('userEnteredFormat.textFormat.bold'); }
+    }
+    out.push({ repeatCell: {
+      range: { sheetId: sheetId, startRowIndex: f.row, endRowIndex: f.row + 1, startColumnIndex: f.col, endColumnIndex: endCol },
+      cell: cell, fields: fields.join(','),
+    } });
+  }
+  if (f.border) {
+    const range = { sheetId: sheetId, startRowIndex: f.row, endRowIndex: f.row + 1, startColumnIndex: f.col, endColumnIndex: endCol };
+    const style = { style: 'SOLID_MEDIUM', color: { red: 0, green: 0, blue: 0 } };
+    out.push({ updateBorders: { range: range, top: style, bottom: style, left: style, right: style } });
+  }
+  return out;
+}
+
 // resize a tab to its actual grid, then write it. values.update (unlike
 // values.append) does NOT auto-grow, so the grid must be sized first; sizing to
 // exactly the content also keeps the workbook well under the 10M-cell cap. The
 // aspect tabs use USER_ENTERED (so the =HYPERLINK counts become live links); the
 // Names tab passes RAW so a worker name that happens to start with "="/"-"/"+"
-// is stored literally, not misread as a formula.
-function writeSummaryTab_(ss, sheetId, tabName, grid, inputOption) {
+// is stored literally, not misread as a formula. formats (optional) is the list
+// of cell-coloring instructions built by fmtCell_/fmtRange_ (Show Up so far) --
+// applied last, in one batchUpdate, after the values are in place.
+function writeSummaryTab_(ss, sheetId, tabName, grid, inputOption, formats) {
   let width = 1;
   grid.forEach(function (r) { if (r.length > width) width = r.length; });
   const rows = Math.max(1, grid.length);
@@ -629,11 +1079,15 @@ function writeSummaryTab_(ss, sheetId, tabName, grid, inputOption) {
   });
   // Write in ROW CHUNKS. A single values.update of a very large grid (the Names
   // files reach hundreds of thousands of rows) fails with a 500 "Internal error"
-  // -- the request is simply too big. Chunking keeps each request small; each
-  // targets a fixed A<start> range so a retry is idempotent. Rows are padded to
-  // the common width per chunk (not up front) to avoid building one giant rect.
+  // -- the request is simply too big. NOTE the binding limit here is the ~10MB
+  // per-REQUEST payload cap, NOT the 10M-cells-per-workbook cap (that's total,
+  // across all tabs, and is handled by splitting Names into separate files). So
+  // the chunk is sized to keep each request comfortably under ~10MB: 50k rows x 8
+  // short RAW cells ~= 5-6MB. Going much higher (e.g. 80k) re-risks the 500.
+  // Each chunk targets a fixed A<start> range so a retry is idempotent. Rows are
+  // padded to the common width per chunk (not up front) to avoid one giant rect.
   const io = inputOption || 'USER_ENTERED';
-  const CHUNK = 20000;
+  const CHUNK = 50000;
   for (var start = 0; start < grid.length; start += CHUNK) {
     const slice = grid.slice(start, start + CHUNK).map(function (r) {
       const c = r.slice();
@@ -646,12 +1100,37 @@ function writeSummaryTab_(ss, sheetId, tabName, grid, inputOption) {
         { values: slice }, id, quoted_(tabName) + '!A' + at, { valueInputOption: io });
     });
   }
+  if (formats && formats.length) {
+    var requests = [];
+    formats.forEach(function (f) { requests = requests.concat(formatRequests_(sheetId, f)); });
+    retryWrite_(function () { return Sheets.Spreadsheets.batchUpdate({ requests: requests }, id); });
+  }
+  // auto-fit column widths to their content ("text should fit cell" -- long
+  // headers like "Non Rotation and show up 1 day in month" were getting clipped
+  // at the default column width). Only for the aspect tabs (USER_ENTERED): the
+  // Names files (RAW) are hundreds of thousands of rows and this is purely
+  // cosmetic there, not worth the extra API call on an already-heavy write.
+  if (io === 'USER_ENTERED') {
+    retryWrite_(function () {
+      return Sheets.Spreadsheets.batchUpdate({ requests: [{ autoResizeDimensions: {
+        dimensions: { sheetId: sheetId, dimension: 'COLUMNS', startIndex: 0, endIndex: width },
+      } }] }, id);
+    });
+  }
 }
 
 // ------------------------------------------------------------------ main sync
 function sync() {
+  // ---- timing instrumentation: pinpoint where a long run spends its time so the
+  // right lever gets pulled (chunk size is minor; drill-down VOLUME is the cost).
+  // Read the Executions log after a run to see the read/append vs summary/names
+  // breakdown per SOC. Remove once the hotspot is confirmed and cut.
+  const T0 = Date.now();
+  function since_() { return ((Date.now() - T0) / 1000).toFixed(1) + 's'; }
+
   const conf = cfg_();
-  const files = discoverFiles_(conf.departments, conf.skipVendors);
+  const files = discoverFiles_(conf.departments, conf.thaiVendors);
+  Logger.log('[t] discovery done: ' + files.length + ' files @ ' + since_());
 
   // stream: per file, append its raw rows to that (year, dept) sheet's raw tab and
   // release; keep only the slim {name,date,team,clockin} slice for the summaries.
@@ -699,6 +1178,7 @@ function sync() {
       }
       cleaned.forEach(function (r) {
         r.vendor = f.vendor;
+        r.nationality = f.nationality;   // Thai/Burmese, from the vendor
         const y = String(r.date.y);
         (rowsByYear[y] = rowsByYear[y] || []).push(r);
       });
@@ -714,7 +1194,8 @@ function sync() {
       // Names drill-down can render every raw column for each counted person.
       rows.forEach(function (r) {
         ctx.slim.push({ name: r.name, date: r.date, team: r.team, clockin: r.clockin,
-          vendor: r.vendor, shift_name: r.shift_name, shift_id: r.shift_id, month: r.month });
+          vendor: r.vendor, shift_name: r.shift_name, shift_id: r.shift_id, month: r.month,
+          nationality: r.nationality });
       });
     });
   });
@@ -729,6 +1210,7 @@ function sync() {
     'New-Old Face': newOldTabGrid_, 'Show Up': showUpTabGrid_,
     'Consecutive': consecutiveTabGrid_, 'Rotation': rotationTabGrid_,
   };
+  Logger.log('[t] all files read + raw appended @ ' + since_());
   const result = {};
   Object.keys(socData).forEach(function (k) {
     const ctx = socData[k];
@@ -737,8 +1219,17 @@ function sync() {
     ASPECT_TABS.forEach(function (tab) {
       const nf = ctx.namesFiles[tab];
       const nc = namesCollector_(nf.ss.getId(), nf.gid);
-      writeSummaryTab_(ctx.ss, ctx.sheetIds[tab], tab, aspectGrids[tab](slim, nc));
+      const tb = Date.now();
+      const built = aspectGrids[tab](slim, nc, ctx.dept);   // {grid, formats}; dept -> "All <DEPT>" label
+      const buildS = ((Date.now() - tb) / 1000).toFixed(1);
+      const tw = Date.now();
+      writeSummaryTab_(ctx.ss, ctx.sheetIds[tab], tab, built.grid, 'USER_ENTERED', built.formats);
+      const sumS = ((Date.now() - tw) / 1000).toFixed(1);
+      const tn = Date.now();
       writeSummaryTab_(nf.ss, nf.gid, NAMES_TAB, nc.rows, 'RAW');
+      const namesS = ((Date.now() - tn) / 1000).toFixed(1);
+      Logger.log('[t] ' + ctx.dept + '/' + tab + ': build=' + buildS + 's write=' +
+        sumS + 's names=' + namesS + 's (' + nc.rows.length + ' name rows) @ ' + since_());
       namesIds[tab] = nf.ss.getId();
     });
     const names = {};
@@ -756,7 +1247,7 @@ function sync() {
 // discover + clean, log counts, write NOTHING. Safe to run any time.
 function dryRun() {
   const conf = cfg_();
-  const files = discoverFiles_(conf.departments, conf.skipVendors);
+  const files = discoverFiles_(conf.departments, conf.thaiVendors);
   const report = [];
   files.forEach(function (f) {
     const read = readMonthTabs_(f.id, f.year.slice(-2));
@@ -784,7 +1275,7 @@ function dryRun() {
 // SEEN before guessing a fix. vendorHint/tabHint are case-insensitive substrings.
 function debugHeaderRows(vendorHint, tabHint, nRows) {
   const conf = cfg_();
-  const files = discoverFiles_(conf.departments, conf.skipVendors);
+  const files = discoverFiles_(conf.departments, conf.thaiVendors);
   const f = files.filter(function (x) {
     return x.vendor.toLowerCase().indexOf(String(vendorHint).toLowerCase()) >= 0;
   })[0];
@@ -812,7 +1303,7 @@ function debugDSR() { return debugHeaderRows('DSR', 'Jan 26', 5); }
 // exactly why a backfill is ambiguous (which teams a shift maps to) before deciding.
 function debugShiftTeam(vendorHint, tabHint, deptHint) {
   const conf = cfg_();
-  const files = discoverFiles_(conf.departments, conf.skipVendors);
+  const files = discoverFiles_(conf.departments, conf.thaiVendors);
   const f = files.filter(function (x) {
     return x.vendor.toLowerCase().indexOf(String(vendorHint).toLowerCase()) >= 0 &&
       (!deptHint || x.dept === String(deptHint).toUpperCase());
@@ -854,7 +1345,7 @@ function debugSPT() { return debugShiftTeam('SPT', 'Jul 26', 'SOCW'); }
 // in วันที่ / วันที่.1) before deciding how to handle it.
 function debugBadDates(vendorHint, tabHint, deptHint) {
   const conf = cfg_();
-  const files = discoverFiles_(conf.departments, conf.skipVendors);
+  const files = discoverFiles_(conf.departments, conf.thaiVendors);
   const f = files.filter(function (x) {
     return x.vendor.toLowerCase().indexOf(String(vendorHint).toLowerCase()) >= 0 &&
       (!deptHint || x.dept === String(deptHint).toUpperCase());

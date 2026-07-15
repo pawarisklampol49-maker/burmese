@@ -527,38 +527,44 @@ function rotationSummary(rows, period) {
   return out;
 }
 
-// New/Old face (slide p3): per (month, worker), the MAX distinct days at any
-// single team. Old (experienced) if that max >= 10, else New. With a team arg,
-// scope to that team (days at T), so Old = present at T with >=10 days at T.
-// Returns a wide block {counts:{Old,New}, pct:{"Old %","New %"}, monthLabels}
-// mirroring showupBlock's shape so one grid shaper renders both.
+// New/Old face -- the OPERATIONAL experience rule (user-confirmed). New/Old only
+// classifies workers FIXED to a single station that month:
+//   Old (experienced) = one station AND >=10 working days there.
+//   New (inexperienced) = one station AND <10 days.
+//   ROTATED (>1 station that month) = NOT classified here at all (returns null) --
+//     rotation is covered by the Rotation tab. (Earlier this folded rotated into
+//     New; the user then said both Old and New are fixed-station-only, so rotated
+//     is excluded.) Classification uses the worker's WHOLE month (all teams), so
+//     team scoping only changes WHO is counted (present at T), never the verdict.
 const NEWOLD_MIN_DAYS = 10;
+function newOldFace_(rs) {
+  const teams = new Set(rs.map((r) => r.team));
+  if (teams.size > 1) return null;   // rotated -> excluded from New/Old
+  const days = new Set(rs.map((r) => r.date.key)).size;
+  return days >= NEWOLD_MIN_DAYS ? "Old" : "New";
+}
 function newOldMonthly(rows, team) {
   const d = prepare(rows);
-  const x = team == null ? d : d.filter((r) => r.team === team);
-  const months = sortedUnique(x.map((r) => r.date.month));
-  const g = groupBy(x, (r) => r.date.month + SEP + r.name);
-  const raw = { Old: {}, New: {} };
-  months.forEach((m) => { raw.Old[m] = 0; raw.New[m] = 0; });
+  const g = groupBy(d, (r) => r.date.month + SEP + r.name);   // ALL teams -- need the full month
+  const raw = {};   // month -> {Old, New}
   for (const rs of g.values()) {
+    if (team != null && !rs.some((r) => r.team === team)) continue;   // scope: present at T
+    const face = newOldFace_(rs);
+    if (face == null) continue;   // rotated -> excluded
     const month = rs[0].date.month;
-    const byTeam = groupBy(rs, (r) => r.team);
-    let maxDays = 0;
-    for (const trs of byTeam.values()) {
-      const dd = new Set(trs.map((r) => r.date.key)).size;
-      if (dd > maxDays) maxDays = dd;
-    }
-    if (maxDays >= NEWOLD_MIN_DAYS) raw.Old[month]++; else raw.New[month]++;
+    const cell = (raw[month] = raw[month] || { Old: 0, New: 0 });
+    cell[face]++;
   }
+  const months = Object.keys(raw).sort();
   const counts = { Old: {}, New: {} };
   const pct = { "Old %": {}, "New %": {} };
   months.forEach((m) => {
     const ml = monthLabel(m);
-    const tot = raw.Old[m] + raw.New[m];
-    counts.Old[ml] = raw.Old[m];
-    counts.New[ml] = raw.New[m];
-    pct["Old %"][ml] = tot ? round2(raw.Old[m] / tot * 100) : 0.0;
-    pct["New %"][ml] = tot ? round2(raw.New[m] / tot * 100) : 0.0;
+    const tot = raw[m].Old + raw[m].New;
+    counts.Old[ml] = raw[m].Old;
+    counts.New[ml] = raw[m].New;
+    pct["Old %"][ml] = tot ? round2(raw[m].Old / tot * 100) : 0.0;
+    pct["New %"][ml] = tot ? round2(raw[m].New / tot * 100) : 0.0;
   });
   return { counts: counts, pct: pct, monthLabels: months.map(monthLabel) };
 }
@@ -637,22 +643,21 @@ function showupMembers(rows, team) {
   return out;
 }
 
-// New/Old: {monthLabel: {"Old"|"New": [rows]}}. Same >=10-days-at-one-team rule.
+// New/Old: {monthLabel: {"Old"|"New": [rows]}} using the rotation-aware rule
+// (newOldFace_). Grouped over ALL teams (rotation needs the full month); team
+// scope only picks WHO is counted (present at T) + the rep row at T, not the
+// classification. members.length === newOldMonthly's counts (self-tested).
 function newOldMembers(rows, team) {
   const d = prepare(rows);
-  const x = team == null ? d : d.filter((r) => r.team === team);
-  const g = groupBy(x, (r) => r.date.month + SEP + r.name);
+  const g = groupBy(d, (r) => r.date.month + SEP + r.name);
   const out = {};
   for (const rs of g.values()) {
+    if (team != null && !rs.some((r) => r.team === team)) continue;
+    const face = newOldFace_(rs);
+    if (face == null) continue;   // rotated -> excluded
     const ml = monthLabel(rs[0].date.month);
-    const byTeam = groupBy(rs, (r) => r.team);
-    let maxDays = 0;
-    for (const trs of byTeam.values()) {
-      const dd = new Set(trs.map((r) => r.date.key)).size;
-      if (dd > maxDays) maxDays = dd;
-    }
-    const face = maxDays >= NEWOLD_MIN_DAYS ? "Old" : "New";
-    (out[ml] = out[ml] || { Old: [], New: [] })[face].push(pickRep(rs));
+    const repRows = team == null ? rs : rs.filter((r) => r.team === team);
+    (out[ml] = out[ml] || { Old: [], New: [] })[face].push(pickRep(repRows));
   }
   return out;
 }
@@ -1001,19 +1006,32 @@ function runSelfTests() {
   assert(JSON.stringify(distinctTeams(df)) === JSON.stringify(["IB", "MS"]), "distinctTeams");
   ok("test_distinct_teams");
 
-  // New/Old face: only grace (12 days at IB in Mar) clears the 10-day bar -> Old
+  // New/Old face: ONLY fixed-station workers are classified; ROTATED excluded.
+  // synthetic Mar: grace(12d IB)=Old; alice/carol/erin/frank/henry (single-station
+  // <10 days)=New (5); bob & dave (2 teams) EXCLUDED. -> Old=1, New=5.
   const nof = newOldMonthly(df);
-  assert(nof.counts.Old["Mar"] === 1 && nof.counts.New["Mar"] === 7, "newold all Mar");
+  assert(nof.counts.Old["Mar"] === 1 && nof.counts.New["Mar"] === 5, "newold all Mar (rotated excluded)");
   const nofIB = newOldMonthly(df, "IB");
-  assert(nofIB.counts.Old["Mar"] === 1 && nofIB.counts.New["Mar"] === 7, "newold IB Mar");
-  // a worker split 5+6 across two teams (max 6 < 10) stays New despite 11 total days
-  const split = makeCleanRows([
-    ["zed", "IB", [2026, 6, 1]], ["zed", "IB", [2026, 6, 2]], ["zed", "IB", [2026, 6, 3]],
-    ["zed", "IB", [2026, 6, 4]], ["zed", "IB", [2026, 6, 5]],
-    ["zed", "MS", [2026, 6, 8]], ["zed", "MS", [2026, 6, 9]], ["zed", "MS", [2026, 6, 10]],
-    ["zed", "MS", [2026, 6, 11]], ["zed", "MS", [2026, 6, 12]], ["zed", "MS", [2026, 6, 15]],
+  assert(nofIB.counts.Old["Mar"] === 1 && nofIB.counts.New["Mar"] === 5, "newold IB Mar (rotated excluded)");
+  // ROTATED worker is EXCLUDED even with >=10 days: ann = 12d IB + 5d MS (rotated)
+  // -> not Old, not New. bea = 10d all IB -> Old. So {ann, bea}: Old=1, New=0.
+  const mix = makeCleanRows([
+    ["ann", "IB", [2026, 6, 1]], ["ann", "IB", [2026, 6, 2]], ["ann", "IB", [2026, 6, 3]],
+    ["ann", "IB", [2026, 6, 4]], ["ann", "IB", [2026, 6, 5]], ["ann", "IB", [2026, 6, 6]],
+    ["ann", "IB", [2026, 6, 7]], ["ann", "IB", [2026, 6, 8]], ["ann", "IB", [2026, 6, 9]],
+    ["ann", "IB", [2026, 6, 10]], ["ann", "IB", [2026, 6, 11]], ["ann", "IB", [2026, 6, 12]],
+    ["ann", "MS", [2026, 6, 15]], ["ann", "MS", [2026, 6, 16]], ["ann", "MS", [2026, 6, 17]],
+    ["bea", "IB", [2026, 6, 1]], ["bea", "IB", [2026, 6, 2]], ["bea", "IB", [2026, 6, 3]],
+    ["bea", "IB", [2026, 6, 4]], ["bea", "IB", [2026, 6, 5]], ["bea", "IB", [2026, 6, 6]],
+    ["bea", "IB", [2026, 6, 7]], ["bea", "IB", [2026, 6, 8]], ["bea", "IB", [2026, 6, 9]],
+    ["bea", "IB", [2026, 6, 10]],
   ]);
-  assert(newOldMonthly(split).counts.New["Jun"] === 1 && newOldMonthly(split).counts.Old["Jun"] === 0, "newold split-max<10 is New");
+  assert(newOldMonthly(mix).counts.Old["Jun"] === 1 && newOldMonthly(mix).counts.New["Jun"] === 0, "newold rotated excluded, fixed>=10 Old");
+  // a fixed worker with <10 days is New
+  const newFixed = makeCleanRows([
+    ["cara", "IB", [2026, 6, 1]], ["cara", "IB", [2026, 6, 2]], ["cara", "IB", [2026, 6, 3]],
+  ]);
+  assert(newOldMonthly(newFixed).counts.New["Jun"] === 1 && newOldMonthly(newFixed).counts.Old["Jun"] === 0, "newold fixed <10 is New");
   ok("test_newold_face");
 
   // attendance headcount: 6 distinct workers present on Mar-02, all in IB

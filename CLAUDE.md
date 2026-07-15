@@ -185,9 +185,16 @@ setup and nothing to re-paste when 2027 rolls over.
 
 **Departments are SOCN / SOCE / SOCW (FSOCW dropped).** `RAW_DEPARTMENTS` =
 `SOCN,SOCE,SOCW`. (`FSOCN` is a *station* inside SOCN, not the dropped `FSOCW`
-department.) Some vendors are excluded via the `SKIP_VENDORS` Script Property
-(`PPO,WAS,RG,YSL,BigBoom`) — a loud, logged skip, so SOCN totals legitimately
-won't match the slide deck's "7 vendors / 5,298 names".
+department.)
+
+**Vendor nationality (Thai vs Burmese).** No vendors are skipped anymore (the old
+`SKIP_VENDORS` is retired — run `migrateSkipVendors()` once to delete the
+property). Instead, every vendor is classified: the `THAI_VENDORS` Script Property
+(`PPO,WAS,RG,YSL,BigBoom`) lists Thai vendors; **anything not in it is Burmese**
+(`nationalityOf_`, the user's chosen default — NOT fail-fast: a new unlisted vendor
+just counts as Burmese until added). Each cleaned row carries `nationality`
+(threaded onto the slim slice from its vendor). Every summary scope is then split
+by nationality — see the nationality note below.
 
 **Per SOC per year**, created in the Central folder by the script itself:
 - `<YEAR>_<DEPT>` (e.g. `2026_SOCN`) — the main results file, **5 tabs**
@@ -215,18 +222,145 @@ mean something (no daily for the bucket/rotation/consecutive aspects — they ca
 run on one day; the one daily view is a head count, below). Percentages render
 with a `%` sign (`pctCell_`, written USER_ENTERED so `"45.11%"` is a real percent
 number, not stuck text):
-  - **New / Old face** — per (month, worker) the MAX distinct days at any single
-    team; **Old** if that max ≥ 10, else **New**. **Monthly** only.
+  - **New / Old face** — the user's **operational experience rule** (`newOldFace_`
+    in engine.gs), per (month, worker). Only classifies workers **fixed to one
+    station** that month: **Old (experienced)** = one station AND **≥10 days**;
+    **New (inexperienced)** = one station AND **<10 days**. **Rotated** workers
+    (>1 station) are **EXCLUDED** (`newOldFace_` returns `null`) — they belong to
+    the Rotation tab. (Evolution: first "max days at any single team ≥ 10" (wrong);
+    then "rotated = New"; the user's final word was "both old and new are
+    fixed-station-only," so rotated is now dropped, not folded into New.)
+    Classification uses the worker's WHOLE month (all teams), so team-scoping only
+    changes WHO is counted (present at T) + the rep row shown, never the verdict.
+    **Monthly** only. Same two-table + trend + `All <DEPT>` + `visibleTeams_`
+    treatment as Show Up. (NOT tenure/range — that was a mid-conversation detour
+    the user corrected.)
   - **Show up** — day-count buckets 1-5/6-10/11-15/16-20/21-30, **monthly** (with
-    drill-down), PLUS a **daily head-count** block (`attendanceCrosstab(slim,'day')`
-    via `renderHeadcount_` — distinct workers present per day, per team + an `All`
-    row). The daily block is **PLAIN NUMBERS, not clickable**: a per-person daily
-    drill-down copies ~2× the entire raw log and overflowed even a dedicated Names
-    file; the daily roster is already the `raw` tab filtered by date. (The engine's
-    `attendanceMembers` remains, self-tested, but is unused by `Code.gs`.)
-  - **3-day consecutive** — **monthly** (`streakMonthCrosstab` categories) +
-    **weekly** (`streakWeek`, ≥3 consecutive).
-  - **Rotation** — **monthly + weekly** (`rotationSummary`, per team).
+    drill-down), PLUS a **daily head-count** block (`renderHeadcount_` — distinct
+    workers present per day, one row per nationality scope). The daily block is
+    **PLAIN NUMBERS, not clickable**: a per-person daily drill-down copies ~2× the
+    entire raw log and overflowed even a dedicated Names file; the daily roster is
+    already the `raw` tab filtered by date. `renderHeadcount_` now computes distinct
+    names/day straight from the slice (no `attendanceCrosstab`); the engine's
+    `attendanceCrosstab`/`attendanceMembers` remain, self-tested, but are unused by
+    `Code.gs`.
+
+    **The combined row is `All <DEPT>`, department-dynamic** (`allLabel_(dept)` →
+    `All SOCN`/`All SOCE`/`All SOCW`), NOT a hardcoded `"All SOCN"` — the same code
+    writes all three SOCs, so the label must follow the SOC being written (was a
+    real bug: literal `"All SOCN"` showed on SOCE/SOCW too). `dept` is threaded from
+    `sync()`'s ctx into each `*TabGrid_(slim, nc, dept)`. The combined row is the
+    all-teams aggregate (no team filter); team rows use the bare team name (`IB`,
+    not `team IB`). `isAllScope_(scope)` (`/^All /`) distinguishes the combined row
+    from a team for header coloring — safe because no `VIS_TEAMS` name starts with
+    `"All "`. Rotation has no `All <DEPT>` row at all (an aggregate double-counts a
+    worker who rotated across teams), so it ignores `dept`.
+
+    **Team scope: all four aspects** are now restricted to the fixed 8-team
+    allowlist `VIS_TEAMS = [IB, CBS, mCBS, MS, OBI, OBC, OBS, OBD]` (`visibleTeams_`),
+    NOT `distinctTeams` — per the user's request, to keep the visualization free of
+    noise teams (a stray `Helper`, or a shift-name-as-team fallback). This is a
+    display-layer filter only; `raw`/drill-down data is untouched.
+
+    **Nationality split (Thai / Burmese), all four aspects.** Every scope is split
+    by worker nationality and interleaved per base scope: `All <DEPT> Burmese`,
+    `All <DEPT> Thai`, `IB Burmese`, `IB Thai`, … (`natScopes_` for the three
+    All-plus-team aspects; `natTeams_` for Rotation, which has no All row). A
+    base/nationality pair with no rows is skipped, so a Burmese-only SOC shows no
+    empty Thai blocks. There is **no combined (both-nationalities) row** — the point
+    is to separate the two populations (flagged for the user to confirm they don't
+    also want a combined total). Each scope filters the slim slice to its
+    nationality (`filterNat_`) then calls the same `*Members` functions. Rotation
+    computes `rotationMembers` per nationality (`monthByNat`/`weekByNat`) and reads
+    each `<team> <nat>` row from its own nationality's map. `isAllScope_` still works
+    with the suffix (`"All SOCN Burmese"` starts `"All "`), so both nationality
+    All-rows get the header/highlight color.
+
+    **Show Up now has TWO tables** (per the user's reference screenshots): the
+    original **by-team** table (`renderShowup_`, unchanged shape) and a new
+    **by-bucket** table (`renderShowupByBucket_`) — one block per bucket, rows =
+    `All <DEPT>` + each visible team, columns = months (% only). The by-bucket table
+    flags a row when its LAST-TWO-MONTHS % move is ≥ `TREND_THRESHOLD_PTS` (5
+    points): colors those two cells (green/`FMT.increaseBg`+`increaseFg` for a
+    rise, red/`decreaseBg`+`decreaseFg` for a drop), boxes them
+    (`fmtRange_(...,{border:true})`), and writes an `increases`/`decreases` label
+    in the column after the last month. This is a **generic threshold rule
+    applied to every row**, not a hardcoded "always highlight team X" — the user's
+    reference screenshot happened to flag one particular team in both examples
+    shown, which may have been a manual/one-off highlight rather than a rule;
+    flagged for the user to confirm against the live threshold-based result.
+
+    **Cell coloring is real Sheets formatting, not just values.** `fmtCell_`/
+    `fmtRange_` collect abstract `{row, col, bg, fg, bold, border}` instructions
+    (grid-relative, 0-based) into a `formats` array returned alongside the grid;
+    `writeSummaryTab_` converts them to real `repeatCell`/`updateBorders` requests
+    (`formatRequests_`, `hexColor_`) against the tab's `sheetId` and applies them
+    in one `batchUpdate` AFTER the values are written (still Advanced-Sheets-Service
+    only — no `SpreadsheetApp` formatting calls). **All four `*TabGrid_` functions
+    return `{grid, formats}`** (New-Old currently returns `formats: []`) so
+    `sync()`'s write loop can treat every aspect uniformly.
+
+    **Columns auto-fit their content.** `writeSummaryTab_` issues an
+    `autoResizeDimensions` request after every aspect-tab write (skipped for the
+    Names files — cosmetic only there, not worth the extra call on an
+    already-heavy write) — long headers like "Non Rotation and show up 1 day in
+    month" were getting clipped at the default column width.
+
+    **`Sum Month` is a PLAIN NUMBER, not a link.** It used to be `nc.link`'d to the
+    concatenation of every bucket's members — i.e. a second copy of names already
+    linked individually per bucket, duplicated into the Names file for nothing.
+    Fixed after the user flagged it live ("same data, waste of memory"); the same
+    rule now applies to every derived/recombined total across the whole file (see
+    Consecutive, below) — link the real distinct groups, never their sum.
+  - **3-day consecutive** — redesigned to match the user's reference sheet
+    (`renderStreakMonth_`/`renderStreakWeek_`, `visibleTeams_`-scoped like Show Up),
+    replacing the old flat 7-column `STREAK_CATS` table:
+    - **Monthly**, per scope (`All SOCN` + each visible team): a **COUNTS**
+      section — block 1 (`<10`/`>10`, no title), block 2 ("Used to work for at
+      least 3 consecutive days (at least one period)", green title), block 3
+      ("Never work for at least 3 consecutive days (at least one period)", red
+      title) — each 2 rows (`Show up < 10 days` / `Show up > 10 days`) + a plain
+      `Total` row; then a **PERCENTAGES** section mirroring all 3 blocks, where
+      blocks 2 and 3 use block 1's denominator (`streakActive_` — that month's
+      total active headcount), not their own subtotal — confirmed against the
+      user's reference numbers, since all three blocks partition the identical
+      population, just by a different question (raw day-count vs streak
+      history). Ends with a validation row: block 2 + block 3 percentages should
+      sum to ~100%.
+    - **Weekly**, same scoping: TRANSPOSED from the old layout — categories as
+      ROWS (`>=3 days consecutive` / `< 3 days and non-consecutive`), weeks as
+      COLUMNS, counts then percentages, plain `Total` row.
+    - **Deferred, NOT built:** the reference sheet's third weekly mini-table
+      (columns numbered 1–17, matching the exact week count of the Mar–Jun
+      period) — the user's clarification didn't resolve what column *N* counts
+      (a longest-streak-length histogram vs a qualifying-week-count histogram
+      are both consistent with the 17-column coincidence). Confirm a concrete
+      example before building; a wrong guess here is expensive (large sync).
+  - **Rotation** — redesigned to match the user's reference sheet
+    (`visibleTeams_`-scoped, no `All SOCN` row — an aggregate would double-count a
+    worker who rotated across several teams, and the reference sheet doesn't show
+    one either), replacing the old flat `period, team` table:
+    - **Per-period DETAIL blocks** (`renderRotationDetail_`, one block per
+      month/week, teams as rows), 7 columns matching the reference order: `Non
+      Rotation` (count, linked), `Rotation` (count, linked), "Non Rotation and
+      show up 1 day in month" (count, linked, then its own % of `Non Rotation` —
+      confirmed against the reference, e.g. 310/334=92.81%), `Total` (**plain**,
+      = `Non Rotation` + `Rotation` recombined — same anti-duplication rule), then
+      `Non Rotation %` / `Rotation %` of `Total`.
+    - **Trend-summary section** (`renderRotationTrend_`, 3 stacked blocks —
+      `Rotation` plain title, `Non Rotation` green title, "Non rotation worker
+      who come to work only 1 day in a month" orange title (`FMT.oneDayFg`) —
+      teams as rows, periods as columns, % only, not linked (derived from the
+      detail blocks above)) via the **same shared trend helper as Show Up's
+      by-bucket table** — `renderTrendPctBlock_`, extracted this round so the
+      last-two-periods/`TREND_THRESHOLD_PTS`/box/label logic lives in exactly one
+      place. Same caveat as Show Up: this is a generic per-row threshold rule, not
+      a hand-picked "always flag team X" — the reference screenshot's boxed cell
+      may reflect a different comparison (e.g. Apr→May, not the generic last-two-
+      periods rule here); flagged for the user to confirm against the live result.
+    - **Weekly** gets the same two-part treatment (per-week detail blocks +
+      trend summary) by extension/consistency with monthly — the reference
+      screenshots only showed monthly, so this is inferred, not confirmed.
 
 **Drill-down (BUILT).** Every count in an aspect tab (except the daily head-count)
 is written as a **cross-file**
