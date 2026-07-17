@@ -626,6 +626,14 @@ function pickRep(rows) {
   return best;
 }
 
+// canonical shift-id value for grouping/matching: trimmed string, blank for a
+// missing one. Shift scoping is TEAM scoping one level finer (a shift id like
+// "CBS_N_00" belongs to exactly one team): a worker counts under every shift
+// they actually worked in the period, and the verdict (Old/New, Rotated) is
+// never changed by the shift filter -- it only changes WHO is counted and
+// which rows the representative is picked from.
+function normShift(v) { return String(v == null ? "" : v).trim(); }
+
 // Show up: {monthLabel: {bucketLabel: [rows]}}. Groups rows directly (same result
 // as daysPerMonthWorker's bucketing) so a representative row is kept per (month,
 // worker); a worker with days outside 1-30 lands in no bucket (matches the count).
@@ -649,17 +657,21 @@ function showupMembers(rows, team) {
 // New/Old: {monthLabel: {"Old"|"New": [rows]}} using the rotation-aware rule
 // (newOldFace_). Grouped over ALL teams (rotation needs the full month); team
 // scope only picks WHO is counted (present at T) + the rep row at T, not the
-// classification. members.length === newOldMonthly's counts (self-tested).
-function newOldMembers(rows, team) {
+// classification. shiftId (optional, only with a team) narrows further to
+// "present at team T on shift S" -- same presence-only semantics.
+// members.length === newOldMonthly's counts (self-tested).
+function newOldMembers(rows, team, shiftId) {
   const d = prepare(rows);
   const g = groupBy(d, (r) => r.date.month + SEP + r.name);
+  const inScope = (r) => (team == null || r.team === team) &&
+                         (shiftId == null || normShift(r.shift_id) === shiftId);
   const out = {};
   for (const rs of g.values()) {
-    if (team != null && !rs.some((r) => r.team === team)) continue;
+    if ((team != null || shiftId != null) && !rs.some(inScope)) continue;
     const face = newOldFace_(rs);
     if (face == null) continue;   // rotated -> excluded
     const ml = monthLabel(rs[0].date.month);
-    const repRows = team == null ? rs : rs.filter((r) => r.team === team);
+    const repRows = (team == null && shiftId == null) ? rs : rs.filter(inScope);
     (out[ml] = out[ml] || { Old: [], New: [] })[face].push(pickRep(repRows));
   }
   return out;
@@ -732,14 +744,27 @@ function rotationMembers(rows, period) {
     for (const t of teams) {
       const inTeam = g.filter((r) => (r.teamCount[t] || 0) >= 1);
       if (!inTeam.length) continue;
-      const cell = { population: [], rotation: [], non_rotation: [], oneday_nonrot: [] };
+      // shifts: the same cell shape one level finer, keyed by normShift(shift_id)
+      // -- a worker counts under EVERY shift they worked at t that period, with
+      // the rep picked from their rows at (t, shift). The verdict (Rotated /
+      // oneday) stays the TEAM-level one; the shift only filters presence.
+      const cell = { population: [], rotation: [], non_rotation: [], oneday_nonrot: [], shifts: {} };
       inTeam.forEach((r) => {
-        const rep = pickRep(r.rows.filter((rr) => rr.team === t));
-        cell.population.push(rep);
-        if (r.analyze[t] === "Rotated") { cell.rotation.push(rep); }
-        else {
-          cell.non_rotation.push(rep);
-          if ((r.teamCount[t] || 0) === 1) cell.oneday_nonrot.push(rep);
+        const rowsAtT = r.rows.filter((rr) => rr.team === t);
+        const rep = pickRep(rowsAtT);
+        const push = (c, rp) => {
+          c.population.push(rp);
+          if (r.analyze[t] === "Rotated") { c.rotation.push(rp); }
+          else {
+            c.non_rotation.push(rp);
+            if ((r.teamCount[t] || 0) === 1) c.oneday_nonrot.push(rp);
+          }
+        };
+        push(cell, rep);
+        for (const [sid, srs] of groupBy(rowsAtT, (rr) => normShift(rr.shift_id))) {
+          const sc = (cell.shifts[sid] = cell.shifts[sid] ||
+            { population: [], rotation: [], non_rotation: [], oneday_nonrot: [] });
+          push(sc, pickRep(srs));
         }
       });
       teamObj[t] = cell;
@@ -806,11 +831,12 @@ function showupWeekMembers(rows, team) {
 // exactly like the monthly tab. A week can straddle two months (the only
 // cross-month grain): the verdict of the month of the worker's EARLIEST show-up
 // in that week decides -- affects boundary weeks only.
-function newOldPresence(rows, period, team) {
+function newOldPresence(rows, period, team, shiftId) {
   const d = prepare(rows);
   const face = {};   // month+SEP+name -> "Old"|"New"|null, over ALL teams
   for (const [k, rs] of groupBy(d, (r) => r.date.month + SEP + r.name)) face[k] = newOldFace_(rs);
-  const x = team == null ? d : d.filter((r) => r.team === team);
+  let x = team == null ? d : d.filter((r) => r.team === team);
+  if (shiftId != null) x = x.filter((r) => normShift(r.shift_id) === shiftId);
   const out = {};
   for (const rs of groupBy(x, (r) => periodKey(r.date, period) + SEP + r.name).values()) {
     const rep = pickRep(rs);
@@ -1171,6 +1197,38 @@ function runSelfTests() {
   assert(rpd["2026-03-02"]["IB"].rotation.length + rpd["2026-03-02"]["IB"].non_rotation.length ===
          amD["2026-03-02"]["IB"].length, "rotation daily partitions the day's head count");
   ok("test_presence_grains");
+
+  // shift scoping: presence-at-(team, shift) only narrows WHO is counted and
+  // where the rep row comes from -- the monthly verdict never changes.
+  // pete: 12 days IB (Old), days 1-6 on IB_N_00, days 7-12 on IB_N_01.
+  // quinn: 1 day IB (New), on IB_N_00.
+  const shiftRows = makeCleanRows([
+    ["pete", "IB", [2026, 5, 1]], ["pete", "IB", [2026, 5, 2]], ["pete", "IB", [2026, 5, 3]],
+    ["pete", "IB", [2026, 5, 4]], ["pete", "IB", [2026, 5, 5]], ["pete", "IB", [2026, 5, 6]],
+    ["pete", "IB", [2026, 5, 7]], ["pete", "IB", [2026, 5, 8]], ["pete", "IB", [2026, 5, 9]],
+    ["pete", "IB", [2026, 5, 10]], ["pete", "IB", [2026, 5, 11]], ["pete", "IB", [2026, 5, 12]],
+    ["quinn", "IB", [2026, 5, 1]],
+  ]);
+  // r.date.d is day-of-month; r.date.dayNum is the ABSOLUTE epoch day (run math),
+  // NOT 1..31 -- using it here silently put every pete row on one shift.
+  shiftRows.forEach((r) => { r.shift_id = (r.name === "quinn" || r.date.d <= 6) ? "IB_N_00" : "IB_N_01"; });
+  const no00 = newOldMembers(shiftRows, "IB", "IB_N_00");
+  assert(no00["May"].Old.length === 1 && no00["May"].New.length === 1, "newold shift _00 (pete Old, quinn New)");
+  const no01 = newOldMembers(shiftRows, "IB", "IB_N_01");
+  assert(no01["May"].Old.length === 1 && no01["May"].New.length === 0, "newold shift _01 (pete only; verdict still Old)");
+  assert(no01["May"].Old[0].date.key === "2026-05-07", "newold shift rep row is AT the shift (pete's first _01 day)");
+  const np00 = newOldPresence(shiftRows, "day", "IB", "IB_N_00");
+  assert(np00["2026-05-01"].Old.length === 1 && np00["2026-05-01"].New.length === 1, "newold daily shift _00 day 1");
+  assert(!np00["2026-05-07"], "newold daily shift _00 absent on a _01-only day");
+  const roS = rotationMembers(shiftRows)["2026-05"]["IB"];
+  assert(roS.population.length === 2 && roS.shifts["IB_N_00"].population.length === 2 &&
+         roS.shifts["IB_N_01"].population.length === 1, "rotation shift populations");
+  assert(roS.shifts["IB_N_00"].oneday_nonrot.length === 1 && roS.shifts["IB_N_01"].non_rotation.length === 1,
+         "rotation shift verdicts stay team-level");
+  assert(roS.shifts["IB_N_01"].population[0].date.key === "2026-05-07", "rotation shift rep row is AT the shift");
+  // rows without a shift_id group under the blank key ""
+  assert(roM["2026-03"]["IB"].shifts[""].population.length === 8, "blank shift_id groups under ''");
+  ok("test_shift_scoping");
 
   log.push("ALL SELF-TESTS PASSED");
   return [{ json: { passed: true, log: log } }];

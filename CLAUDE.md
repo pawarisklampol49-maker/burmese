@@ -306,6 +306,37 @@ not stuck text):
     with the suffix (`"All SOCN Burmese"` starts `"All "`), so both nationality
     All-rows get the header/highlight color.
 
+    **Shift_id breakdown (all four aspects, 2026-07-16, user request).** Within
+    each team group, that team's numbers are further split by `Shift_id` (e.g.
+    `CBS` → `CBS_N_00`, `CBS_N_01`; format confirmed against the local June BTS
+    CSV — a shift id belongs to exactly one team, 2–10+ ids per team per vendor).
+    Shift scoping is **team scoping one level finer, same semantics**: a worker
+    counts under every shift they actually worked in the period, days/streak-runs
+    are counted AT that shift, and the monthly verdicts (Old/New; Rotated +
+    Reading-B oneday) NEVER change — the shift only filters who is counted and
+    which rows the rep is picked from. Engine: `normShift`, optional `shiftId`
+    param on `newOldMembers`/`newOldPresence`, per-team `cell.shifts` on
+    `rotationMembers` (self-tested: `test_shift_scoping`). Code.gs: `shiftKey_`
+    (same normalization as `normShift`), `shiftIdsOf_` (data-driven per
+    nationality slice + team), `shiftSlice_`; a blank shift id groups under `''`
+    and displays `(no Shift_id)`; row labels are indented with `SHIFT_INDENT`
+    (NBSPs, written as `\u00A0` escapes — a plain leading space would be trimmed
+    by USER_ENTERED). Layout, user-chosen ("extra rows under the team"):
+    **indented rows under each team row in every teams-as-rows table** — Show Up
+    by-bucket + daily head count; New/Old by-category + daily face tables;
+    Rotation detail + trend + daily (detail-row counts ARE linked; link keys and
+    Names titles use the parent `<team> <nat>` label + sid — the bare indented
+    display label repeats across nationalities and would collide). **Consecutive
+    is the exception**: its rows are streak categories, not teams, so each team
+    block is followed by per-shift SUB-BLOCKS (same renderers on a
+    shift-filtered slice, label `<sid> <nat>` indented) — flagged to the user as
+    the necessary deviation from the rows layout. Deliberately NOT shift-split
+    (block-style tables, per the rows-not-blocks choice): Show Up table A and
+    weekly buckets, New/Old monthly/weekly count blocks. Names-file growth comes
+    only from Rotation detail shift rows (~2× Rotation Names) and Consecutive
+    shift sub-blocks (~one extra scope per worker) — the streak Names file stays
+    the first 10M watch-item.
+
     **Show Up now has TWO tables** (per the user's reference screenshots): the
     original **by-team** table (`renderShowup_`, unchanged shape) and a new
     **by-bucket** table (`renderShowupByBucket_`) — one block per bucket, rows =
@@ -321,20 +352,45 @@ not stuck text):
     flagged for the user to confirm against the live threshold-based result.
 
     **Cell coloring is real Sheets formatting, not just values.** `fmtCell_`/
-    `fmtRange_` collect abstract `{row, col, bg, fg, bold, border}` instructions
-    (grid-relative, 0-based) into a `formats` array returned alongside the grid;
-    `writeSummaryTab_` converts them to real `repeatCell`/`updateBorders` requests
-    (`formatRequests_`, `hexColor_`) against the tab's `sheetId` and applies them
-    in one `batchUpdate` AFTER the values are written (still Advanced-Sheets-Service
-    only — no `SpreadsheetApp` formatting calls). **All four `*TabGrid_` functions
-    return `{grid, formats}`** (New-Old currently returns `formats: []`) so
-    `sync()`'s write loop can treat every aspect uniformly.
+    `fmtRange_` collect abstract `{row, col, [rowEnd/colEnd], bg, fg, bold, size,
+    border, borderTop, borderBottom}` instructions (grid-relative, 0-based) into a
+    `formats` array returned alongside the grid; `writeSummaryTab_` converts them
+    to real `repeatCell`/`updateBorders` requests (`formatRequests_`, `hexColor_`
+    — precise per-property `fields` masks so instructions on the same cell
+    COMPOSE) against the tab's `sheetId` and applies them in one `batchUpdate`
+    AFTER the values are written (still Advanced-Sheets-Service only — no
+    `SpreadsheetApp` formatting calls). **All four `*TabGrid_` functions return
+    `{grid, formats}`** so `sync()`'s write loop can treat every aspect uniformly.
 
-    **Columns auto-fit their content.** `writeSummaryTab_` issues an
-    `autoResizeDimensions` request after every aspect-tab write (skipped for the
-    Names files — cosmetic only there, not worth the extra call on an
-    already-heavy write) — long headers like "Non Rotation and show up 1 day in
-    month" were getting clipped at the default column width.
+    **Full visual theme (2026-07-16, "decorate the 4 summaries").** Each aspect
+    tab has a color identity (`ASPECT_STYLE`: New-Old deep blue, Show Up deep
+    green, Consecutive plum, Rotation brown-orange): the **tab strip** is colored
+    (`tabColor`), the top row is a full-width accent **banner** (white bold, size
+    12; `banner_`) and each sub-section title a pale-tint **section bar**
+    (`section_`) — both use `colEnd: -1`, a sentinel `writeSummaryTab_` resolves
+    to the final grid width. On top of that, `decorateFormats_(grid)` is a
+    generic structural pass hooked in the write loop (PREPENDED so renderer
+    colors like trend flags win): table header rows (first cell
+    `bucket`/`face`/`team`, or `''` followed only by plain non-`%` strings — the
+    rule that also catches Rotation's period/column rows while skipping the
+    streak validation `%` row) get gray-bold + a thin bottom rule; rows of
+    `team`-headed tables get **zebra striping**; indented `Shift_id` labels are
+    muted gray; `Sum Month`/`Sum Week`/`Total` rows get bold + a thin top rule.
+    `writeSummaryTab_` also (aspect tabs only): **resets ALL formatting** on the
+    grid first (`repeatCell` fields `userEnteredFormat` — values.batchClear only
+    clears VALUES, so stale colors from a previous differently-shaped run would
+    linger), **freezes row 1 + column 1** (labels stay visible against the wide
+    month/week/day columns), and applies the scope-header colors across the
+    block's real width (was col A only). Detection rules verified by a local
+    Python transcription (all row shapes classify correctly).
+
+    **Columns: A is fixed, the rest auto-fit.** `writeSummaryTab_` sizes col A to
+    a fixed 230px (auto-fitting it to the long banner sentences made it absurdly
+    wide; banner text overflows across the blank cells to its right) and
+    `autoResizeDimensions` the remaining columns (skipped entirely for the Names
+    files — cosmetic only there, not worth the extra call on an already-heavy
+    write) — long headers like "Non Rotation and show up 1 day in month" were
+    getting clipped at the default column width.
 
     **`Sum Month` is a PLAIN NUMBER, not a link.** It used to be `nc.link`'d to the
     concatenation of every bucket's members — i.e. a second copy of names already
@@ -450,11 +506,33 @@ ever happens within one vendor across adjacent tabs, never across vendors.
 Where app.py's `run_sync` *threw* on a duplicate `(name,date)`, the Apps Script
 collapses it — a show-up recorded in two tabs is one show-up, not an error.
 
-Still true from the old design (the raw side is unchanged): each SOC file's `raw`
-tab has the verbatim 8-col header `Date show up | Month show up | Sub-con name |
-Name | Clock in | shift name | Shift_id | team` (RAW), always written even if
-header-only; recompute-from-scratch every run (`prepareSocSheet_` clears all 6
-tabs first and deletes strays); year derived from each row's actual date.
+Still true from the old design (the raw side is mostly unchanged): each SOC
+file's `raw` tab has the verbatim 8-col header `Date show up | Month show up |
+Sub-con name | Name | Clock in | shift name | Shift_id | team` (RAW), always
+written even if header-only; recompute-from-scratch every run (`prepareSocSheet_`
+clears all tabs first and deletes strays); year derived from each row's actual
+date. 2026-07-16 (user request "filter from the header of the table"): the raw
+tab's header row now carries a **basic filter** (`setBasicFilter`, all 8 columns,
+unbounded rows) plus `frozenRowCount: 1`, set at the END of each run after all
+appends; `prepareSocSheet_` issues `clearBasicFilter` FIRST each run — the old
+filter's range would block the shrink-to-1-row grid reset, and leftover user
+criteria must not be active during the append phase. Sheets allows ONE basic
+filter per tab, so the aspect tabs (stacks of many small tables) deliberately
+get none — filtering lives on `raw`; per-table filter VIEWS were considered and
+skipped (clunky for the audience, and they accumulate across runs).
+`prepareSocSheet_` MUST unfreeze every existing tab BEFORE shrinking it to the
+1-row baseline: run N freezes row 1 (raw tab filter) and row 1 + col 1 (aspect
+tabs, `writeSummaryTab_`), and run N+1's shrink to 1 row under a frozen row leaves
+ZERO non-frozen rows — Sheets throws "not possible to delete all non-frozen rows"
+(hit live on the 2nd sync after the freeze/filter feature landed). CRUCIAL detail
+learned the hard way: putting `frozenRowCount:0` in the SAME `updateSheetProperties`
+as `rowCount:1` does NOT work — the shrink is validated against the tab's EXISTING
+frozen count (still 1), not the merged result (this failed live twice). The
+unfreeze must be its OWN request, ordered BEFORE the resize, in the batchUpdate
+(requests apply + validate sequentially, so the standalone unfreeze runs while the
+grid is still full-size = always valid, then the shrink sees 0 frozen). So the
+request order is: clearBasicFilter → unfreeze-all-existing → resize/add → delete
+strays. Freezes are re-applied later the same run.
 
 **Durable-account requirement (handoff-critical):** the script and its daily
 trigger run as whichever Google account owns the project. That account must
@@ -469,10 +547,17 @@ current design: a full all-departments run on HALF a year's data measured 29.7 m
 live (2026-07-15, `[t]` timing logs) — **23 min (78%) of it in the read+raw-append
 phase** across the 28 vendor files, only ~7 min in all summaries+Names writes — so
 a full year would blow the ceiling. The three SOCs share nothing (separate vendor
-files in, separate central files out), so the daily schedule is three staggered
-triggers (`installTrigger`, 11:00/12:00/13:00) on thin wrappers `syncSOCN`/
-`syncSOCE`/`syncSOCW` → `runSync_(dept)` (triggers can't pass arguments; a dept in
-`RAW_DEPARTMENTS` without a wrapper is a hard error at install). Discovery stays
+files in, separate central files out), so the daily schedule is three triggers
+**all at the same hour** (`installTrigger`, `SYNC_HOUR` = 11:00) on thin wrappers
+`syncSOCN`/`syncSOCE`/`syncSOCW` → `runSync_(dept)` — they run as independent
+concurrent executions, each with its own 30-min budget and its own files, so
+there is nothing to stagger (was 11/12/13 staggered; the user asked for same-time
+2026-07-16, since each dept is a separate execution the split already made
+independent). Chaining all three into ONE execution is NOT an option — that's the
+30-min wall the split exists to avoid. The shared Google API quota is the only
+concurrency cost; `retryWrite_`/`retryRead_` absorb the extra 429s. (Triggers
+can't pass arguments; a dept in `RAW_DEPARTMENTS` without a wrapper is a hard
+error at install.) Discovery stays
 global (cheap, keeps strict validation over every title); only processing is
 filtered. `sync()` remains the manual all-departments entry (smoke tests — exceeds
 the limit on full data). Per-run work is bounded: a year's file set caps at 12
