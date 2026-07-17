@@ -1,0 +1,82 @@
+# Knowledge: Thai and Burmese Workers (SOC Worker Analysis)
+
+This document explains the SOC worker-attendance data so the chatbot can read the
+four data tables correctly. All figures come from the daily attendance records of
+the three departments; this document defines the terms, and the four tables hold
+the numbers.
+
+## Thai vs Burmese (nationality)
+
+Every worker is supplied by a staffing **vendor** (also called the "Sub-con"). Each
+vendor is classified as **Thai** or **Burmese**:
+
+- **Thai vendors:** PPO, WAS, RG, YSL, BigBoom.
+- **Every other vendor counts as Burmese** by default. (If a new vendor is Thai, it
+  is added to the Thai list; until then it is treated as Burmese.)
+
+Every number in the tables is split into a **Burmese** row and a **Thai** row —
+there is **no combined "both nationalities" row**. If a department has only Burmese
+workers, only Burmese rows appear.
+
+## Departments and teams
+
+- **Departments (SOC):** **SOCN, SOCE, SOCW**. Each is reported separately.
+- **Teams (stations), 8 in total:** **IB, CBS, mCBS, MS, OBI, OBC, OBS, OBD**.
+- **`All`** in the Team column = the whole department (all teams combined) for that
+  nationality. (Exception: the Rotation table has **no `All` row** — see below.)
+- **Two time grains**, marked by the `Grain` column: **`Month`** and **`Day`**.
+  - For a `Month` row, `Period` is a short month label (e.g. `Jun`).
+  - For a `Day` row, `Period` is a calendar date `YYYY-MM-DD` (e.g. `2026-06-05`).
+  - The `Year` column carries the year (month labels alone don't).
+  - **Consecutive is `Month` only** (there is no daily consecutive metric).
+  - **Daily rows only exist where someone was present**: if a (Team, Nationality,
+    Day) row is absent from a table, the count for that day is **zero**.
+
+## Metric definitions (one line each)
+
+- **New / Old face** — classifies only workers who stayed at **one** station that
+  month. **Old** (experienced) = one station **and ≥10 working days**; **New**
+  (inexperienced) = one station **and <10 days**. Workers who **rotated** between
+  stations that month are **excluded** here — they appear in Rotation.
+- **Show Up** — how many days each worker showed up that month, grouped into buckets:
+  **1-5, 6-10, 11-15, 16-20, 21-30** days. Each worker falls in exactly one bucket;
+  the bucket counts sum to that scope's total workers for the month.
+- **3-day Consecutive** — whether a worker worked at least **3 days in a row** at
+  least once in the month. Workers are first split by attendance (**<10** vs **>10**
+  days), then by streak history (**used to** have a ≥3-day run vs **never** did). The
+  "Active" count is the month's total workers (the <10 + >10 split).
+- **Rotation** — for a given team: **Rotation** = the worker worked more than once
+  that month AND also worked at other teams (moved around); **Non Rotation** = stayed
+  put. **"1 day"** (OneDay) = a non-rotated worker who came only a single day that
+  month. Because a worker can be counted at several teams, Rotation has **no `All`
+  department-total row** (it would double-count movers).
+
+A month-over-month change of **≥5 percentage points** is considered **notable**
+(up = improving, down = declining).
+
+## How to read the four data tables
+
+Each aspect is a separate spreadsheet file, one flat `data` table. Files are named
+plainly: **`New-Old Face`**, **`Show Up`**, **`Consecutive`**, **`Rotation`**. All
+share the first six columns: **Department, Nationality, Team, Year, Grain, Period**
+(one row per combination).
+
+- **New-Old Face** — `... | Old | New | Old% | New%`
+  - `Month` rows: Old/New = classified workers; Old%/New% = their shares.
+  - `Day` rows: Old/New = workers **present that day**, counted by their month
+    verdict (rotated workers excluded, so Old + New ≤ that day's head count).
+- **Show Up** — `... | 1-5 | 6-10 | 11-15 | 16-20 | 21-30 | Total | 1-5% | 6-10% | 11-15% | 16-20% | 21-30%`
+  - `Month` rows: the five day-count buckets, `Total` = workers that month, each `%`
+    = that bucket's share of Total.
+  - `Day` rows: the buckets and `%` columns are **blank**; `Total` = the **distinct
+    head count** present that day (you can't bucket a single day).
+- **Consecutive** (`Month` grain only) — `... | ShowUp<10 | ShowUp>10 | Active | UsedTo3day<10 | UsedTo3day>10 | Never3day<10 | Never3day>10 | UsedTo3day% | Never3day%`
+  (Active = ShowUp<10 + ShowUp>10; UsedTo3day% and Never3day% are shares of Active.)
+- **Rotation** — `... | NonRotation | Rotation | Total | OneDay | OneDay%OfNonRot | NonRotation% | Rotation%`  (**No `All` row.**)
+  - `Month` rows: Total = NonRotation + Rotation; OneDay%OfNonRot = OneDay ÷ NonRotation.
+  - `Day` rows: NonRotation/Rotation = workers **present that day** by their month
+    Reading-B status at that team; `OneDay` and `OneDay%OfNonRot` are **blank**.
+
+To answer a question, find the row(s) matching the asked Department + Nationality +
+Team + Grain + Period in the relevant table, quote the exact figure, and name that
+scope (and whether it's a monthly or daily figure).

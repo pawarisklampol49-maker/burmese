@@ -1,0 +1,540 @@
+{
+  "name": "SOC RAG Tables Sync",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Run Manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 12,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "schedule",
+      "name": "Daily 12:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Config; year derived so it rolls over automatically.\nconst year = new Date().getFullYear();\nconst sourceFolder = '1oDCnJmwIjedcHNtSyd_Hr-B5HDhZIN4K';  // READ the 3 <year>_SOC* files from here (central folder)\nconst outFolder = '1XIAfd1FKPHK9D8sCf5t5mHqZbZdp5F-X';     // WRITE the 4 output files here\nconst depts = ['SOCN', 'SOCE', 'SOCW'];\nconst socTitles = depts.map(d => year + '_' + d);\nconst nameClause = socTitles.map(t => \"name='\" + t + \"'\").join(' or ');\nconst driveQuery = \"'\" + sourceFolder + \"' in parents and trashed=false and (\" + nameClause + \")\";\nreturn [{ json: { year, sourceFolder, outFolder, depts, socTitles, driveQuery } }];\n"
+      },
+      "id": "build-config",
+      "name": "Build Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.driveQuery }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name)"
+            },
+            {
+              "name": "pageSize",
+              "value": "100"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "find-soc-files",
+      "name": "Find SOC Files",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        300
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "REPLACE_googleDriveOAuth2Api",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const cfg = $('Build Config').first().json;\nconst files = ($input.first().json.files) || [];\nif (!files.length) throw new Error('No SOC files found for ' + cfg.socTitles.join(', ') +\n  '. Check the names and that they are shared with this account, and that they live in the source folder.');\nreturn files.map(f => ({ json: { dept: String(f.name).split('_')[1] || f.name,\n  spreadsheetId: f.id, socTitle: f.name } }));\n"
+      },
+      "id": "plan-reads",
+      "name": "Plan Reads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $json.spreadsheetId }}/values:batchGet?ranges=%27New-Old%20Face%27%21A%3AZZ&ranges=%27Show%20Up%27%21A%3AZZ&ranges=%27Consecutive%27%21A%3AZZ&ranges=%27Rotation%27%21A%3AZZ&majorDimension=ROWS&valueRenderOption=FORMATTED_VALUE",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {}
+      },
+      "id": "read-aspect-tabs",
+      "name": "Read Aspect Tabs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        300
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_googleSheetsOAuth2Api",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Reshape the 4 aspect tabs (New-Old Face / Show Up / Consecutive / Rotation)\n// across the 3 SOC files into 4 flat tables for RAG. NO AI: reads only the counts\n// the appscript already computed (FORMATTED_VALUE renders each HYPERLINK count as\n// its number) and derives every percentage. Parses the MONTHLY by-team blocks AND\n// the DAILY blocks (head count / daily face / daily rotation). Anchors on SEMANTIC\n// marker cells (scope labels, 'face'/'bucket', streak labels, the rotation column\n// header, and daily 'team'+YYYY-MM-DD headers) so decoration never affects it.\n// Shift_id (NBSP-indented) rows are skipped -- team level only. Consecutive has no\n// daily grain (matches the appscript: month + week only). Throws if it parses 0\n// rows so a structural drift is loud, not a silent empty file.\nconst YEAR = $('Build Config').first().json.year;\nconst OUT_FOLDER = $('Build Config').first().json.outFolder;\n\nconst MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];\nconst MONSET = new Set(MONTHS);\nconst VIS = new Set(['IB','CBS','mCBS','MS','OBI','OBC','OBS','OBD']);\nconst BUCKETS = ['1-5','6-10','11-15','16-20','21-30'];\nconst BSET = new Set(BUCKETS);\nconst NBSP = String.fromCharCode(160);\nconst USED = 'Used to work for at least 3 consecutive days (at least one period)';\nconst NEVER = 'Never work for at least 3 consecutive days (at least one period)';\nconst ROT_COLS = ['Non Rotation','Rotation','Non Rotation and show up 1 day in month',\n  'Non Rotation and show up 1 day in month','Total','Non Rotation','Rotation'];\n\nconst S = (v) => (v == null ? '' : String(v)).trim();\nconst rawCell = (r, i) => { const v = r && r[i]; return v == null ? '' : String(v); };\nconst hasNBSP = (s) => s.indexOf(NBSP) !== -1;\nconst isMonth = (v) => MONSET.has(S(v));\nconst isDay = (v) => /^\\d{4}-\\d{2}-\\d{2}$/.test(S(v));\nconst num = (v) => { const s = S(v).replace(/,/g, ''); if (s === '' || s === '-') return 0; const n = parseInt(s, 10); return isNaN(n) ? 0 : n; };\nconst pctOf = (a, b) => b ? (Math.round(a / b * 10000) / 100) + '%' : '';\nfunction scopeParts(label) { const t = S(label).split(/\\s+/); return { team: t[0] === 'All' ? 'All' : t[0], nat: t[t.length - 1] }; }\nfunction isScope(label) { const t = S(label).split(/\\s+/); const nat = t[t.length - 1]; if (nat !== 'Burmese' && nat !== 'Thai') return false; if (t[0] === 'All') return t.length === 3; return t.length === 2 && VIS.has(t[0]); }\n\nfunction ordered() { const m = new Map(); const ks = []; return {\n  get(k) { if (!m.has(k)) { m.set(k, {}); ks.push(k); } return m.get(k); },\n  out(fn) { return ks.map(k => fn(m.get(k))); } }; }\n\n// Find every DAILY block in a tab (head count / daily face / daily rotation).\n// A daily table header is 'team' followed by YYYY-MM-DD day columns (the\n// by-category/trend blocks also start with 'team' but are followed by MONTHS, so\n// the day-key regex separates them). The block's kind comes from the nearest\n// preceding 'DAILY ...' section title. Returns [{tag, rows:[{scope, counts}]}].\nfunction dailyBlocks(values) {\n  const out = [];\n  for (let i = 0; i < values.length; i++) {\n    const r = values[i] || [];\n    if (S(r[0]) !== 'team' || !isDay(r[1])) continue;\n    let tag = 'HEADCOUNT';\n    for (let k = i - 1; k >= 0 && k >= i - 4; k--) {\n      const t = rawCell(values[k] || [], 0).toUpperCase();\n      if (t.indexOf('DAILY') !== -1) {\n        if (t.indexOf('HEAD COUNT') !== -1) tag = 'HEADCOUNT';\n        else if (t.indexOf('NON ROTATION') !== -1) tag = 'NONROT';\n        else if (t.indexOf('OLD FACE') !== -1) tag = 'OLD';\n        else if (t.indexOf('NEW FACE') !== -1) tag = 'NEW';\n        else if (t.indexOf('ROTATION') !== -1) tag = 'ROT';\n        break;\n      }\n    }\n    const cols = [];\n    for (let c = 1; c < r.length; c++) { if (isDay(r[c])) cols.push([c, S(r[c])]); }\n    const rows = [];\n    let j = i + 1;\n    for (; j < values.length; j++) {\n      const rr = values[j] || [];\n      const rawLabel = rawCell(rr, 0);\n      if (S(rawLabel) === '') break;\n      if (hasNBSP(rawLabel)) continue;      // Shift_id detail row\n      if (!isScope(rawLabel)) continue;\n      const counts = {};\n      cols.forEach(cd => { counts[cd[1]] = num(rr[cd[0]]); });\n      rows.push({ scope: rawLabel, counts: counts });\n    }\n    out.push({ tag: tag, rows: rows });\n    i = j;\n  }\n  return out;\n}\n\nfunction parseNewOld(values, dept) {\n  const A = ordered(); let scope = null, months = null;\n  for (const rr of values) { const r = rr || [];\n    if (hasNBSP(rawCell(r, 0))) continue;   // shift row -> handled by dailyBlocks / not a team block\n    const f = S(r[0]);\n    if (isScope(f)) { scope = f; months = null; continue; }\n    if (f === 'face') { const ms = r.slice(1).filter(isMonth); months = ms.length ? ms : null; continue; }\n    if ((f === 'Old' || f === 'New') && scope && months) {\n      for (let i = 0; i < months.length; i++) { const c = A.get(scope + '|' + months[i]);\n        c.scope = scope; c.month = months[i]; c[f === 'Old' ? 'old' : 'new'] = num(r[1 + i]); } } }\n  const monthly = A.out(c => { const p = scopeParts(c.scope); const o = c.old || 0, n = c.new || 0, t = o + n;\n    return [dept, p.nat, p.team, YEAR, 'Month', c.month, o, n, pctOf(o, t), pctOf(n, t)]; });\n  const D = ordered();\n  dailyBlocks(values).forEach(b => { if (b.tag !== 'OLD' && b.tag !== 'NEW') return;\n    b.rows.forEach(row => { Object.keys(row.counts).forEach(day => {\n      const c = D.get(row.scope + '|' + day); c.scope = row.scope; c.day = day;\n      c[b.tag === 'OLD' ? 'old' : 'new'] = row.counts[day]; }); }); });\n  const daily = D.out(c => { const p = scopeParts(c.scope); const o = c.old || 0, n = c.new || 0, t = o + n;\n    return [dept, p.nat, p.team, YEAR, 'Day', c.day, o, n, pctOf(o, t), pctOf(n, t)]; })\n    .filter(row => (row[6] || 0) + (row[7] || 0) > 0);\n  return monthly.concat(daily);\n}\n\nfunction parseShowUp(values, dept) {\n  const A = ordered(); let scope = null, months = null;\n  for (const rr of values) { const r = rr || [];\n    if (hasNBSP(rawCell(r, 0))) continue;\n    const f = S(r[0]);\n    if (isScope(f)) { scope = f; months = null; continue; }\n    if (f === 'bucket') { const ms = r.slice(1).filter(isMonth); months = ms.length ? ms : null; continue; }\n    if (BSET.has(f) && scope && months) {\n      for (let i = 0; i < months.length; i++) { const c = A.get(scope + '|' + months[i]);\n        c.scope = scope; c.month = months[i]; c[f] = num(r[1 + i]); } } }\n  const monthly = A.out(c => { const p = scopeParts(c.scope); const vals = BUCKETS.map(b => c[b] || 0);\n    const t = vals.reduce((a, b) => a + b, 0);\n    return [dept, p.nat, p.team, YEAR, 'Month', c.month].concat(vals, [t], BUCKETS.map(b => pctOf(c[b] || 0, t))); });\n  const daily = [];\n  dailyBlocks(values).forEach(b => { if (b.tag !== 'HEADCOUNT') return;\n    b.rows.forEach(row => { const p = scopeParts(row.scope);\n      Object.keys(row.counts).forEach(day => { const hc = row.counts[day]; if (hc <= 0) return;\n        daily.push([dept, p.nat, p.team, YEAR, 'Day', day, '', '', '', '', '', hc, '', '', '', '', '']); }); }); });\n  return monthly.concat(daily);\n}\n\nfunction parseConsecutive(values, dept) {\n  const A = ordered(); let scope = null, months = null, block = null;\n  for (const rr of values) { const r = rr || [];\n    if (hasNBSP(rawCell(r, 0))) { scope = null; continue; }   // shift sub-block -> stop until next real scope\n    const f = S(r[0]);\n    if (isScope(f)) { scope = f; block = 'plain'; months = null; continue; }\n    if (f === USED) { block = 'usedto'; continue; }\n    if (f === NEVER) { block = 'never'; continue; }\n    if (f === '') { const ms = r.slice(1).filter(isMonth); if (ms.length) months = ms; continue; }\n    if ((f === 'Show up < 10 days' || f === 'Show up > 10 days') && scope && months && block) {\n      const cells = r.slice(1, 1 + months.length);\n      if (cells.some(c => String(c == null ? '' : c).indexOf('%') !== -1)) continue;   // pct block\n      const key = block + (f === 'Show up < 10 days' ? '_lt10' : '_gt10');\n      for (let i = 0; i < months.length; i++) { const c = A.get(scope + '|' + months[i]);\n        c.scope = scope; c.month = months[i]; c[key] = num(r[1 + i]); } } }\n  return A.out(c => { const p = scopeParts(c.scope);\n    const plo = c.plain_lt10 || 0, pgt = c.plain_gt10 || 0, act = plo + pgt;\n    const ulo = c.usedto_lt10 || 0, ugt = c.usedto_gt10 || 0, nlo = c.never_lt10 || 0, ngt = c.never_gt10 || 0;\n    return [dept, p.nat, p.team, YEAR, 'Month', c.month, plo, pgt, act, ulo, ugt, nlo, ngt,\n      pctOf(ulo + ugt, act), pctOf(nlo + ngt, act)]; });\n}\n\nfunction isRotHeader(r) { if (!r) return false; for (let i = 0; i < 7; i++) { if (S(r[1 + i]) !== ROT_COLS[i]) return false; } return true; }\nfunction parseRotation(values, dept) {\n  const rows = [];\n  for (let i = 0; i < values.length; i++) { const r = values[i] || [];\n    if (!isRotHeader(r)) continue;\n    const month = S((values[i - 1] || [])[1]); if (!isMonth(month)) continue;   // weekly detail -> skip\n    let j = i + 1;\n    for (; j < values.length; j++) { const tr = values[j] || []; const rawLabel = rawCell(tr, 0);\n      if (S(rawLabel) === '') break;\n      if (hasNBSP(rawLabel)) continue;      // Shift_id row -> skip (team level only)\n      if (!isScope(rawLabel)) continue;\n      const p = scopeParts(rawLabel);\n      const nonRot = num(tr[1]), rot = num(tr[2]), one = num(tr[3]), t = nonRot + rot;\n      rows.push([dept, p.nat, p.team, YEAR, 'Month', month, nonRot, rot, t, one, pctOf(one, nonRot), pctOf(nonRot, t), pctOf(rot, t)]); }\n    i = j; }\n  const D = ordered();\n  dailyBlocks(values).forEach(b => { if (b.tag !== 'ROT' && b.tag !== 'NONROT') return;\n    b.rows.forEach(row => { Object.keys(row.counts).forEach(day => {\n      const c = D.get(row.scope + '|' + day); c.scope = row.scope; c.day = day;\n      c[b.tag === 'ROT' ? 'rot' : 'non'] = row.counts[day]; }); }); });\n  const daily = D.out(c => { const p = scopeParts(c.scope); const non = c.non || 0, rot = c.rot || 0, t = non + rot;\n    return [dept, p.nat, p.team, YEAR, 'Day', c.day, non, rot, t, '', '', pctOf(non, t), pctOf(rot, t)]; })\n    .filter(row => (row[6] || 0) + (row[7] || 0) > 0);\n  return rows.concat(daily);\n}\n\nconst H = {\n  NewOldFace: ['Department','Nationality','Team','Year','Grain','Period','Old','New','Old%','New%'],\n  ShowUp: ['Department','Nationality','Team','Year','Grain','Period','1-5','6-10','11-15','16-20','21-30','Total','1-5%','6-10%','11-15%','16-20%','21-30%'],\n  Consecutive: ['Department','Nationality','Team','Year','Grain','Period','ShowUp<10','ShowUp>10','Active','UsedTo3day<10','UsedTo3day>10','Never3day<10','Never3day>10','UsedTo3day%','Never3day%'],\n  Rotation: ['Department','Nationality','Team','Year','Grain','Period','NonRotation','Rotation','Total','OneDay','OneDay%OfNonRot','NonRotation%','Rotation%'],\n};\nconst FILE = { NewOldFace: 'New-Old Face', ShowUp: 'Show Up', Consecutive: 'Consecutive', Rotation: 'Rotation' };\n\nconst reads = $input.all();\nconst plans = $('Plan Reads').all();\nconst defs = [\n  { aspect: 'NewOldFace', idx: 0, parse: parseNewOld },\n  { aspect: 'ShowUp', idx: 1, parse: parseShowUp },\n  { aspect: 'Consecutive', idx: 2, parse: parseConsecutive },\n  { aspect: 'Rotation', idx: 3, parse: parseRotation },\n];\nlet grandTotal = 0; const seen = [];\nconst results = defs.map(d => {\n  let rows = [];\n  reads.forEach((item, i) => {\n    const dept = plans[i] ? plans[i].json.dept : ('SOC' + i);\n    const vr = (item.json && item.json.valueRanges) || [];\n    const values = (vr[d.idx] && vr[d.idx].values) || [];\n    if (d.idx === 0 && values[0]) seen.push(dept + ':' + S(values[0][0]));\n    rows = rows.concat(d.parse(values, dept));\n  });\n  grandTotal += rows.length;\n  const fileName = FILE[d.aspect];\n  return { json: { aspect: d.aspect, fileName: fileName, folderId: OUT_FOLDER,\n    fileQuery: \"'\" + OUT_FOLDER + \"' in parents and trashed=false and name='\" + fileName + \"'\",\n    values: [H[d.aspect]].concat(rows) } };\n});\nif (grandTotal === 0) throw new Error('Reshape produced 0 data rows across all 4 aspects. Read ' +\n  reads.length + ' SOC file(s); first-cell samples: ' + JSON.stringify(seen) +\n  '. Check the aspect tab names/structure and that the read range covers all columns.');\nreturn results;\n"
+      },
+      "id": "reshape",
+      "name": "Reshape",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.fileQuery }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name)"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "find-rag-file",
+      "name": "Find Output File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        300
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "REPLACE_googleDriveOAuth2Api",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.files ? $json.files.length : 0 }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      },
+      "id": "if-exists",
+      "name": "Output file exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { properties: { title: $('Reshape').item.json.fileName }, sheets: [ { properties: { title: 'data' } } ] } }}",
+        "options": {},
+        "contentType": "json"
+      },
+      "id": "create-rag-file",
+      "name": "Create Output File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1780,
+        160
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_googleSheetsOAuth2Api",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://www.googleapis.com/drive/v3/files/{{ $json.spreadsheetId }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "addParents",
+              "value": "={{ $('Reshape').item.json.folderId }}"
+            },
+            {
+              "name": "removeParents",
+              "value": "root"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "fields",
+              "value": "id,parents"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "move-into-folder",
+      "name": "Move Into Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        160
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "REPLACE_googleDriveOAuth2Api",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Both the existing-file and newly-created-file branches arrive here.\n// Process every item: the previous version used $input.item in run-once-for-all\n// mode, so all four Sheets could be created before the write step failed.\nreturn $input.all().map((item, index) => {\n  const j = item.json || {};\n  const meta = $('Reshape').itemMatching(index).json;\n  const id = j.spreadsheetId || j.id || (j.files && j.files[0] && j.files[0].id);\n  if (!id) throw new Error('Could not resolve the output file id for ' + (meta.fileName || '?'));\n  if (!Array.isArray(meta.values) || meta.values.length < 2) {\n    throw new Error('Refusing to write an empty table for ' + (meta.fileName || '?'));\n  }\n  return {\n    json: { spreadsheetId: id, fileName: meta.fileName, values: meta.values },\n    pairedItem: index,\n  };\n});\n"
+      },
+      "id": "prepare-write",
+      "name": "Prepare Write",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $('Prepare Write').item.json.spreadsheetId }}/values:batchClear",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { ranges: ['data'] } }}",
+        "options": {},
+        "contentType": "json"
+      },
+      "id": "clear-data",
+      "name": "Clear Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2440,
+        300
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_googleSheetsOAuth2Api",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $('Prepare Write').item.json.spreadsheetId }}/values:batchUpdate",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { valueInputOption: 'RAW', data: [ { range: 'data!A1', values: $('Prepare Write').item.json.values } ] } }}",
+        "options": {},
+        "contentType": "json"
+      },
+      "id": "write-data",
+      "name": "Write Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2660,
+        300
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_googleSheetsOAuth2Api",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## SOC -> 4 flat tables for RAG (no AI)\\nReads the monthly + daily numbers from the 3 `<YEAR>_SOCN/E/W` aspect tabs in the SOURCE folder and writes 4 plain Google Sheets -- **New-Old Face / Show Up / Consecutive / Rotation** -- into the OUTPUT folder, one `data` table each, for a RAG to query. Percentages computed from the counts; `Grain` = Month or Day.\\n\\n**Wire on import:** Google Drive + Google Sheets OAuth2 (no OpenAI). Confirm the source + output folder ids in `Build Config`. Run Manually to test, or leave the daily trigger.",
+        "height": 260,
+        "width": 440,
+        "color": 5
+      },
+      "id": "sticky-1",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -120
+      ]
+    }
+  ],
+  "connections": {
+    "Run Manually": {
+      "main": [
+        [
+          {
+            "node": "Build Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 12:00": {
+      "main": [
+        [
+          {
+            "node": "Build Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Config": {
+      "main": [
+        [
+          {
+            "node": "Find SOC Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find SOC Files": {
+      "main": [
+        [
+          {
+            "node": "Plan Reads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Reads": {
+      "main": [
+        [
+          {
+            "node": "Read Aspect Tabs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Aspect Tabs": {
+      "main": [
+        [
+          {
+            "node": "Reshape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reshape": {
+      "main": [
+        [
+          {
+            "node": "Find Output File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Output File": {
+      "main": [
+        [
+          {
+            "node": "Output file exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Output file exists?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Write",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Output File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Output File": {
+      "main": [
+        [
+          {
+            "node": "Move Into Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Move Into Folder": {
+      "main": [
+        [
+          {
+            "node": "Prepare Write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Write": {
+      "main": [
+        [
+          {
+            "node": "Clear Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Data": {
+      "main": [
+        [
+          {
+            "node": "Write Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateId": "soc-rag-tables-sync"
+  }
+}
