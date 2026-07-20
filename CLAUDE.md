@@ -541,37 +541,137 @@ sheets + central folder must be accessible to it. This replaces the old
 service-account/n8n-OAuth ownership risks with a single one — see
 docs/RUNBOOK.md.
 
-Scaling ceiling is now **execution time** (the Apps Script per-run limit — 6 min
-consumer / 30 min Workspace), not memory. **One department per execution** is the
-current design: a full all-departments run on HALF a year's data measured 29.7 min
-live (2026-07-15, `[t]` timing logs) — **23 min (78%) of it in the read+raw-append
-phase** across the 28 vendor files, only ~7 min in all summaries+Names writes — so
-a full year would blow the ceiling. The three SOCs share nothing (separate vendor
-files in, separate central files out), so the daily schedule is three triggers
-**all at the same hour** (`installTrigger`, `SYNC_HOUR` = 11:00) on thin wrappers
-`syncSOCN`/`syncSOCE`/`syncSOCW` → `runSync_(dept)` — they run as independent
-concurrent executions, each with its own 30-min budget and its own files, so
-there is nothing to stagger (was 11/12/13 staggered; the user asked for same-time
-2026-07-16, since each dept is a separate execution the split already made
-independent). Chaining all three into ONE execution is NOT an option — that's the
-30-min wall the split exists to avoid. The shared Google API quota is the only
-concurrency cost; `retryWrite_`/`retryRead_` absorb the extra 429s. (Triggers
-can't pass arguments; a dept in `RAW_DEPARTMENTS` without a wrapper is a hard
-error at install.) Discovery stays
-global (cheap, keeps strict validation over every title); only processing is
-filtered. `sync()` remains the manual all-departments entry (smoke tests — exceeds
-the limit on full data). Per-run work is bounded: a year's file set caps at 12
-months, so ~20 min/dept at full year is the worst case. NOT pulled (measured to be
-minor levers): cutting drill-down links — the entire summaries+Names phase is only
-~7 min — and chunk-size tuning (`writeSummaryTab_` writes in **50k-row chunks**;
-the binding limit there is the ~10MB per-REQUEST payload cap — a single
-`values.update` of a whole Names grid 500s "Internal error encountered", hit live
-after a 12-min run — NOT the 10M-cell workbook cap, which is per-file total). Every
-write still goes through `retryWrite_` (idempotent fixed-range writes, backoff
-2/4/8s) to ride out transient 500s; `readMonthTabs_` failures name the file id +
-tabs (a persistent `batchGet` 404 with a healthy metadata `get` was seen live —
-under diagnosis). If a dept run ever exceeds the limit anyway, the remaining lever
-is UrlFetchApp.fetchAll-parallelized reads (the 23 min is per-file sequential I/O).
+Scaling ceiling is **execution time** (the Apps Script per-run limit — typically
+6 min, or 30 min for some Workspace accounts), not memory. **One department per
+execution** remains mandatory; `sync()` is only a small-data smoke entry. After the
+2026-07-16 live failures, two measured bottlenecks were fixed: New/Old had repeatedly
+regrouped the entire SOC for every team/Shift_id/grain (755.9s for SOCN), so engine
+validation, nationality/team/shift slices, and monthly New/Old verdicts are now
+per-execution cached/indexed; and 12-tab `batchGet` calls could occupy the Sheets
+backend for minutes before a 503, so reads now use four-tab chunks and retry only
+the failed subset. Existing engine self-tests cover the cached month/week/day and
+Shift_id paths.
+
+**2026-07-20 SOCW live failures — per-minute quota + heavy-file 503, fixed:** two
+distinct crimes. (1) `Quota exceeded ... 'Read requests per minute per user'` thrown
+from `prepareNamesSheet_`'s `Sheets.Spreadsheets.get` — root cause: all three depts
+run as the SAME account and share ONE 60-reads/min/user quota, and the `socCtx_`
+burst (`prepareSocSheet_` + 4× `prepareNamesSheet_`, each 2 `spreadsheets.get`) was
+BOTH unwrapped by any retry AND, where wrapped, used a 1–2s backoff useless against a
+per-minute window. Fixes: `retryRead_`/`retryWrite_` are now **quota-aware**
+(`isRateLimitError_` → sleep a full `QUOTA_WAIT_MS`=60s window, not 1–2s), and every
+`prepare*` `get`/`batchUpdate`/`batchClear` is wrapped in the retry helpers.
+`appendRawRows_` is deliberately LEFT unwrapped — `values.append` is non-idempotent,
+so a retry after a partial success would DUPLICATE raw rows; a crashed append is
+instead recovered cleanly by the department-level retry (which re-clears + re-appends
+from scratch). (2) **SOCW/PPO is formula-heavy and can't be read whole.** Evidence
+across runs: PPO's tabs have the SAME ~16k-row grid as its sibling vendors (CYD/RG/
+WAS), which read a 10k-row page in ~1s — but PPO's read HANGS ~3 min then 503s. The
+difference is that PPO's "empty" rows are **dragged-down lookup formulas** (e.g. the
+team column) that evaluate on read and are NOT trimmed like true blanks, so a whole
+`A:J` (or even 10k-row) read evaluates thousands of filler cells and times out. The
+user confirmed PPO has only ~4k real rows padded out with empties. Fix in
+`readMonthTabs_`: keep the fast **four-tab `batchGet` chunk** path for every file
+(Google trims a normal vendor's empty tail for free); the moment a chunk fails,
+switch that WHOLE file to `readTabByRowPages_` — **small `ROW_PAGE`=500 pages that
+STOP once a page's tail is filler** (`rowHasData_` = ≥2 filled cells), so a formula-padded
+16k-row grid is read only through its ~4k real rows, not the filler. A first, larger
+`HEAVY_TAB_ROWS`-based routing attempt was REVERTED: the padding inflates EVERY tab's
+grid to ~16k, so grid size can't tell PPO from RG and it mis-paged the healthy
+vendors (RG 18.8s → 80.2s). Two more turns of the same fix: (a) the chunk read
+(`readChunk_`) is a **single attempt, NO retry** — a chunk that fails is a formula-
+heavy hang, and `retryRead_`'s 3 attempts just burned 3×3min=9min of hangs before
+failing over to paging (the visible "still retrying" symptom); per-PAGE retries in
+the paged path cover genuine blips. (b) a **`PAGED_VENDORS` Script Property** (seeded
+`PPO`) makes a known formula-heavy vendor skip the batch attempt ENTIRELY
+(`forcePaged` → `readMonthTabs_` starts in paged mode), so PPO never eats even the one
+exploratory 3-min hang. **Final diagnosis (don't keep tuning the reader): the PPO
+FILE is unservable by Google's Sheets API in its current state.** Even small paged
+reads return an ERRATIC mix — instant 503, 500 "Internal error," 404 "Requested
+entity was not found," some hanging 3 min, some instant — on PPO ONLY, while sibling
+vendors with the identical ~16k grid read fine. That is a backend/file problem, not a
+read-strategy problem; no chunking/paging/retry setting fixes a file the API itself
+errors on. So the pipeline is made RESILIENT instead: `runSync_` collects
+`failedFiles` and, when a vendor's read throws after its own retries, LOGS
+`[SKIPPED VENDOR]` and CONTINUES — the department's summaries are built from the
+vendors that read, rather than one bad file sinking all of SOCW. It throws only if
+EVERY file fails (systemic outage), so nothing is silently empty, and a skipped file
+does NOT schedule a department retry (retrying an unservable file is pointless). This
+is a deliberate exception to "fail fast": it tolerates an EXTERNAL infra read failure,
+never a data/schema/parse error (those still throw). The real cure remains data-side
+— **rebuild the PPO sheet** (its ~4k real rows into a fresh sheet, or delete the
+dragged-down empty formula rows) — after which it reads on the fast path like RG and
+can drop out of `PAGED_VENDORS`.
+
+**Confirmed from the actual PPO CSV (2026-07-20):** PPO's Jul tab = **1,346 real rows
+then 14,517 filler rows whose ONLY content is a literal `FALSE` in the last column J**
+(`เวลาเข้า-ออกงาน`, a formula dragged to the bottom of the grid). It is NOT a row
+limit — sibling SOCW vendors read fine at far higher REAL counts (SPT 36,498 rows in
+15s, DSR 15,991, RG 14,206, CYD 12,751). Two consequent fixes: (a) `rowHasData_` now
+requires **≥2 non-blank cells** so that lone `FALSE` doesn't read as data; (b)
+`readTabByRowPages_` stops as soon as a page's **TAIL** (last few rows) is filler —
+real rows are a contiguous top block — so PPO reads ONLY page 1 (its 1,346 rows) and
+never REQUESTS the all-filler pages below, which are the ones that 503/hang (PPO's
+page 2 = pure filler was what sank the read). Net: a live run now COMPLETES — PPO's
+data is included if page 1 reads (slow, ~5–8 min, because the 654 filler rows in page
+1 still evaluate), or it's cleanly SKIPPED (resilience) if even page 1 fails, without
+sinking SOCW. Cleaning the sheet makes it instant either way.
+
+**SpreadsheetApp read path (2026-07-20, the automatic no-manual fix that finally
+worked — LIVE-CONFIRMED).** The read METHOD is dispatched in `readVendorTabs_(f, conf)`:
+a vendor in `PAGED_VENDORS` ("known-problem file") is read via
+`readMonthTabsViaSpreadsheetApp_`; every OTHER file uses the fast values API and
+**auto-falls-back to SpreadsheetApp if it throws** (a newly-broken file self-heals, no
+config). Two backends were tried and REJECTED for PPO before this, both proven dead:
+(1) the values API (`spreadsheets.values.get`/`batchGet`) fails ERRATICALLY (500/503/
+404) on PPO regardless of page size — even a 500-row page over PPO's REAL top data
+(rows 1–500, well above the filler that starts ~row 1,347) 500s, so it is not the
+filler being evaluated, the whole FILE is unservable by that backend. (2) The CSV
+export endpoint (`docs.google.com/.../export?format=csv&gid=`, via `UrlFetchApp` +
+`ScriptApp.getOAuthToken()`) returns **HTTP 400 with Google's HTML error page** —
+root cause: the export 302-redirects to a `googleusercontent.com` download URL and
+`UrlFetchApp` DROPS the `Authorization: Bearer` header on the cross-domain hop, so the
+second request is unauthenticated (a browser export works only because its session
+COOKIES survive the redirect; a Bearer token does not). The winning path,
+`readMonthTabsViaSpreadsheetApp_`, uses `SpreadsheetApp.openById()` — the SAME backend
+the browser uses — which serves PPO where both APIs refuse, for two reasons:
+`getDisplayValues()` returns each cell's STORED computed value from the spreadsheet
+model (no whole-grid re-evaluation like values.get, the thing that times out), and
+there is no export redirect to strip auth. It reads in bounded `ROW_PAGE` pages with
+the SAME tail-filler stop as `readTabByRowPages_` (`rowHasData_` ≥2 cells), range A:J
+(10 cols, national-ID never read), `getDisplayValues` (NOT `getValues`) so the shape
+is formatted STRINGS matching the values-API `FORMATTED_VALUE` the cleaner expects
+(dates as `"09 Jul 26"`, not `Date` objects). loadRawFromValues then drops PPO's
+no-name filler rows as usual. **Live result 2026-07-20:** SOCW ran to completion with
+all 7 vendors — PPO read via SpreadsheetApp in 35.7s (12 tabs, 12,127 real rows),
+department total 5,953 workers / 97,989 rows (was 4,596 / 85,771 with PPO skipped).
+No new OAuth scope needed (SpreadsheetApp uses the existing `spreadsheets` scope), so
+NO re-authorization — the `script.external_request` scope added for the abandoned CSV
+attempt is now unused but left in `appsscript.json` (removing it would force a
+needless re-consent). This lets PPO read WITHOUT touching the sheet; cleaning it
+(delete the dragged-down formula filler rows) is still nice-to-have (faster, and lets
+PPO drop out of `PAGED_VENDORS` onto the fast values path) but no longer required.
+
+The daily schedule uses shared `SYNC_HOURS` **11:00 / 13:00 / 15:00 / 17:00**
+(project time zone). Department wrappers are **staggered within each window** by
+`SYNC_DEPT_STAGGER_MINUTES` (5) — SOCN :00, SOCE :05, SOCW :10 — so their read
+bursts don't collide in the same per-minute quota window (the root cause of the
+2026-07-20 quota crash); the quota-aware backoff above is the safety net for the
+residual overlap Apps Script's ~15-min jitter can still cause. All three wrappers run
+in every configured hour, producing 12 recurring triggers. **Changing the stagger (or
+any trigger constant) requires re-running `installTrigger()`.** Apps Script timing
+remains approximate (about +/-15 minutes). Transient 429/5xx/timeout failures schedule up
+to two automatic department retries, 20 minutes apart; retry state expires after
+90 minutes so the next regular two-hour window receives a fresh allowance.
+Triggers cannot pass arguments, so wrappers `syncSOCN`/`syncSOCE`/`syncSOCW` call
+`runDepartmentSync_(dept)`, which calls `runSync_(dept)`. A department in
+`RAW_DEPARTMENTS` without a wrapper is a hard install error. The installer keeps
+the 12 recurring triggers plus a six-trigger retry reserve within Apps Script's
+20-trigger per-user/per-script limit.
+
+`writeSummaryTab_` writes **50k-row chunks** to stay below the per-request payload
+limit, and fixed-range writes use `retryWrite_`. Discovery stays global (cheap and
+keeps strict title validation); only processing is department-filtered.
 
 ### Superseded: Render + n8n (kept for reference, retired)
 

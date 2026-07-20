@@ -38,6 +38,12 @@ function initProperties() {
     // scope into "... Burmese" / "... Thai" rows. Add a new Thai vendor here (no
     // code change); a new vendor left off the list simply counts as Burmese.
     THAI_VENDORS: 'PPO,WAS,RG,YSL,BigBoom',
+    // KNOWN-PROBLEM vendors whose sheets the values API can't serve -- their "empty"
+    // rows are dragged-down formulas that make reads hang/503/500/404 (SOCW/PPO
+    // confirmed live; CSV export 400s it too). These are read through the
+    // SpreadsheetApp service (the browser's backend), skipping the doomed values-API
+    // attempt. Any OTHER file that fails the values API also falls back automatically.
+    PAGED_VENDORS: 'PPO',
   });
   Logger.log('Script properties set.');
 }
@@ -61,7 +67,15 @@ function cfg_() {
   const thaiVendors = {};
   thaiRaw.split(',').map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean)
     .forEach(function (v) { thaiVendors[v] = true; });
-  return { folderId: folderId, departments: departments, thaiVendors: thaiVendors };
+  // KNOWN-PROBLEM vendors the values API can't serve -> read straight via the
+  // SpreadsheetApp service (readVendorTabs_). Case-insensitive on the vendor token.
+  // Unset = none: every file uses the fast values API and only falls back to
+  // SpreadsheetApp if it fails, so a newly-broken file self-heals with no config change.
+  const pagedRaw = props.getProperty('PAGED_VENDORS') || '';
+  const pagedVendors = {};
+  pagedRaw.split(',').map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean)
+    .forEach(function (v) { pagedVendors[v] = true; });
+  return { folderId: folderId, departments: departments, thaiVendors: thaiVendors, pagedVendors: pagedVendors };
 }
 
 // Burmese unless the vendor is in the Thai allowlist (user's chosen default).
@@ -127,16 +141,38 @@ function monthTabYear_(title) { return String(title).trim().split(/\s+/)[1]; }
 
 function quoted_(t) { return "'" + String(t).replace(/'/g, "''") + "'"; }
 
-// retry an idempotent read through transient Google API errors (a live 404
-// "Requested entity was not found" cleared on its own the next second -- Drive/
-// Sheets eventual consistency). Reads only: safe to repeat. Backoff 1s/2s/4s.
-function retryRead_(fn) {
+// Retry only transient Google API failures. Permanent schema/permission errors
+// should fail immediately; retrying them wastes the execution budget. A context
+// label is logged so a slow vendor/tab chunk is visible in Executions.
+function googleErrorText_(e) { return String(e && e.message ? e.message : e); }
+function isTransientGoogleError_(e) {
+  return /(service is currently unavailable|internal error|backend error|temporar|try again|rate limit|too many|quota|\b(?:429|500|502|503|504)\b|timed? out|timeout|requested entity was not found)/i
+    .test(googleErrorText_(e));
+}
+// A per-minute read/write QUOTA error ("Read requests per minute per user", 429)
+// only clears when the minute window rolls over -- a 1-2s backoff does nothing, so
+// these get a full-window sleep instead. (isTransientGoogleError_ already routes
+// them into the retry; this just picks the RIGHT wait. Confirmed live: SOCW hit
+// the per-user read quota because all three depts share one account's 60/min.)
+function isRateLimitError_(e) {
+  return /(quota exceeded|rate limit|ratelimit|user rate|too many|per minute|per user|\b429\b)/i
+    .test(googleErrorText_(e));
+}
+const QUOTA_WAIT_MS = 60000;   // one per-minute quota window
+function retryRead_(fn, context) {
   var lastErr;
-  for (var attempt = 1; attempt <= 4; attempt++) {
+  const maxAttempts = 3;
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
     try { return fn(); }
     catch (e) {
       lastErr = e;
-      if (attempt < 4) Utilities.sleep(1000 * Math.pow(2, attempt - 1));
+      if (!isTransientGoogleError_(e) || attempt >= maxAttempts) break;
+      const rate = isRateLimitError_(e);
+      const waitMs = rate ? QUOTA_WAIT_MS
+        : 1000 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 500);
+      Logger.log('[retry read ' + attempt + '/' + maxAttempts + (rate ? ' quota-wait 60s' : '') +
+        '] ' + (context || 'Google Sheets') + ': ' + googleErrorText_(e));
+      Utilities.sleep(waitMs);
     }
   }
   throw lastErr;
@@ -154,44 +190,209 @@ function retryWrite_(fn) {
     try { return fn(); }
     catch (e) {
       lastErr = e;
-      if (attempt < 4) Utilities.sleep(2000 * Math.pow(2, attempt - 1));
+      // writes have their own per-minute quota too -- wait a full window on a
+      // quota/rate error, else the usual 2s/4s/8s server-hiccup backoff.
+      if (attempt < 4) Utilities.sleep(isRateLimitError_(e) ? QUOTA_WAIT_MS : 2000 * Math.pow(2, attempt - 1));
     }
   }
   throw lastErr;
 }
 
-// read every month tab of one vendor file in a single batchGet, capped to A:J
-// (only the first ~8 columns are used -- avoids junk/wide columns). Mirrors
-// n8n Build Ranges + Batch Read and app.py _batch_get_month_tabs.
-function readMonthTabs_(fileId, yearSuffix) {
+// Read month tabs, capped to A:J (only the first ~8 columns are used). FAST PATH:
+// four-tab batchGet chunks -- Google trims each tab's trailing empty padding, so a
+// normal vendor's chunk returns just its real rows in ~1s (the ~16k-row grid these
+// exports carry is free to skip). If a chunk fails after retries, the file is
+// formula-heavy: its "empty" rows are dragged-down lookup formulas (e.g. the team
+// column) that force evaluation on read and are NOT trimmed, so a whole-range read
+// evaluates thousands of cells and hangs ~3 min -> 503 (confirmed live, SOCW/PPO,
+// where sibling vendors with the SAME 16k grid read fine). That file switches to
+// small paged reads that STOP at the end of real data.
+const READ_TABS_PER_BATCH = 4;
+const ROW_PAGE = 500;           // rows per paged read -- small so (a) each request is
+                                //  light enough to survive a flaky/formula-heavy file
+                                //  (a 10k-row PPO page hung ~3 min -> 503) and (b) the
+                                //  page where real data ends carries only a little
+                                //  filler past it (~ROW_PAGE rows), so the read stops
+                                //  close to the real data and evaluates little filler.
+const MAX_ROW_PAGES = 1000;     // safety cap when grid rowCount is unknown
+function readMonthTabs_(fileId, yearSuffix, forcePaged) {
   const meta = retryRead_(function () {
-    return Sheets.Spreadsheets.get(fileId, { fields: 'sheets.properties.title' });
-  });
+    return Sheets.Spreadsheets.get(fileId, { fields: 'sheets.properties(title,gridProperties.rowCount)' });
+  }, 'metadata ' + fileId);
   // Only this file's own year: a '[<DEPT> 2026]' file is scoped to 2026 by its
   // title, so read only its '... 26' tabs. An off-year tab (e.g. a leftover
   // 'Dec 25') belongs to a different year's file and can have stale/broken
   // structure -- confirmed live, PPO SOCW had a 'Dec 25' tab that broke header
   // detection. yearSuffix is the title's last two digits ('2026' -> '26').
+  const rowCounts = {};
+  (meta.sheets || []).forEach(function (s) {
+    rowCounts[s.properties.title] = (s.properties.gridProperties && s.properties.gridProperties.rowCount) || 0;
+  });
   const titles = (meta.sheets || [])
     .map(function (s) { return s.properties.title; })
     .filter(function (t) { return isMonthTab_(t) && monthTabYear_(t) === yearSuffix; });
   if (!titles.length) return { titles: [], valuesByTitle: {} };
-  const ranges = titles.map(function (t) { return quoted_(t) + '!A:J'; });
-  let resp;
-  try {
-    resp = retryRead_(function () {
-      return Sheets.Spreadsheets.Values.batchGet(fileId, { ranges: ranges, majorDimension: 'ROWS' });
-    });
-  } catch (e) {
-    // The metadata get() above already succeeded on this fileId, so the file EXISTS
-    // and is readable -- a 404 here is NOT "file missing". Name the file id and the
-    // exact month tabs requested so the culprit can be opened and inspected directly.
-    throw new Error('batchGet failed for spreadsheet ' + fileId + ' on tabs ' +
-      JSON.stringify(titles) + ' -- ' + e.message);
-  }
-  const vr = resp.valueRanges || [];
+
   const valuesByTitle = {};
-  titles.forEach(function (t, i) { valuesByTitle[t] = (vr[i] && vr[i].values) || []; });
+  // Once a chunk fails, the WHOLE file is treated as formula-heavy and read in pages
+  // -- no point wasting another ~3-min hang on the next doomed chunk of the same file.
+  // forcePaged (vendor in PAGED_VENDORS) skips the batch attempt entirely, so a known
+  // formula-heavy file like SOCW/PPO never eats even the one exploratory 3-min hang.
+  var paged = !!forcePaged;
+  if (paged) Logger.log('[paged mode] ' + fileId + ' -- vendor flagged PAGED_VENDORS; skipping batch chunks');
+  for (var start = 0; start < titles.length; start += READ_TABS_PER_BATCH) {
+    const chunk = titles.slice(start, start + READ_TABS_PER_BATCH);
+    if (!paged) {
+      try { readChunk_(fileId, chunk, valuesByTitle); continue; }
+      catch (e) {
+        Logger.log('[paged mode] ' + fileId + ' chunk ' + JSON.stringify(chunk) +
+          ' failed as a batch; reading this file in small row pages: ' + googleErrorText_(e));
+        paged = true;
+      }
+    }
+    chunk.forEach(function (t) { valuesByTitle[t] = readTabByRowPages_(fileId, t, rowCounts[t]); });
+  }
+  return { titles: titles, valuesByTitle: valuesByTitle };
+}
+
+// One four-tab batchGet, a SINGLE attempt (NO retry): a chunk that fails is almost
+// always a formula-heavy file whose whole-range read hangs ~3 min then 503s, and
+// retrying the same doomed read just burns more 3-min hangs (9 min for 3 attempts)
+// before we fail over to paging. Genuine transient blips are caught by the per-PAGE
+// retries in the paged path. Throws so the caller switches the whole file to paging.
+function readChunk_(fileId, chunkTitles, valuesByTitle) {
+  const resp = Sheets.Spreadsheets.Values.batchGet(fileId,
+    { ranges: chunkTitles.map(function (t) { return quoted_(t) + '!A:J'; }), majorDimension: 'ROWS' });
+  const vr = resp.valueRanges || [];
+  if (vr.length !== chunkTitles.length) {
+    throw new Error('batchGet returned ' + vr.length + ' range(s) for ' +
+      chunkTitles.length + ' requested tab(s) in spreadsheet ' + fileId +
+      ': ' + JSON.stringify(chunkTitles));
+  }
+  chunkTitles.forEach(function (t, i) { valuesByTitle[t] = (vr[i] && vr[i].values) || []; });
+}
+
+// "Real" data row = at least TWO non-blank cells. A real attendance row carries
+// date + name + shift + team + clock-in (5+ fields); padding/filler rows carry at
+// most one stray cell. Confirmed live: SOCW/PPO's July tab had 1,346 real rows then
+// 14,517 junk rows whose ONLY content was a "FALSE" (a formula dragged down the last
+// column). Keying the paged-read stop on this -- not "any non-blank cell" -- stops at
+// the end of real data instead of scanning and EVALUATING all that formula filler.
+function rowHasData_(row) {
+  var n = 0;
+  for (var i = 0; i < row.length; i++) {
+    if (String(row[i] == null ? '' : row[i]).trim() !== '' && ++n >= 2) return true;
+  }
+  return false;
+}
+// Read one tab in small row pages and concatenate, STOPPING at the end of real data.
+// These exports keep the real rows in a contiguous block at the top, then padding
+// (blank, or dragged-down formulas that evaluate to blank), so the first page with
+// NO non-blank cell means we're past the data -- crucial for a formula-heavy file
+// whose grid is ~16k but whose real rows are only a few thousand (reading the whole
+// grid would evaluate every filler formula and hang). Small pages keep each request
+// under Google's read timeout; rowCount is the hard upper bound (MAX_ROW_PAGES caps
+// it when unknown). loadRawFromValues finds the header (first page) and drops blanks.
+function readTabByRowPages_(fileId, title, rowCount) {
+  const total = rowCount && rowCount > 0 ? rowCount : ROW_PAGE * MAX_ROW_PAGES;
+  const all = [];
+  for (var startRow = 1; startRow <= total; startRow += ROW_PAGE) {
+    const endRow = Math.min(startRow + ROW_PAGE - 1, total);
+    const range = quoted_(title) + '!A' + startRow + ':J' + endRow;
+    const resp = retryRead_(function () {
+      return Sheets.Spreadsheets.Values.get(fileId, range, { majorDimension: 'ROWS' });
+    }, 'spreadsheet ' + fileId + ' tab ' + JSON.stringify(title) + ' rows ' + startRow + '-' + endRow);
+    const vals = resp.values || [];
+    if (!vals.length) break;                             // nothing returned -> done
+    for (var k = 0; k < vals.length; k++) all.push(vals[k]);
+    // Real rows are a contiguous block at the TOP; once a page's TAIL is filler (or
+    // the page is short/trimmed), the real data ended WITHIN this page -> stop, so we
+    // never even REQUEST the all-filler pages below. Those are the ones that hang/503
+    // (SOCW/PPO's real data ends at row ~1,346, and its all-filler page 2 was what
+    // 503'd and sank the whole read). Check the last few rows, not one, so a lone
+    // interior blank at a page edge can't stop early. loadRawFromValues drops the
+    // filler rows we did append.
+    var tailReal = false;
+    for (var q = Math.max(0, vals.length - 3); q < vals.length; q++) {
+      if (rowHasData_(vals[q])) { tailReal = true; break; }
+    }
+    if (!tailReal) break;                                // page tail is filler -> real data done
+    if (vals.length < endRow - startRow + 1) break;      // short (trimmed) page -> data done
+  }
+  return all;
+}
+
+// Read a vendor file's month tabs, choosing the read METHOD. A vendor flagged in
+// PAGED_VENDORS is a KNOWN problem file -- its values-API reads fail erratically
+// (SOCW/PPO: its "empty" rows are dragged-down formulas the API chokes on, 500/503)
+// AND the CSV export endpoint 400s it (the export redirects to googleusercontent and
+// UrlFetchApp drops the Bearer header on the cross-domain hop -> unauthenticated ->
+// Google's HTML error page) -- so it is read through the SpreadsheetApp service, the
+// SAME backend the browser uses, which serves the file where both APIs refuse. Every
+// OTHER file uses the fast values API and only falls back to SpreadsheetApp if that
+// throws, so a newly-broken file self-heals without any config change or manual step.
+function readVendorTabs_(f, conf) {
+  const yy = f.year.slice(-2);
+  if (conf.pagedVendors[String(f.vendor).toUpperCase()]) {
+    Logger.log('[spreadsheetapp read] ' + f.dept + '/' + f.vendor + " ('" + f.name +
+      "') flagged in PAGED_VENDORS -- reading via SpreadsheetApp (browser backend)");
+    return readMonthTabsViaSpreadsheetApp_(f.id, yy);
+  }
+  try {
+    return readMonthTabs_(f.id, yy, false);
+  } catch (e) {
+    Logger.log('[spreadsheetapp fallback] ' + f.dept + '/' + f.vendor + " ('" + f.name +
+      "'): values API failed (" + e.message + ') -- retrying via SpreadsheetApp');
+    return readMonthTabsViaSpreadsheetApp_(f.id, yy);
+  }
+}
+
+// Read month tabs via the SpreadsheetApp service (SpreadsheetApp.openById), NOT the
+// Sheets API v4 and NOT the CSV export URL. This is the same backend the browser uses
+// to open the file, so it serves files both other paths reject (SOCW/PPO: values API
+// 500/503, CSV export 400). Two reasons it works where they don't: (1) getDisplayValues
+// returns each cell's STORED computed value from the spreadsheet model -- it does not
+// re-evaluate the whole grid on read the way values.get does, which is what times out
+// the formula-heavy file; (2) there is no export redirect, so nothing strips auth.
+// getDisplayValues (not getValues) returns formatted STRINGS, matching the values-API
+// FORMATTED_VALUE shape the cleaner expects (dates as "09 Jul 26", not Date objects).
+// Rows are read in bounded ROW_PAGE pages with the SAME tail-filler stop as
+// readTabByRowPages_, so a formula-padded 16k-row grid is read only through its real
+// top block; the range is A:J (10 cols), so the national-ID column is never read.
+// loadRawFromValues then finds the header and drops the filler/blank/no-name rows.
+function readMonthTabsViaSpreadsheetApp_(fileId, yearSuffix) {
+  const ss = retryRead_(function () { return SpreadsheetApp.openById(fileId); }, 'open ' + fileId);
+  const sheets = ss.getSheets().filter(function (sh) {
+    const t = sh.getName();
+    return isMonthTab_(t) && monthTabYear_(t) === yearSuffix;
+  });
+  if (!sheets.length) return { titles: [], valuesByTitle: {} };
+  const valuesByTitle = {};
+  const titles = [];
+  sheets.forEach(function (sh) {
+    const title = sh.getName();
+    const maxRows = sh.getMaxRows();
+    const all = [];
+    for (var startRow = 1; startRow <= maxRows; startRow += ROW_PAGE) {
+      const numRows = Math.min(ROW_PAGE, maxRows - startRow + 1);
+      const vals = retryRead_(function () {
+        return sh.getRange(startRow, 1, numRows, 10).getDisplayValues();
+      }, 'SpreadsheetApp ' + fileId + ' tab ' + JSON.stringify(title) + ' rows ' +
+        startRow + '-' + (startRow + numRows - 1));
+      for (var k = 0; k < vals.length; k++) all.push(vals[k]);
+      // Real rows are a contiguous block at the TOP; once a page's TAIL is filler the
+      // real data ended within this page -> stop, so a 16k-row formula-padded grid is
+      // read only through its ~few-thousand real rows. loadRawFromValues drops the
+      // filler rows we did append.
+      var tailReal = false;
+      for (var q = Math.max(0, vals.length - 3); q < vals.length; q++) {
+        if (rowHasData_(vals[q])) { tailReal = true; break; }
+      }
+      if (!tailReal) break;
+    }
+    valuesByTitle[title] = all;
+    titles.push(title);
+  });
   return { titles: titles, valuesByTitle: valuesByTitle };
 }
 
@@ -258,7 +459,9 @@ function prepareSocSheet_(ss) {
   const keep = {};
   allTitles.forEach(function (t) { keep[t] = true; });
 
-  const meta = Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  const meta = retryRead_(function () {
+    return Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  }, 'prepareSoc meta ' + id);
   const existing = {};   // title -> sheetId
   (meta.sheets || []).forEach(function (s) { existing[s.properties.title] = s.properties.sheetId; });
 
@@ -314,18 +517,20 @@ function prepareSocSheet_(ss) {
   Object.keys(existing).forEach(function (t) {
     if (!keep[t]) requests.push({ deleteSheet: { sheetId: existing[t] } });
   });
-  if (requests.length) Sheets.Spreadsheets.batchUpdate({ requests: requests }, id);
+  if (requests.length) retryWrite_(function () { return Sheets.Spreadsheets.batchUpdate({ requests: requests }, id); });
 
   // clear all tabs, then write the raw header (RAW so IDs aren't reinterpreted)
-  Sheets.Spreadsheets.Values.batchClear({ ranges: allTitles.map(quoted_) }, id);
-  Sheets.Spreadsheets.Values.batchUpdate({
+  retryWrite_(function () { return Sheets.Spreadsheets.Values.batchClear({ ranges: allTitles.map(quoted_) }, id); });
+  retryWrite_(function () { return Sheets.Spreadsheets.Values.batchUpdate({
     valueInputOption: 'RAW',
     data: [{ range: quoted_(RAW_TAB) + '!A1', values: [RAW_TAB_HEADER] }],
-  }, id);
+  }, id); });
 
   // re-fetch to capture sheetIds of any just-added tabs (needed to resize the
   // aspect tabs at write time).
-  const meta2 = Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  const meta2 = retryRead_(function () {
+    return Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  }, 'prepareSoc meta2 ' + id);
   const sheetIds = {};
   (meta2.sheets || []).forEach(function (s) { sheetIds[s.properties.title] = s.properties.sheetId; });
   return sheetIds;
@@ -338,7 +543,9 @@ function prepareSocSheet_(ss) {
 function prepareNamesSheet_(ss) {
   const id = ss.getId();
   SpreadsheetApp.flush();   // commit the create/move first
-  const meta = Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  const meta = retryRead_(function () {
+    return Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  }, 'prepareNames meta ' + id);
   const existing = {};
   (meta.sheets || []).forEach(function (s) { existing[s.properties.title] = s.properties.sheetId; });
 
@@ -354,10 +561,12 @@ function prepareNamesSheet_(ss) {
   Object.keys(existing).forEach(function (t) {
     if (t !== NAMES_TAB) requests.push({ deleteSheet: { sheetId: existing[t] } });
   });
-  if (requests.length) Sheets.Spreadsheets.batchUpdate({ requests: requests }, id);
-  Sheets.Spreadsheets.Values.batchClear({ ranges: [quoted_(NAMES_TAB)] }, id);
+  if (requests.length) retryWrite_(function () { return Sheets.Spreadsheets.batchUpdate({ requests: requests }, id); });
+  retryWrite_(function () { return Sheets.Spreadsheets.Values.batchClear({ ranges: [quoted_(NAMES_TAB)] }, id); });
 
-  const meta2 = Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  const meta2 = retryRead_(function () {
+    return Sheets.Spreadsheets.get(id, { fields: 'sheets.properties(sheetId,title)' });
+  }, 'prepareNames meta2 ' + id);
   let gid = null;
   (meta2.sheets || []).forEach(function (s) { if (s.properties.title === NAMES_TAB) gid = s.properties.sheetId; });
   return gid;
@@ -454,14 +663,25 @@ function isAllScope_(scope) { return /^All /.test(scope); }
 // "All <DEPT> Thai", "IB Burmese", "IB Thai", ... A base/nationality pair with no
 // rows is skipped, so a Burmese-only SOC shows no empty Thai blocks.
 const NATIONALITIES = ['Burmese', 'Thai'];   // display order, Burmese first
+const NATIONALITY_INDEX_CACHE_ = new WeakMap();
+
+function nationalityIndex_(slim) {
+  let idx = NATIONALITY_INDEX_CACHE_.get(slim);
+  if (idx) return idx;
+  idx = {};
+  slim.forEach(function (r) {
+    (idx[r.nationality] = idx[r.nationality] || []).push(r);
+  });
+  NATIONALITY_INDEX_CACHE_.set(slim, idx);
+  return idx;
+}
 
 function presentNationalities_(slim) {
-  const seen = {};
-  slim.forEach(function (r) { seen[r.nationality] = true; });
-  return NATIONALITIES.filter(function (n) { return seen[n]; });
+  const idx = nationalityIndex_(slim);
+  return NATIONALITIES.filter(function (n) { return idx[n] && idx[n].length; });
 }
 function filterNat_(slim, nat) {
-  return slim.filter(function (r) { return r.nationality === nat; });
+  return nationalityIndex_(slim)[nat] || [];
 }
 
 // base scopes (All <DEPT> + each visible team) x present nationalities ->
@@ -495,14 +715,28 @@ function natScopes_(slim, teams, allLabel) {
 const SHIFT_INDENT = '\u00A0\u00A0\u00A0';   // three non-breaking spaces (survive USER_ENTERED trimming)
 function shiftKey_(r) { return r.shift_id == null ? '' : String(r.shift_id).trim(); }   // == engine normShift
 function shiftLabel_(sid) { return SHIFT_INDENT + (sid || '(no Shift_id)'); }
+const SHIFT_INDEX_CACHE_ = new WeakMap();
+
+function shiftIndex_(natSlim) {
+  let idx = SHIFT_INDEX_CACHE_.get(natSlim);
+  if (idx) return idx;
+  idx = { idsByTeam: {}, rowsByTeamShift: {} };
+  natSlim.forEach(function (r) {
+    const sid = shiftKey_(r);
+    (idx.idsByTeam[r.team] = idx.idsByTeam[r.team] || {})[sid] = true;
+    const key = r.team + SEP + sid;
+    (idx.rowsByTeamShift[key] = idx.rowsByTeamShift[key] || []).push(r);
+  });
+  SHIFT_INDEX_CACHE_.set(natSlim, idx);
+  return idx;
+}
+
 function shiftIdsOf_(natSlim, team) {
   if (team == null) return [];   // shift rows only hang under a team scope
-  const seen = {};
-  natSlim.forEach(function (r) { if (r.team === team) seen[shiftKey_(r)] = true; });
-  return Object.keys(seen).sort();
+  return Object.keys(shiftIndex_(natSlim).idsByTeam[team] || {}).sort();
 }
 function shiftSlice_(natSlim, team, sid) {
-  return natSlim.filter(function (r) { return r.team === team && shiftKey_(r) === sid; });
+  return shiftIndex_(natSlim).rowsByTeamShift[team + SEP + sid] || [];
 }
 
 // team x nationality rows for the Rotation tab (which has no All scope), interleaved
@@ -1488,22 +1722,62 @@ function writeSummaryTab_(ss, sheetId, tabName, grid, inputOption, formats) {
 }
 
 // ------------------------------------------------------------------ main sync
-// ONE DEPARTMENT PER EXECUTION. Measured live (2026-07-15, half-year data): a full
-// all-departments sync took 29.7 min -- 23 min of it reading the 28 vendor files +
-// appending raw rows, ~7 min summaries -- so a full year would blow the ~30-min
-// execution ceiling. The three SOCs share nothing (separate vendor files in,
-// separate central files out), so the daily schedule runs one dept per execution
-// (~1/3 the work, and bounded: a year's file set caps at 12 months). Triggers
-// can't pass arguments, so each dept gets a thin named wrapper; installTrigger()
-// installs one daily trigger per department, ALL AT THE SAME HOUR -- they run as
-// independent concurrent executions (separate 30-min budgets, separate files in
-// and out, no shared writes), so there is nothing to stagger. The Google API
-// quota is the only shared resource; retryWrite_/retryRead_ ride out the extra
-// 429s from tripled concurrent call volume.
-const SYNC_HOUR = 11;   // daily run hour, project time zone (all three depts)
-function syncSOCN() { return runSync_('SOCN'); }
-function syncSOCE() { return runSync_('SOCE'); }
-function syncSOCW() { return runSync_('SOCW'); }
+// ONE DEPARTMENT PER EXECUTION. Every department runs in each requested daily
+// window, but STAGGERED by a few minutes so their bursts of Sheets reads don't
+// land in the same per-minute window: all three depts run as the SAME account and
+// share ONE per-user read quota (60/min), so firing them together tripped
+// "Read requests per minute per user" live (SOCW). SOCN :00, SOCE :05, SOCW :10.
+// Apps Script still jitters the real start ~15 min, so this is a probability
+// reduction, not a guarantee -- the quota-aware backoff in retryRead_/retryWrite_
+// is the actual safety net. Thin wrappers are required because triggers cannot
+// pass a department argument.
+const SYNC_HOURS = [11, 13, 15, 17];                  // project time zone
+const SYNC_NEAR_MINUTE = 0;
+const SYNC_DEPT_STAGGER_MINUTES = 5;                  // spacing between departments in a window
+const SYNC_RETRY_DELAY_MINUTES = 20;
+const MAX_TRANSIENT_SYNC_RETRIES = 2;
+const SYNC_RETRY_WINDOW_MINUTES = 90;
+const APPS_SCRIPT_TRIGGER_LIMIT = 20;                 // per user, per script
+
+function syncRetryKey_(dept) { return 'SYNC_RETRY_STATE_' + dept; }
+
+function scheduleTransientSyncRetry_(dept, error) {
+  const props = PropertiesService.getScriptProperties();
+  const key = syncRetryKey_(dept);
+  const now = Date.now();
+  let state = {};
+  try { state = JSON.parse(props.getProperty(key) || '{}'); } catch (ignore) { state = {}; }
+  // Keep the retry allowance inside one scheduled window. The next regular run
+  // (two hours later) receives a fresh allowance even if this window exhausted it.
+  const fresh = state.updatedAt &&
+    now - state.updatedAt < SYNC_RETRY_WINDOW_MINUTES * 60 * 1000;
+  const count = fresh ? (Number(state.count) || 0) + 1 : 1;
+  if (count > MAX_TRANSIENT_SYNC_RETRIES) {
+    Logger.log('[retry sync] ' + dept + ' exhausted ' + MAX_TRANSIENT_SYNC_RETRIES +
+      ' automatic retries: ' + googleErrorText_(error));
+    return;
+  }
+  props.setProperty(key, JSON.stringify({ count: count, updatedAt: now }));
+  ScriptApp.newTrigger('sync' + dept).timeBased()
+    .after(SYNC_RETRY_DELAY_MINUTES * 60 * 1000).create();
+  Logger.log('[retry sync] scheduled ' + dept + ' retry ' + count + '/' +
+    MAX_TRANSIENT_SYNC_RETRIES + ' in ' + SYNC_RETRY_DELAY_MINUTES + ' minutes.');
+}
+
+function runDepartmentSync_(dept) {
+  try {
+    const result = runSync_(dept);
+    PropertiesService.getScriptProperties().deleteProperty(syncRetryKey_(dept));
+    return result;
+  } catch (e) {
+    if (isTransientGoogleError_(e)) scheduleTransientSyncRetry_(dept, e);
+    throw e;
+  }
+}
+
+function syncSOCN() { return runDepartmentSync_('SOCN'); }
+function syncSOCE() { return runDepartmentSync_('SOCE'); }
+function syncSOCW() { return runDepartmentSync_('SOCW'); }
 
 // manual all-departments run (smoke tests / small data). The daily schedule uses
 // the per-dept wrappers above -- on full data this one exceeds the execution limit.
@@ -1552,14 +1826,25 @@ function runSync_(deptFilter) {
     return socData[k];
   }
 
+  // One vendor file that Google's API cannot serve -- persistent 503/500/404 AFTER
+  // the read's own retries, an EXTERNAL backend problem with THAT file, not our logic
+  // (confirmed live for SOCW/PPO, whose identical sibling vendors read fine) -- must
+  // not sink the whole department. Skip it LOUDLY and keep going; the summaries are
+  // built from the vendors that read. A DATA error (schema/parse) still throws below
+  // -- this tolerance is ONLY for the infra read failure. If EVERY file fails we throw
+  // after the loop (systemic outage, not one bad file), so nothing is silently empty.
+  const failedFiles = [];
   files.forEach(function (f) {
     const tf = Date.now();
     let read;
     try {
-      read = readMonthTabs_(f.id, f.year.slice(-2));
+      read = readVendorTabs_(f, conf);
     } catch (e) {
-      throw new Error("reading '" + f.name + "' (id=" + f.id + ", dept=" + f.dept +
-        ", vendor=" + f.vendor + "): " + e.message);
+      Logger.log("[SKIPPED VENDOR] Google's API could not serve '" + f.name + "' (id=" +
+        f.id + ", dept=" + f.dept + ", vendor=" + f.vendor + ") after retries: " + e.message +
+        " -- continuing WITHOUT it. Rebuild/clean this sheet to include its data.");
+      failedFiles.push(f.vendor + " ('" + f.name + "')");
+      return;   // skip this unservable file, keep the rest of the department
     }
     if (!read.titles.length) {
       throw new Error("'" + f.name + "' (dept=" + f.dept + ", vendor=" + f.vendor +
@@ -1607,6 +1892,15 @@ function runSync_(deptFilter) {
     Logger.log('[t] ' + f.dept + '/' + f.vendor + ': ' + read.titles.length + ' tabs, ' +
       fileRows + ' rows, ' + ((Date.now() - tf) / 1000).toFixed(1) + 's @ ' + since_());
   });
+
+  if (failedFiles.length) {
+    Logger.log('[SKIPPED ' + failedFiles.length + ' of ' + files.length +
+      ' vendor file(s)] ' + failedFiles.join('; ') + ' -- summaries below EXCLUDE them.');
+    if (failedFiles.length === files.length) {
+      throw new Error('every vendor file failed to read' + (deptFilter ? ' for ' + deptFilter : '') +
+        ' -- likely a systemic Google API outage, not one bad file: ' + failedFiles.join('; '));
+    }
+  }
 
   // per (year, dept): dedup the slim slice, then for each aspect write its summary
   // tab (to the MAIN file; its counts are cross-file links into that aspect's own
@@ -1682,7 +1976,7 @@ function dryRun() {
   const files = discoverFiles_(conf.departments, conf.thaiVendors);
   const report = [];
   files.forEach(function (f) {
-    const read = readMonthTabs_(f.id, f.year.slice(-2));
+    const read = readVendorTabs_(f, conf);
     let rows = 0;
     read.titles.forEach(function (t) {
       const v = read.valuesByTitle[t];
@@ -1820,25 +2114,58 @@ function createYearSheet(year) {
   return ss.getId();
 }
 
-// install (idempotently) ONE daily time-based trigger PER DEPARTMENT, staggered
-// an hour apart (11:00 / 12:00 / 13:00) -- a full all-departments sync exceeds
-// the execution-time limit on full data, so each dept runs in its own execution
-// (see the note above runSync_). Deletes any previous sync/syncDEPT triggers
-// first. Departments come from RAW_DEPARTMENTS; each must have a syncDEPT
-// wrapper (triggers can't pass arguments), so a dept without one is a hard
-// error here, not a silent no-trigger.
+// Install (idempotently) one trigger per department per requested daily hour.
+// A full all-departments sync exceeds the execution-time limit on full data, so
+// each dept still runs in its own execution (see the note above runSync_). This
+// creates 12 recurring triggers for the default 3 departments x 4 hours. Deletes
+// any previous sync/syncDEPT triggers first. Departments come from
+// RAW_DEPARTMENTS; each must have a syncDEPT wrapper (triggers can't pass
+// arguments), so a dept without one is a hard error here, not a silent no-trigger.
 function installTrigger() {
   const conf = cfg_();
-  ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (/^sync/.test(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
+  if (!Array.isArray(SYNC_HOURS) || !SYNC_HOURS.length) {
+    throw new Error('SYNC_HOURS must contain at least one hour');
+  }
+  const uniqueHours = Array.from(new Set(SYNC_HOURS));
+  uniqueHours.forEach(function (hour) {
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
+      throw new Error('invalid hour in SYNC_HOURS: ' + hour);
+    }
   });
+
   conf.departments.forEach(function (d) {
     const fn = 'sync' + d;
     if (typeof globalThis[fn] !== 'function') {
       throw new Error("no trigger wrapper '" + fn + "' for department '" + d +
-        "' -- add `function " + fn + "() { return runSync_('" + d + "'); }` to Code.gs");
+        "' -- add `function " + fn + "() { return runDepartmentSync_('" + d + "'); }` to Code.gs");
     }
-    ScriptApp.newTrigger(fn).timeBased().everyDays(1).atHour(SYNC_HOUR).create();
-    Logger.log('Daily trigger installed: ' + fn + '() ~' + SYNC_HOUR + ':00 (project time zone).');
   });
+
+  const existing = ScriptApp.getProjectTriggers();
+  const nonSyncCount = existing.filter(function (t) {
+    return !/^sync/.test(t.getHandlerFunction());
+  }).length;
+  const recurringCount = conf.departments.length * uniqueHours.length;
+  const retryReserve = conf.departments.length * MAX_TRANSIENT_SYNC_RETRIES;
+  if (nonSyncCount + recurringCount + retryReserve > APPS_SCRIPT_TRIGGER_LIMIT) {
+    throw new Error('not enough Apps Script trigger slots: ' + nonSyncCount +
+      ' non-sync + ' + recurringCount + ' recurring sync + ' + retryReserve +
+      ' retry reserve exceeds ' + APPS_SCRIPT_TRIGGER_LIMIT);
+  }
+
+  existing.forEach(function (t) {
+    if (/^sync/.test(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
+  });
+  conf.departments.forEach(function (d, di) {
+    const fn = 'sync' + d;
+    const deptMinute = (SYNC_NEAR_MINUTE + di * SYNC_DEPT_STAGGER_MINUTES) % 60;
+    uniqueHours.forEach(function (hour) {
+      ScriptApp.newTrigger(fn).timeBased().everyDays(1).atHour(hour)
+        .nearMinute(deptMinute).create();
+      Logger.log('Daily trigger installed: ' + fn + '() around ' + hour + ':' +
+        ('0' + deptMinute).slice(-2) + ' (project time zone; Apps Script timing is approximate).');
+    });
+  });
+  Logger.log('Installed ' + recurringCount + ' recurring sync triggers; reserved ' +
+    retryReserve + ' slots for transient retries.');
 }

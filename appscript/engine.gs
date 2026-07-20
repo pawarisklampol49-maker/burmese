@@ -376,8 +376,19 @@ function loadRawFromValues(grid) {
 }
 
 // ------------------------------------------------------------------ core engine
+// A full SOC can contain hundreds of thousands of clean rows. The renderers ask
+// the same engine functions for All/team/Shift_id views, so re-validating and
+// re-filtering the full array for every view turns a linear calculation into
+// minutes of repeated work. These caches live only for the current execution;
+// WeakMap/WeakSet keys do not keep old row arrays alive between runs.
+const PREPARED_ROWS_ = new WeakSet();
+const SCOPE_ROWS_CACHE_ = new WeakMap();
+const NEWOLD_BASE_CACHE_ = new WeakMap();
+const NEWOLD_MEMBERS_CACHE_ = new WeakMap();
+
 function prepare(rows) {
   // rows: [{name, date:makeDate, team, ...}]. Validates uniqueness of (name,date).
+  if (PREPARED_ROWS_.has(rows)) return rows;
   const seen = new Set();
   for (const r of rows) {
     if (r.name == null || r.date == null || r.team == null) {
@@ -387,7 +398,34 @@ function prepare(rows) {
     if (seen.has(k)) throw new Error("duplicate (name,date) rows -- clean set must be one row per worker per day");
     seen.add(k);
   }
+  PREPARED_ROWS_.add(rows);
   return rows;
+}
+
+// Index one clean array into team and team+Shift_id slices in a single pass.
+// Callers receive the original row objects, so representative-row/drill-down
+// behavior is identical to Array.filter; only the repeated scans disappear.
+function scopeRows_(rows, team, shiftId) {
+  const d = prepare(rows);
+  if (team == null && shiftId == null) return d;
+  let idx = SCOPE_ROWS_CACHE_.get(d);
+  if (!idx) {
+    idx = { byTeam: new Map(), byTeamShift: new Map() };
+    for (const r of d) {
+      if (!idx.byTeam.has(r.team)) idx.byTeam.set(r.team, []);
+      idx.byTeam.get(r.team).push(r);
+      const k = r.team + SEP + normShift(r.shift_id);
+      if (!idx.byTeamShift.has(k)) idx.byTeamShift.set(k, []);
+      idx.byTeamShift.get(k).push(r);
+    }
+    SCOPE_ROWS_CACHE_.set(d, idx);
+  }
+  if (team == null) {
+    return d.filter((r) => normShift(r.shift_id) === shiftId);
+  }
+  return shiftId == null
+    ? (idx.byTeam.get(team) || [])
+    : (idx.byTeamShift.get(team + SEP + shiftId) || []);
 }
 
 function maxConsecutiveRun(dayNums) {
@@ -425,7 +463,7 @@ function groupBy(rows, keyFn) {
 
 // distinct show-up days per (month, worker)
 function daysPerMonthWorker(d, team) {
-  const x = team == null ? d : d.filter((r) => r.team === team);
+  const x = scopeRows_(d, team);
   const g = groupBy(x, (r) => r.date.month + SEP + r.name);
   const out = [];
   for (const rs of g.values()) {
@@ -546,13 +584,28 @@ function newOldFace_(rs) {
   const days = new Set(rs.map((r) => r.date.key)).size;
   return days >= NEWOLD_MIN_DAYS ? "Old" : "New";
 }
-function newOldMonthly(rows, team) {
+
+// Compute the expensive whole-month verdict once per nationality slice. Every
+// New/Old view (month/week/day, All/team/shift) must use this same verdict.
+function newOldBase_(rows) {
   const d = prepare(rows);
-  const g = groupBy(d, (r) => r.date.month + SEP + r.name);   // ALL teams -- need the full month
+  let base = NEWOLD_BASE_CACHE_.get(d);
+  if (base) return base;
+  const groups = groupBy(d, (r) => r.date.month + SEP + r.name);
+  const face = new Map();
+  for (const [k, rs] of groups) face.set(k, newOldFace_(rs));
+  base = { rows: d, groups: groups, face: face };
+  NEWOLD_BASE_CACHE_.set(d, base);
+  return base;
+}
+
+function newOldMonthly(rows, team) {
+  const base = newOldBase_(rows);
+  const g = base.groups;   // ALL teams -- need the full month
   const raw = {};   // month -> {Old, New}
-  for (const rs of g.values()) {
+  for (const [k, rs] of g) {
     if (team != null && !rs.some((r) => r.team === team)) continue;   // scope: present at T
-    const face = newOldFace_(rs);
+    const face = base.face.get(k);
     if (face == null) continue;   // rotated -> excluded
     const month = rs[0].date.month;
     const cell = (raw[month] = raw[month] || { Old: 0, New: 0 });
@@ -639,7 +692,7 @@ function normShift(v) { return String(v == null ? "" : v).trim(); }
 // worker); a worker with days outside 1-30 lands in no bucket (matches the count).
 function showupMembers(rows, team) {
   const d = prepare(rows);
-  const x = team == null ? d : d.filter((r) => r.team === team);
+  const x = scopeRows_(d, team);
   const g = groupBy(x, (r) => r.date.month + SEP + r.name);
   const out = {};
   for (const rs of g.values()) {
@@ -661,19 +714,26 @@ function showupMembers(rows, team) {
 // "present at team T on shift S" -- same presence-only semantics.
 // members.length === newOldMonthly's counts (self-tested).
 function newOldMembers(rows, team, shiftId) {
-  const d = prepare(rows);
-  const g = groupBy(d, (r) => r.date.month + SEP + r.name);
+  const base = newOldBase_(rows);
+  const d = base.rows;
+  let cache = NEWOLD_MEMBERS_CACHE_.get(d);
+  if (!cache) { cache = new Map(); NEWOLD_MEMBERS_CACHE_.set(d, cache); }
+  const cacheKey = String(team == null ? '*' : team) + SEP +
+                   String(shiftId == null ? '*' : shiftId);
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
+  const g = base.groups;
   const inScope = (r) => (team == null || r.team === team) &&
                          (shiftId == null || normShift(r.shift_id) === shiftId);
   const out = {};
-  for (const rs of g.values()) {
+  for (const [k, rs] of g) {
     if ((team != null || shiftId != null) && !rs.some(inScope)) continue;
-    const face = newOldFace_(rs);
+    const face = base.face.get(k);
     if (face == null) continue;   // rotated -> excluded
     const ml = monthLabel(rs[0].date.month);
     const repRows = (team == null && shiftId == null) ? rs : rs.filter(inScope);
     (out[ml] = out[ml] || { Old: [], New: [] })[face].push(pickRep(repRows));
   }
+  cache.set(cacheKey, out);
   return out;
 }
 
@@ -682,7 +742,7 @@ function newOldMembers(rows, team, shiftId) {
 // (same days/run as workerMonthStats) so a representative row is kept per member.
 function streakMonthMembers(rows, team) {
   const d = prepare(rows);
-  const x = team == null ? d : d.filter((r) => r.team === team);
+  const x = scopeRows_(d, team);
   const g = groupBy(x, (r) => r.date.month + SEP + r.name);
   const out = {};
   for (const rs of g.values()) {
@@ -710,7 +770,7 @@ function streakMonthMembers(rows, team) {
 function streakWeekMembers(rows, team, minRun) {
   minRun = minRun || 3;
   const d = prepare(rows);
-  const x = team == null ? d : d.filter((r) => r.team === team);
+  const x = scopeRows_(d, team);
   const g = groupBy(x, (r) => r.date.iso.year + SEP + r.date.iso.week);
   const out = {};
   for (const rs of g.values()) {
@@ -808,7 +868,7 @@ function attendanceMembers(rows, period) {
 // sum for a week equals that week's distinct-worker head count.
 function showupWeekMembers(rows, team) {
   const d = prepare(rows);
-  const x = team == null ? d : d.filter((r) => r.team === team);
+  const x = scopeRows_(d, team);
   const g = groupBy(x, (r) => r.date.iso.year + SEP + r.date.iso.week + SEP + r.name);
   const out = {};
   for (const rs of g.values()) {
@@ -832,15 +892,12 @@ function showupWeekMembers(rows, team) {
 // cross-month grain): the verdict of the month of the worker's EARLIEST show-up
 // in that week decides -- affects boundary weeks only.
 function newOldPresence(rows, period, team, shiftId) {
-  const d = prepare(rows);
-  const face = {};   // month+SEP+name -> "Old"|"New"|null, over ALL teams
-  for (const [k, rs] of groupBy(d, (r) => r.date.month + SEP + r.name)) face[k] = newOldFace_(rs);
-  let x = team == null ? d : d.filter((r) => r.team === team);
-  if (shiftId != null) x = x.filter((r) => normShift(r.shift_id) === shiftId);
+  const base = newOldBase_(rows);
+  const x = scopeRows_(base.rows, team, shiftId);
   const out = {};
   for (const rs of groupBy(x, (r) => periodKey(r.date, period) + SEP + r.name).values()) {
     const rep = pickRep(rs);
-    const f = face[rep.date.month + SEP + rep.name];
+    const f = base.face.get(rep.date.month + SEP + rep.name);
     if (f == null) continue;   // rotated that month -> the Rotation tab's turf
     const label = periodLabel(periodKey(rep.date, period), period);
     (out[label] = out[label] || { Old: [], New: [] })[f].push(rep);
@@ -871,7 +928,7 @@ function rotationPresenceDay(rows) {
 }
 
 function workerMonthStats(d, team) {
-  const x = team == null ? d : d.filter((r) => r.team === team);
+  const x = scopeRows_(d, team);
   const g = groupBy(x, (r) => r.date.month + SEP + r.name);
   const out = [];
   for (const rs of g.values()) {
@@ -908,7 +965,7 @@ function streakMonthCrosstab(rows, team) {
 function streakWeek(rows, team, minRun) {
   minRun = minRun || 3;
   const d = prepare(rows);
-  const x = team == null ? d : d.filter((r) => r.team === team);
+  const x = scopeRows_(d, team);
   const g = groupBy(x, (r) => r.date.iso.year + SEP + r.date.iso.week);
   const out = [];
   for (const rs of g.values()) {
