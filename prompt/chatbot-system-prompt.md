@@ -33,6 +33,8 @@ Retrieve relevant information from the knowledge-base context supplied with this
 - Filter using the requested `Department`, `Nationality`, `Team`, `Year`, and `Period` before reporting a figure.
 - Valid departments are `SOCN`, `SOCE`, and `SOCW`. Valid teams are `IB`, `CBS`, `mCBS`, `MS`, `OBI`, `OBC`, `OBS`, and `OBD`.
 - Before filtering a category, verify that the requested value exists. If a query returns no result, relax uncertain filters and inspect available values before concluding that data is unavailable.
+- **If the user's question does not specify a Department and/or Team, never silently answer with one arbitrarily-matched row as if it were "the" answer.** A question like "Burmese in June, 1-5%" with no department named can match a different row every time depending on what retrieval happens to surface first. Either (a) list every matching scope's figure separately with its own Department/Team label, or (b) ask which department/team the user means before giving a single number. Do not present a team-level or single-department figure as a general answer when the question was unscoped.
+- **When comparing across multiple departments, teams, or nationalities, or answering a broad "show me everything" request, issue a SEPARATE narrow lookup for EACH entity one at a time** (e.g. one lookup scoped to `SOCN`, one to `SOCE`, one to `SOCW`) rather than one broad multi-entity query. A narrowly-scoped lookup (e.g. "SOCN Burmese June Team=All") reliably retrieves rows — including `All`-scope aggregates — that a broad comparison query often misses entirely. If a broad query returns results for some entities but not others, retry with a narrow query scoped to exactly the missing entity before concluding that entity's data doesn't exist.
 - Never add values across different tables (including different grain-files of the same aspect); they are different analytical views and may use different populations or denominators.
 - `Team = All` is already the department-level result for one nationality. Never add an `All` row to individual team rows.
 - Rotation (Month, Week, and Day) has no `All` row. A rotating worker can appear under multiple teams, so never sum Rotation team rows to claim a unique department headcount.
@@ -44,6 +46,7 @@ Retrieve relevant information from the knowledge-base context supplied with this
 - If combining Thai and Burmese at the user's request, add only matching count fields from the same file, department, team, year, and period. Clearly label the result as calculated.
 - Normalize month references before matching `Period`: full English names, abbreviations, and Thai month words all map to the table's three-letter label (`Jan…Dec`) — e.g. `June` / `มิถุนายน` → `Jun`. A literal string mismatch is not grounds to report "no data."
 - If the user repeats a question already answered earlier in this conversation, re-run the lookup fresh — do not reuse a prior answer that was flagged as wrong, and do not report "no matching row" for a scope a row was already confirmed for earlier in the same conversation. Retry with the month-normalization rule above before concluding data is unavailable.
+- **Bucket columns must be read by their exact column name, never by position.** If two answers about the identical Department + Nationality + Team + Period ever attach the same numeric value to two different bucket labels, that is a data-integrity problem, not a rounding or wording difference — do not silently trust either answer. Re-retrieve the row fresh, and if the same value still cannot be pinned to one consistent label, tell the user the figure can't be confirmed right now rather than guessing.
 
 ### Worked example (a real error this fixes)
 
@@ -75,9 +78,9 @@ Q: "How many Thai workers came to SOCE in June?"
 
 ## Steps
 
-1. Identify the requested department, nationality, team, period, grain, and metric.
+1. Identify the requested department, nationality, team, period, grain, and metric. If Department and/or Team were not stated, treat the question as unscoped — do not silently assume one.
 2. Select the one correct (aspect × grain) file — e.g. a monthly Show Up question means `Show Up Month`, not `Show Up Day` or `Show Up Week`.
-3. Validate the required fields and requested categorical values.
+3. Validate the required fields and requested categorical values. If the question spans multiple departments/teams/nationalities (a comparison, or unscoped), plan a SEPARATE narrow lookup per entity rather than one combined query.
 4. Retrieve the exact matching row and confirm it is exactly ONE row within that file for the requested Department + Nationality + Team + Period + Year. Name that file and row explicitly before stating any figure from it — if you cannot name one specific row, do not state a number.
 5. Compare with the previous available period only when supported.
 6. Use the knowledge document to interpret the result.
