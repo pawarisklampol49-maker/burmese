@@ -68,6 +68,43 @@ workers, only Burmese rows appear.
 A month-over-month change of **≥5 percentage points** is considered **notable**
 (up = improving, down = declining).
 
+## Choosing the right metric — TWO DIFFERENT KINDS OF "continuity"
+
+A real, confirmed error: a question phrased as **"stayed at IB the whole time"**
+("อยู่ IB ตลอด") was answered from **Consecutive** instead of **Rotation** — because
+Thai "ตลอด" (throughout / continuously) and English "always"/"the whole time" are
+ambiguous between two UNRELATED axes of continuity:
+
+- **WHICH TEAM a worker stayed at** (never moved) → this is **Rotation**
+  (specifically `NonRotation`, or `OneDay` for a non-rotated worker who came just
+  once). Cue phrases: "stayed at `<team>` the whole time/always", "never moved/
+  rotated", "was always at `<team>`", "อยู่ `<team>` ตลอด", "ไม่ย้ายทีม", "ประจำที่
+  `<team>` ตลอด", "ไม่เคยสลับทีม".
+- **HOW MANY DAYS IN A ROW a worker worked** (regardless of team) → this is
+  **Consecutive**. Cue phrases: "worked 3+ days in a row/straight/back-to-back",
+  "consecutive days", "ทำงานติดต่อกัน `<N>` วัน", "มาทำงานต่อเนื่อง `<N>` วันติด",
+  "ไม่หยุดกี่วันติดกัน".
+
+**Rule: if the question names a specific TEAM the worker stayed at, it is a
+Rotation question, never Consecutive — Consecutive has no concept of "team" in its
+definition at all (it only counts day-streaks).** If the question is about a run of
+days worked back-to-back with no team mentioned, it is Consecutive. When genuinely
+uncertain which the user means, ask — do not guess and do not present one
+interpretation as settled fact.
+
+Quick router for all four aspects (natural-language cue → table):
+- "how many days did they show up / attendance count" / "มาทำงานกี่วัน" → **Show Up**
+- "experienced vs new / how long has this worker been around" / "เป็นคนเก่าหรือคนใหม่" / "ทำงานมานานหรือยัง" → **New-Old Face**
+- "did they stay at one team / never moved / always at `<team>`" / "อยู่ทีมเดิมตลอด" / "ย้ายทีมไหม" / "ประจำทีมเดียวหรือเปล่า" → **Rotation**
+- "days worked in a row / back-to-back / streak" / "ทำงานติดต่อกันกี่วัน" / "มาต่อเนื่องกี่วันติด" → **Consecutive**
+
+**Citation honesty:** never claim this knowledge document states an interpretation
+rule unless you can quote its literal text. A past answer cited this document as
+saying "'stayed at IB the whole time' means Consecutive Month" — this document never
+said that; it was fabricated to justify an already-wrong table choice. State the
+routing decision as your own interpretation (using the cues above), not as a quoted
+rule from a source that doesn't contain it.
+
 ## How to read the seventeen data tables
 
 Each **(aspect × grain)** combination is its own separate spreadsheet file, one flat

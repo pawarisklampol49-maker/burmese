@@ -2,17 +2,6 @@
   "name": "SOC RAG Tables Sync",
   "nodes": [
     {
-      "parameters": {},
-      "id": "manual-trigger",
-      "name": "Run Manually",
-      "type": "n8n-nodes-base.manualTrigger",
-      "typeVersion": 1,
-      "position": [
-        0,
-        200
-      ]
-    },
-    {
       "parameters": {
         "rule": {
           "interval": [
