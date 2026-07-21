@@ -49,8 +49,10 @@ workers, only Burmese rows appear.
   (inexperienced) = one station **and <10 days**. Workers who **rotated** between
   stations that month are **excluded** here — they appear in Rotation.
 - **Show Up** — how many days each worker showed up in that period, grouped into
-  buckets. **Monthly buckets are `1-5, 6-10, 11-15, 16-20, 21-30`** days.
-  **Weekly buckets are a DIFFERENT, smaller set: `1-2, 3-4, 5-7`** days (a week
+  buckets. **Monthly buckets are `1_5, 6_10, 11_15, 16_20, 21_30`** days (column
+  names use underscores, not hyphens — a hyphenated range like `1-5` reads as a
+  date shorthand to some tools, so the columns are named to avoid that).
+  **Weekly buckets are a DIFFERENT, smaller set: `1_2, 3_4, 5_7`** days (a week
   can't hold a 21-30-day count). Each worker falls in exactly one bucket for that
   period; the bucket counts sum to that scope's total workers for the period.
 - **3-day Consecutive** — whether a worker worked at least **3 days in a row** at
@@ -91,9 +93,9 @@ Year, Grain, Period** — `Grain` is constant within each file, included for cla
   - `Month`/`Week` files: Old/New = classified workers for that period; Old%/New% = their shares.
   - `Day` file: Old/New = workers **present that day**, counted by their MONTH
     verdict (rotated workers excluded, so Old + New ≤ that day's head count).
-- **Show Up Month** — `... | 1-5 | 6-10 | 11-15 | 16-20 | 21-30 | Total | 1-5% | 6-10% | 11-15% | 16-20% | 21-30%`
+- **Show Up Month** — `... | 1_5 | 6_10 | 11_15 | 16_20 | 21_30 | Total | 1_5% | 6_10% | 11_15% | 16_20% | 21_30%`
   (the five day-count buckets; `Total` = workers that month; each `%` = that bucket's share of Total)
-- **Show Up Week** — `... | 1-2 | 3-4 | 5-7 | Total | 1-2% | 3-4% | 5-7%`
+- **Show Up Week** — `... | 1_2 | 3_4 | 5_7 | Total | 1_2% | 3_4% | 5_7%`
   (a DIFFERENT, smaller bucket set than Month — do not confuse the two files' columns)
 - **Show Up Day** — `... | Total` only. `Total` = the **distinct head count** present
   that day (no buckets or percentages exist at daily grain — that's why it's a

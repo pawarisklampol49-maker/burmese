@@ -1,104 +1,123 @@
-# SOC Sync — Runbook
+# SOC Sync — คู่มือการปฏิบัติงาน (Runbook)
 
-This is for whoever operates this system day to day. It doesn't assume you can read code — if you can use Google Drive and open the Apps Script editor, that's enough.
+คู่มือฉบับนี้จัดทำขึ้นสำหรับผู้ที่มีหน้าที่ดูแลระบบนี้ในแต่ละวัน โดยไม่จำเป็นต้องมีความรู้ด้านการเขียนโค้ด เพียงแค่ใช้งาน Google Drive และเปิดหน้าแก้ไข Apps Script (Apps Script editor) เป็นก็เพียงพอแล้ว
 
-## What this does, in one paragraph
+## ระบบนี้ทำอะไร (สรุปในหนึ่งย่อหน้า)
 
-Every day, a small Google Apps Script reads every worker attendance file across the 3 departments (SOCN, SOCE, SOCW) and updates one summary spreadsheet per year in the Central folder. It runs entirely inside Google — there's no separate server. **All three departments run four times per day**, around 11:00, 13:00, 15:00, and 17:00 in the project time zone (`Asia/Bangkok`). This is 12 recurring triggers: one separate execution for each department at each time. Apps Script timing is approximate and may vary by about 15 minutes. Each department has its own execution because an all-department run exceeds Google's per-run time limit; chunked reads and automatic retries protect the concurrent runs from temporary Sheets API errors. You never tell it about a new file (it finds files itself), and you never create the yearly spreadsheet by hand (it makes that itself too). The only rule is that the raw files are named correctly and shared with the account that owns the script.
+ในทุก ๆ วัน สคริปต์ Google Apps Script ขนาดเล็กจะอ่านไฟล์ข้อมูลการลงเวลาทำงานของพนักงานจากทั้ง 3 แผนก (SOCN, SOCE, SOCW) และนำมาอัปเดตลงในสเปรดชีตสรุปรายปีที่อยู่ในโฟลเดอร์ Central การทำงานทั้งหมดเกิดขึ้นภายในระบบของ Google โดยไม่ต้องใช้เซิร์ฟเวอร์แยกต่างหาก **ทั้งสามแผนกจะรันทำงาน 4 ครั้งต่อวัน** ได้แก่ เวลาประมาณ 11:00, 13:00, 15:00 และ 17:00 น. ตามเขตเวลาของโครงการ (`Asia/Bangkok`) รวมเป็น 12 ตัวจุดชนวนทำงาน (Triggers): แยกการทำงาน 1 ครั้งต่อ 1 แผนกในแต่ละช่วงเวลา (การระบุเวลาของ Apps Script เป็นการกะประมาณ ซึ่งอาจคลาดเคลื่อนได้ราวๆ 15 นาที) แต่ละแผนกต้องแยกการทำงานออกจากกัน เพราะการรันทุกแผนกพร้อมกันในครั้งเดียวจะใช้เวลานานเกินขีดจำกัดต่อรอบของ Google โดยระบบใช้การอ่านข้อมูลแบบแบ่งเป็นชุด (Chunked reads) และลองใหม่อัตโนมัติ (Automatic retries) เพื่อป้องกันข้อผิดพลาดชั่วคราวจาก Sheets API คุณไม่จำเป็นต้องคอยบอกระบบเมื่อมีไฟล์ใหม่ (ระบบจะค้นหาไฟล์เอง) และไม่ต้องสร้างสเปรดชีตประจำปีด้วยตนเอง (ระบบจะสร้างให้เองเช่นกัน) กฎเพียงข้อเดียวคือ **ต้องตั้งชื่อไฟล์ต้นฉบับให้ถูกต้อง และแชร์ไฟล์ให้กับบัญชีที่เป็นเจ้าของสคริปต์**
 
-## Where the script lives
+## สคริปต์นี้อยู่ที่ไหน
 
-It's a **standalone Apps Script project** (not attached to any spreadsheet), owned by one Google account. To open it: that account → <https://script.google.com> → the SOC sync project. Everything — the schedule, the code, the run history — is in there.
+สคริปต์นี้เป็น **โครงการ Apps Script แบบเดี่ยว (Standalone Apps Script project)** ซึ่งไม่ได้ผูกติดอยู่กับสเปรดชีตใดสเปรดชีตหนึ่ง และมีบัญชี Google บัญชีหนึ่งเป็นเจ้าของ 
 
-## What you never need to do manually
+**วิธีเปิดใช้งาน:** ใช้บัญชีที่เป็นเจ้าของ เข้าไปที่ <https://script.google.com> → เลือกโครงการ **SOC sync** ทุกอย่างไม่ว่าจะเป็นกำหนดการทำงาน (Schedule), โค้ด (Code) หรือประวัติการรัน (Run history) จะรวมอยู่ในนั้นทั้งหมด
 
-- **A new staffing vendor's file for an existing department:** nothing beyond the one rule below (naming + sharing). It gets folded into that department's numbers on the next daily run.
-- **Each new year's central spreadsheet:** the script creates it automatically. When January 2027 arrives and the first 2027 data appears, it makes a spreadsheet titled `2027` in the Central folder itself. This used to be a manual once-a-year task; it no longer is.
+## สิ่งที่คุณ "ไม่ต้องทำ" เองเลย
 
-## The one thing you DO need to do by hand
+- **เพิ่มไฟล์ของบริษัทซัพพลายเออร์ (Vendor) รายใหม่ในแผนกที่มีอยู่แล้ว:** ไม่ต้องทำอะไรเพิ่มเติมนอกจากปฏิบัติตามกฎ 1 ข้อด้านล่าง (การตั้งชื่อ + การแชร์ไฟล์) ข้อมูลจะถูกดึงเข้ามารวมในตัวเลขของแผนกนั้นโดยอัตโนมัติในการรันรอบถัดไป
+- **สร้างสเปรดชีตส่วนกลางประจำปีใหม่:** สคริปต์จะสร้างให้โดยอัตโนมัติ เช่น เมื่อถึงเดือนมกราคม 2027 และมีข้อมูลของปี 2027 ปรากฏขึ้น ระบบจะสร้างสเปรดชีตชื่อ `2027` ไว้ในโฟลเดอร์ Central ให้เอง (จากเดิมที่เคยต้องกดสร้างเองปีละครั้ง ปัจจุบันไม่ต้องทำแล้ว)
 
-**Every new raw attendance file** (a new vendor, or a new year's file for an existing vendor) must be:
+## สิ่งเดียวที่คุณ "ต้องทำ" ด้วยตนเอง
 
-1. **A real Google Sheet** (File → New → Google Sheets, or a copy of an existing one) — not a CSV file just sitting in Drive.
-2. **Named exactly like this:** `[DEPARTMENT YEAR]_Daily name list_VENDOR`
-   - Example: `[SOCE 2026]_Daily name list_BTS`
-   - `DEPARTMENT` must be one of: `SOCN`, `SOCE`, `SOCW`
-   - `YEAR` is a 4-digit year
-   - `VENDOR` is the staffing vendor's short code (BTS, CYD, SPT, DSR, WAS, etc. — whatever it already is)
-   - Get the brackets, spaces, and underscores exactly right — the system matches this pattern precisely and will refuse to run (rather than guess) if a file's name is close but not exact.
-3. **Have one tab per month** inside it, named like `Jun 26` or `July 26`.
-4. **Shared with the account that owns the script** as an **Editor** (the Google account named under "Where the script lives"). There is no separate "service account" anymore — it's just that one human account.
+**ไฟล์ข้อมูลลงเวลาต้นฉบับใหม่ทุกไฟล์** (ไม่ว่าจะเป็น Vendor ใหม่ หรือไฟล์ปีใหม่ของ Vendor เดิม) จะต้อง:
 
-If a file is missing any of this, the daily sync fails loudly (rather than silently producing wrong numbers) — see "if the daily run fails" below.
+1. **เป็น Google Sheets แท้ๆ** (เข้าเมนู ไฟล์ → ใหม่ → Google ชีต หรือคัดลอกมาจากไฟล์ที่มีอยู่) — *ไม่ใช่* ไฟล์ CSV ที่อัปโหลดไปวางไว้เฉยๆ บน Drive
+2. **ตั้งชื่อตามรูปแบบนี้เป๊ะๆ:** `[DEPARTMENT YEAR]_Daily name list_VENDOR`
+   - ตัวอย่าง: `[SOCE 2026]_Daily name list_BTS`
+   - `DEPARTMENT` ต้องเป็นหนึ่งในนี้เท่านั้น: `SOCN`, `SOCE`, `SOCW`
+   - `YEAR` คือปี ค.ศ. เลข 4 หลัก
+   - `VENDOR` คือรหัสย่อของบริษัทซัพพลายเออร์ (เช่น BTS, CYD, SPT, DSR, WAS ฯลฯ ตามที่เคยใช้)
+   - **ต้องใส่เครื่องหมายวงเล็บ เว้นวรรค และเครื่องหมายขีดล่าง (Underscore) ให้ถูกต้องเป๊ะๆ** ระบบใช้วิธีจับรูปแบบชื่อที่แน่นอน หากตั้งชื่อใกล้เคียงแต่ไม่ถูกต้อง ระบบจะปฏิเสธการทำงานทันที (ดีกว่าการสุ่มเดาข้อมูล)
+3. **มีแท็บ (Tab) แยกตามเดือน** อยู่ข้างใน เช่น ชื่อแท็บ `Jun 26` หรือ `July 26`
+4. **แชร์ไฟล์ให้กับบัญชี Google ที่เป็นเจ้าของสคริปต์** โดยให้สิทธิ์เป็น **ผู้แก้ไข (Editor)** (บัญชีตามที่ระบุในหัวข้อ "สคริปต์นี้อยู่ที่ไหน") ปัจจุบันไม่มีระบบ "Service account" แยกต่างหากแล้ว ใช้เพียงบัญชีบุคคลนั้นบัญชีเดียว
 
-## Where results live
+หากไฟล์ขาดคุณสมบัติข้อใดข้อหนึ่งข้างต้น การรันประจำวันจะแจ้งเตือนข้อผิดพลาดทันที (เพื่อป้องกันไม่ให้ประมวลผลได้ตัวเลขที่ผิดพลาดไปเงียบๆ) — โปรดดูหัวข้อ "หากการรันประจำวันล้มเหลว" ด้านล่าง
 
-Open the **Central** Drive folder. Inside it, for each SOC each year there are several spreadsheets, all created by the script itself:
+## ผลลัพธ์เก็บไว้ที่ไหน
 
-- `<YEAR>_<DEPT>` — e.g. `2026_SOCN`, `2026_SOCE`, `2026_SOCW` — the **main results** file, with **5 tabs**: one `raw` tab + one tab per analysis aspect. This is the one you actually read.
-- `<YEAR>_<DEPT>_<ASPECT>_Names` — e.g. `2026_SOCN_ShowUp_Names`, `2026_SOCN_Rotation_Names` — a **drill-down** file for each aspect. You never open these directly; you reach them by clicking a number.
+เปิดโฟลเดอร์ **Central** ใน Google Drive ภายในนั้น สคริปต์จะสร้างสเปรดชีตประจำปีของแต่ละ SOC ไว้ให้ ดังนี้:
 
-There are separate drill-down files because a single Google spreadsheet can hold at most 10 million cells *across all its tabs*, and the "who's behind each number" detail is large enough to blow that limit if kept in one file. Giving each aspect its own **file** (not just another tab — tabs share one budget) is what keeps it under the limit.
+- `<YEAR>_<DEPT>` — เช่น `2026_SOCN`, `2026_SOCE`, `2026_SOCW` — นี่คือ **ไฟล์ผลลัพธ์หลัก** ซึ่งมี **5 แท็บ** ได้แก่ แท็บ `raw` 1 แท็บ + แท็บวิเคราะห์ข้อมูลด้านต่างๆ อีก 4 แท็บ (นี่คือไฟล์หลักที่คุณต้องใช้งานจริง)
+- `<YEAR>_<DEPT>_<ASPECT>_Names` — เช่น `2026_SOCN_ShowUp_Names`, `2026_SOCN_Rotation_Names` — เป็น **ไฟล์เจาะลึกรายชื่อ (Drill-down)** ของแต่ละมุมมองวิเคราะห์ คุณไม่ต้องเปิดไฟล์เหล่านี้โดยตรง แต่จะเข้าถึงได้ด้วยการคลิกที่ตัวเลขในไฟล์หลัก
 
-- **`raw`** — every worker's show-up day that year for this SOC, combined across all its vendor files. Columns: *Date show up, Month show up, Sub-con name (the vendor), Name, Clock in, shift name, Shift_id, team*. The header row has **filter dropdowns** (the funnel icons) and stays frozen while you scroll — so "who was at CBS on June 3rd" is just: open `raw`, filter *Date show up* to that date, filter *team* to CBS. Any filter you leave applied is reset by the next nightly run. (The analysis tabs can't have per-table dropdowns — Google Sheets allows only one filter per tab, and those tabs hold many small tables — so filtering always happens here on `raw`.)
-- **`New-Old Face`** — experienced vs inexperienced, for `All <DEPT>` + the 8 stations. Only counts workers who **stayed at one station** that month: **Old (experienced)** = one station AND worked **≥10 days**; **New (inexperienced)** = one station AND fewer than 10 days. Workers who **rotated** between stations are **not shown here at all** — they're in the Rotation tab. Shown at **three time scales**: monthly (two ways like Show Up: by station, then one block per category with trend coloring), **weekly** (who was present that week, counted by their month's Old/New verdict — clickable), and **daily** (same idea per day — plain numbers, not clickable). A worker's verdict always comes from their whole month; the week and day views only change *who was present*.
-- **`Show Up`** — day-count buckets (1-5 / 6-10 / 11-15 / 16-20 / 21-30 days in a month), monthly, shown TWO ways: grouped **by team** (each team's own block), then the same numbers grouped **by bucket** (each bucket's own block, teams as rows) with color — a month that moved 5+ percentage points from the prior month is highlighted green (up) or red (down), boxed, and labeled. Only these 8 stations are shown: IB, CBS, mCBS, MS, OBI, OBC, OBS, OBD (other station labels found in the raw data are left out of this view on purpose). Then a **weekly bucket table** — the same idea per ISO week, with week-sized buckets (**1-2 / 3-4 / 5-7 days** in a week), weeks as columns, clickable. Plus a **daily head-count block** (how many distinct workers were present each day, per team and overall — plain numbers, not clickable).
-- **`Consecutive`** — worked ≥3 days in a row: monthly and weekly, for `All SOCN` and each of the same 8 stations as Show Up. Each period shows worker counts split "Show up < 10 days" vs "Show up > 10 days", first as the plain split, then narrowed to "used to work 3+ days in a row at least once" (green) vs "never did" (red), as both counts and percentages. A `Total` row is included for reference but isn't clickable (it's just the two rows above it added together).
-- **`Rotation`** — worked at a station more than once and whether they were rotated to others: monthly and weekly, one block per period, for each of the 8 stations (no overall total row — a worker who rotated across several stations would get counted more than once in a total, so there isn't one). Below the period-by-period detail, a second section shows the same three percentages (Rotation %, Non Rotation %, and "worked only 1 day") side by side across all months, with the same trend coloring described under Show Up. At the bottom, a **daily block** (plain numbers, not clickable): for each day, who was present at each station, split by whether they were a rotator **that month** — a worker only ever has one station per day, so "rotated today" by itself can't exist; the day view shows *where this month's rotators and non-rotators were, day by day*.
+> **เหตุผลที่ต้องแยกไฟล์:** Google Sheets จำกัดจำนวนเซลล์สูงสุดไว้ไม่เกิน 10 ล้านเซลล์ *ต่อหนึ่งไฟล์ (รวมทุกแท็บ)* รายละเอียดข้อมูล "ใครอยู่เบื้องหลังตัวเลขแต่ละตัว" มีขนาดใหญ่มาก หากรวมไว้ในไฟล์เดียวจะเกินขีดจำกัด การแยกข้อมูลแต่ละมุมมองออกเป็น **ไฟล์ใหม่** (ไม่ใช่แค่เพิ่มแท็บ เพราะแท็บในไฟล์เดียวกันจะใช้วิธีหารสิทธิ์จำนวนเซลล์ร่วมกัน) ช่วยให้ข้อมูลไม่เกินขีดจำกัดของ Google
 
-"By team" means each of the 8 stations gets its own rows. Every scope is also split by nationality — you'll see `All SOCN Burmese` / `All SOCN Thai`, `IB Burmese` / `IB Thai`, and so on. Only the nationalities actually present in that SOC appear. Percentages are shown with a `%` sign (e.g. `45.11%`).
+---
 
-**Reading the tabs.** Each analysis tab has its own color (its tab at the bottom of the screen is colored to match): a dark banner at the top names the tab, and each lighter colored bar starts a new section (monthly, weekly, daily). The first row and first column stay frozen while you scroll, so you always see which team a number belongs to. Table header rows are gray, wide tables alternate white/faint-gray rows, shift rows are indented in gray text, and `Sum`/`Total` rows are bold with a line above them. All of this is repainted from scratch every night along with the numbers.
+### รายละเอียดของแต่ละแท็บในไฟล์หลัก
 
-**Each station is also broken down by shift.** In the tables where stations appear as rows (the by-bucket tables, the trend tables, and every daily table), each station's row is followed by indented rows, one per `Shift_id` — e.g. under `CBS Burmese` you'll see `CBS_N_00`, `CBS_N_01`, … — the same numbers narrowed to the people who worked that shift. A worker who worked two shifts that period appears under both (with the days they worked at each), so shift rows can add up to slightly more than the station row. In the **Consecutive** tab (which has no station-as-rows table) each station's block is instead followed by one small block per shift. A row worth of data with no shift id recorded shows as `(no Shift_id)`.
+- **`raw`** — แสดงข้อมูลการเข้างานของพนักงานทุกคนในปีนั้นสำหรับ SOC นั้นๆ โดยรวบรวมมาจากทุกไฟล์ Vendor คอลัมน์ประกอบด้วย: *Date show up, Month show up, Sub-con name (ชื่อ Vendor), Name, Clock in, shift name, Shift_id, team* 
+  - แถวหัวข้อจะมี **ตัวกรอง (Dropdown รูปกรวย)** และตรึงแถวไว้ขณะสกอร์ลหน้าจอ เพื่อให้คุณค้นหาได้ง่าย เช่น ต้องการดูว่า "ใครทำงานที่ CBS เมื่อวันที่ 3 มิถุนายน" ก็แค่เปิดแท็บ `raw` กรอง *Date show up* เป็นวันนั้น และกรอง *team* เป็น CBS
+  - ตัวกรองใดๆ ที่คุณค้างไว้จะถูกรีเซ็ตใหม่ในการรันคืนถัดไป (แท็บวิเคราะห์อื่นๆ ไม่สามารถใส่ตัวกรองแยกรายโต๊ะได้ เนื่องจาก Google Sheets อนุญาตให้มีตัวกรองได้เพียง 1 ชุดต่อ 1 แท็บ ในขณะที่แท็บเหล่านั้นมีโต๊ะข้อมูลเล็กๆ หลายโต๊ะ ดังนั้นการกรองข้อมูลจึงต้องมาทำที่แท็บ `raw` นี้เสมอ)
+- **`New-Old Face`** — แสดงพนักงานเก่า (มีประสบการณ์) vs พนักงานใหม่ (ไม่มีประสบการณ์) สำหรับภาพรวม `All <DEPT>` + แยกราย 8 สถานี 
+  - **เงื่อนไข:** นับเฉพาะพนักงานที่ **ทำงานประจำอยู่สถานีเดียว** ในเดือนนั้นเท่านั้น: 
+    - **Old (พนักงานเก่า/มีประสบการณ์)** = ทำงานสถานีเดียว และ ทำงาน **≥10 วัน**
+    - **New (พนักงานใหม่/ไม่มีประสบการณ์)** = ทำงานสถานีเดียว และ ทำงานน้อยกว่า 10 วัน
+    - *พนักงานที่มีการหมุนเวียน (Rotate) ไปหลายสถานีจะไม่แสดงในแท็บนี้* (จะไปอยู่ในแท็บ Rotation แทน)
+  - **แสดงผล 3 ระดับเวลา:** รายเดือน (Monthly - แสดง 2 แบบเหมือน Show Up: แยกตามสถานี และแยกตามกลุ่มพร้อมไฮไลต์สีตามแนวโน้ม), **รายสัปดาห์ (Weekly)** (นับจำนวนคนมาทำงานในสัปดาห์นั้นตามผลสรุป Old/New ของเดือนนั้น — คลิกดูรายชื่อได้) และ **รายวัน (Daily)** (แสดงจำนวนคนรายวัน — เป็นตัวเลขธรรมดา คลิกไม่ได้) ผลสรุป New/Old ของพนักงานจะอิงจากข้อมูลทั้งเดือนเสมอ ส่วนมุมมองรายสัปดาห์และรายวันจะเปลี่ยนไปตาม *คนที่มาทำงานจริงในวัน/สัปดาห์นั้น*
+- **`Show Up`** — จัดกลุ่มตามจำนวนวันที่มาทำงานในแต่ละเดือน (1-5 / 6-10 / 11-15 / 16-20 / 21-30 วัน) แสดงผลรายเดือน 2 แบบ: จัดกลุ่ม **ตามทีม/สถานี** (แต่ละทีมมีบล็อกของตัวเอง) และจัดกลุ่ม **ตามช่วงวัน (Bucket)** (แต่ละช่วงวันมีบล็อกของตัวเอง โดยมีทีมเป็นแถว) พร้อมการใส่สีไฮไลต์ — เดือนใดที่มีการเปลี่ยนแปลงเพิ่มขึ้นหรือลดลงตั้งแต่ 5% ขึ้นไปเมื่อเทียบกับเดือนก่อนหน้า จะถูกไฮไลต์สีเขียว (เพิ่มขึ้น) หรือสีแดง (ลดลง) พร้อมตีกรอบและติดป้ายกำกับ 
+  - แสดงเฉพาะ 8 สถานีนี้เท่านั้น: IB, CBS, mCBS, MS, OBI, OBC, OBS, OBD (ชื่อสถานีอื่นนอกเหนือจากนี้ในข้อมูลดิบจะถูกตัดออก)
+  - มี **ตารางจัดกลุ่มรายสัปดาห์ (Weekly bucket table)** ตาม ISO week โดยใช้ช่วงวันระดับสัปดาห์ (**1-2 / 3-4 / 5-7 วัน** ต่อสัปดาห์) มีสัปดาห์เป็นคอลัมน์ (กดคลิกดูรายชื่อได้)
+  - มี **บล็อกยอดนับรายวัน (Daily head-count block)** แสดงจำนวนพนักงานที่ไม่ซ้ำคนที่มาทำงานในแต่ละวัน แยกตามทีมและภาพรวม (เป็นตัวเลขธรรมดา คลิกไม่ได้)
+- **`Consecutive`** — ทำงานติดต่อกัน ≥3 วันขึ้นไป: แสดงผลรายเดือนและรายสัปดาห์ สำหรับภาพรวม `All SOCN` และแยกตาม 8 สถานี 
+  - แต่ละช่วงเวลาจะแบ่งจำนวนพนักงานเป็น "มาทำงาน < 10 วัน" vs "มาทำงาน > 10 วัน" โดยเริ่มจากยอดรวมธรรมดา จากนั้นเจาะลึกลงเป็นกลุ่ม "เคยทำงานติดต่อกัน 3+ วันอย่างน้อยหนึ่งครั้ง" (สีเขียว) vs "ไม่เคยเลย" (สีแดง) ทั้งในรูปแบบจำนวนคนและเปอร์เซ็นต์
+  - มีแถว `Total` รวมให้เพื่อใช้อ้างอิง แต่กดคลิกไม่ได้ (เป็นเพียงผลรวมของสองแถวด้านบน)
+- **`Rotation`** — ทำงานที่สถานีเดิมมากกว่า 1 ครั้ง และดูว่ามีการหมุนเวียนไปสถานีอื่นด้วยหรือไม่: แสดงผลรายเดือนและรายสัปดาห์ แยกเป็นบล็อกตามช่วงเวลาของแต่ละ 8 สถานี (ไม่มีแถวผลรวมภาพรวมทั้งหมด เนื่องจากพนักงานที่หมุนเวียนหลายสถานีจะถูกนับซ้ำในยอดรวม จึงตัดแถวรวมออก)
+  - ด้านล่างรายละเอียดช่วงเวลา จะมีส่วนที่สองแสดงเปอร์เซ็นต์ 3 ค่า (Rotation %, Non Rotation %, และ "ทำงานเพียง 1 วัน") เปรียบเทียบข้างกันทุกเดือน พร้อมไฮไลต์สีตามแนวโน้มเช่นเดียวกับแท็บ Show Up
+  - ด้านล่างสุดเป็น **บล็อกรายวัน (Daily block)** (ตัวเลขธรรมดา คลิกไม่ได้): แสดงว่าในแต่ละวัน มีใครมาทำงานที่สถานีใดบ้าง โดยแบ่งตามสถานะว่าพนักงานคนนั้นเป็นกลุ่มหมุนเวียน (Rotator) **ในเดือนนั้น** หรือไม่ — เนื่องจากพนักงานทำงานได้เพียง 1 สถานีต่อวัน ดังนั้นสถานะ "หมุนเวียนวันนี้" จึงไม่มีอยู่จริง มุมมองรายวันจึงแสดงให้เห็นว่า *คนที่หมุนเวียนและไม่หมุนเวียนของเดือนนั้น ไปทำงานอยู่ที่ไหนในแต่ละวัน*
 
-**Click a number to see who's behind it.** Every monthly and weekly count in the four analysis tabs is a **clickable link**. The exception is anything **daily** (the head-count block, the daily New/Old tables, the daily Rotation tables): those are plain numbers — for the roster of a single day, just filter the `raw` tab by that date. Click a count and that aspect's `_Names` file opens at a block listing exactly those people, shown with the **same columns as the raw tab** (Date show up, Month, Sub-con, Name, Clock in, shift name, Shift_id, team). The number of rows always equals the number you clicked — click a count of 3 and you get exactly 3 rows, one per person (their first show-up in that group). Groups are separated by two blank rows.
+---
 
-The slide's **"% Burmese"** figure and **capacity-per-station** targets are **not** produced — both need the total (non-Burmese) headcount, which these Burmese-only name lists don't contain.
+### หมายเหตุการอ่านข้อมูลและการใช้งาน
 
-**Important: all of these files (every tab) are wiped and rewritten every single day.** If you type anything directly into these tabs, it's gone the next morning. To correct something, fix it in the *source* file (the vendor's raw sheet), not here.
+* **การแยกตามทีมและสัญชาติ:** คำว่า "By team" หมายถึงทั้ง 8 สถานีจะแยกออกเป็นแถวของตัวเอง ทุกขอบเขตข้อมูลจะถูกแบ่งตามสัญชาติด้วย เช่น `All SOCN Burmese` / `All SOCN Thai`, `IB Burmese` / `IB Thai` เป็นต้น (แสดงเฉพาะสัญชาติที่มีข้อมูลอยู่ใน SOC นั้นจริงๆ) ตัวเลขเปอร์เซ็นต์จะแสดงเครื่องหมาย `%` เช่น `45.11%`
+* **การดูแถบสีในแท็บ:** แต่ละแท็บวิเคราะห์จะมีสีประจำแท็บ (แท็บด้านล่างจอจะเปลี่ยนสีตาม): แถบสีเข้มด้านบนสุดคือชื่อแท็บ แถบสีอ่อนลงมาคือการเริ่มต้นหัวข้อใหม่ (รายเดือน, รายสัปดาห์, รายวัน) แถวแรกและคอลัมน์แรกจะถูกตรึงไว้เสมอ แถวหัวตารางเป็นสีเทา ตารางที่กว้างจะใช้สีสลับขาว/เทาอ่อน แถวที่เป็นกะการทำงาน (Shift) จะย่อหน้าด้วยตัวหนังสือสีเทา และแถวสรุปยอด `Sum`/`Total` จะเป็นตัวหนาพร้อมมีเส้นขีดด้านบน รูปแบบทั้งหมดนี้จะถูกวาดใหม่ทั้งหมดทุกคืนพร้อมกับข้อมูลตัวเลข
+* **การแยกตามกะการทำงาน (Shift):** ในตารางที่แสดงสถานีเป็นแถว (ตาราง By-bucket, ตาราง Trend และตารางรายวันทุกตาราง) ใต้แถวของแต่ละสถานีจะมีแถวย่อหน้าลงมา แยกตาม `Shift_id` — เช่น ใต้ `CBS Burmese` จะเจอ `CBS_N_00`, `CBS_N_01`... ซึ่งเป็นตัวเลขชุดเดียวกันเจาะลึกเฉพาะคนที่ทำงานในกะนั้นๆ (พนักงานที่ทำ 2 กะในช่วงเวลานั้น จะปรากฏชื่อในทั้งสองกะ ดังนั้นยอดรวมของกะอาจสูงกว่ายอดรวมของสถานีเล็กน้อย) สำหรับ **แท็บ Consecutive** (ซึ่งไม่มีตารางสถานีแบบแถว) ใต้บล็อกสถานีจะมีบล็อกเล็กๆ ของแต่ละกะแทน หากแถวใดไม่มีข้อมูลรหัสกะ จะแสดงเป็น `(no Shift_id)`
+* **กดที่ตัวเลขเพื่อดูรายชื่อ (Click to view names):** ตัวเลขนับจำนวนรายเดือนและรายสัปดาห์ในแท็บวิเคราะห์ทั้ง 4 แท็บ **สามารถกดคลิกเป็นลิงก์ได้** (ยกเว้น **ข้อมูลรายวัน** เช่น Head-count รายวัน, ตาราง New/Old รายวัน, ตาราง Rotation รายวัน ที่จะเป็นตัวเลขธรรมดา — หากต้องการดูรายชื่อของวันเดียว ให้ใช้การกรองวันที่ในแท็บ `raw` แทน) เมื่อคลิกที่ตัวเลข ไฟล์ `_Names` ของมุมมองนั้นจะเปิดขึ้นมาตรงบล็อกรายชื่อคนที่อยู่ในกลุ่มนั้นทันที โดยแสดง **คอลัมน์เหมือนกับแท็บ raw ทุกประการ** จำนวนแถวจะเท่ากับตัวเลขที่คุณคลิกพอดี (คลิกเลข 3 ได้ 3 แถว คือข้อมูลการมาทำงานครั้งแรกของ 3 คนนั้น) แต่ละกลุ่มจะถูกแยกด้วยแถวว่าง 2 แถว
+* **การคำนวณที่ไม่ได้ทำ:** ตัวเลข **"% Burmese"** และเป้าหมาย **capacity-per-station** บนสไลด์ จะ **ไม่ถูกสร้างขึ้น** เนื่องจากต้องใช้จำนวนพนักงานทั้งหมด (ที่ไม่ใช่พม่า) ซึ่งรายชื่อพม่าอย่างเดียวนั้นไม่มีข้อมูลนี้
+* **ข้อควรระวังสำคัญ:** **ไฟล์เหล่านี้ (ทุกแท็บ) จะถูกลบและเขียนใหม่ทั้งหมดทุกๆ วัน** หากคุณพิมพ์หรือแก้ไขอะไรลงไปในแท็บเหล่านี้โดยตรง ข้อมูลนั้นจะหายไปในเช้าวันถัดไป หากต้องการแก้ไขข้อมูลที่ถูกต้อง ให้ไปแก้ที่ **ไฟล์ต้นทาง (ไฟล์ raw ของ Vendor)** ไม่ใช่ที่ไฟล์สรุปนี้
 
-## How the data is cleaned
+## วิธีการคลีนข้อมูล (Data Cleaning)
 
-The raw vendor sheets are messy (broken formulas, blank cells, duplicate rows, tabs that overlap at month boundaries). Before any number is counted, each month tab is cleaned by these rules. Every rule either fixes the row or drops it loudly — nothing wrong is silently counted.
+ไฟล์ต้นฉบับจาก Vendor มักมีปัญหา (สูตรเสีย, เซลล์ว่าง, แถวซ้ำ, แท็บเดือนเหลื่อมกัน) ก่อนนำตัวเลขไปนับ ระบบจะทำความสะอาดแท็บของแต่ละเดือนตามกฎดังนี้ โดยทุกกฎจะทำการแก้ไขหรือตัดแถวทิ้งพร้อมแจ้งเตือน — ไม่มีข้อมูลที่ผิดพลาดอันไหนถูกแอบนำไปนับเด็ดขาด
 
-- **One show-up per person per day.** A worker is counted as present on a date if any row exists for them that date. If the same person appears twice on the same date (e.g. a double shift, or the same day showing up in two overlapping month tabs like `Mar 26` and `Apr 26`), those are collapsed to **one** show-up, keeping the earliest clock-in.
-- **Missing team is filled in from the shift name.** The `team` column is an abbreviation of the shift. When it's blank, the system fills it by learning the shift→team pairing from the other rows in the same tab that *do* have a team, using the most common pairing. If it still can't tell (a genuine tie), it stops and asks rather than guessing. As a last resort it uses a short list of known facts (e.g. shift `FSOCE` → team `FSOCE`), and failing that, the shift name itself as the team.
-- **Undated rows are dropped and counted.** Some rows have a full work record (name, clock-in, shift, team) but no date in either date column — there's no day to attribute the show-up to, so the row is dropped. The count of dropped rows is written to the run log, never hidden.
-- **Broken formula cells are recovered where possible.** Cells showing spreadsheet errors (`#REF!`, `#N/A`, `#VALUE!`, etc.) or a corrupted header cell are repaired from the other, intact copy of the same information (each row has the date in two columns; the header block has a fixed layout). If a date genuinely can't be recovered from either column, the row is dropped (see above). If the two date columns hold two *different* valid dates, it stops and asks.
-- **Thai vs Burmese vendors.** No vendors are skipped. Each vendor is either Thai or Burmese: the `THAI_VENDORS` script property lists the Thai ones (currently `PPO, WAS, RG, YSL, BigBoom`), and **anything not on that list is treated as Burmese**. The summaries show Burmese and Thai as separate rows in every table. To classify a **new** vendor as Thai, add it to `THAI_VENDORS` in Script Properties (no code change); if you forget, it simply counts as Burmese until you do.
-- **Only the file's own year is read.** A `[SOCN 2026]…` file is read only for its `… 26` month tabs; a leftover off-year tab (e.g. a stray `Dec 25`) is ignored.
+- **นับ 1 คน มาทำงาน 1 ครั้ง ต่อ 1 วัน:** ระบบนับว่าพนักงานมาทำงานในวันที่นั้นๆ หากมีแถวข้อมูลของเขาปรากฏอยู่ หากคนเดิมมีชื่อซ้ำ 2 ครั้งในวันเดียวกัน (เช่น ทำเบิ้ลสองกะ หรือชื่อไปโผล่ในแท็บเดือนที่เหลื่อมกัน เช่น `Mar 26` กับ `Apr 26`) ระบบจะยุบรวมเหลือ **1 ครั้ง** โดยยึดเวลาตอกบัตรเข้า (Clock-in) ที่เร็วที่สุด
+- **เติมชื่อทีมที่หายไปจากชื่อกะ:** คอลัมน์ `team` เป็นตัวย่อของกะ หากช่องนี้ว่างเปล่า ระบบจะเรียนรู้คู่ความสัมพันธ์ระหว่าง Shift → Team จากแถวอื่นในแท็บเดียวกันที่มีข้อมูล โดยเลือกคู่ที่พบบ่อยที่สุด หากยังระบุไม่ได้ (กรณีเจอยอดเท่ากันเป๊ะ) ระบบจะหยุดและถามผู้ดูแลแทนการเดาเอง และหากจำเป็นจริงๆ จะใช้รายการข้อมูลพื้นฐานที่มีอยู่ (เช่น กะ `FSOCE` → ทีม `FSOCE`) หากไม่พบอีก จะใช้ชื่อกะมาใส่เป็นชื่อทีม
+- **แถวที่ไม่มีวันที่ จะถูกตัดออกและนับจำนวน:** หากแถวใดมีข้อมูลครบ (ชื่อ, เวลาเข้างาน, กะ, ทีม) แต่ไม่มีวันที่ในคอลัมน์วันที่ทั้งสองช่อง ระบบไม่สามารถระบุวันได้ แถวนั้นจะถูกตัดออก และจำนวนแถวที่ถูกตัดจะบันทึกลงในไดอารี่การทำงาน (Run log) ไม่มีการปกปิด
+- **กู้คืนเซลล์ที่สูตรเสีย:** เซลล์ที่ขึ้นข้อผิดพลาดสเปรดชีต (`#REF!`, `#N/A`, `#VALUE!` ฯลฯ) หรือส่วนหัวตารางเสียหาย จะถูกซ่อมแซมโดยดึงข้อมูลจากอีกชุดที่ยังสมบูรณ์ (แต่ละแถวมีคอลัมน์วันที่ 2 ช่อง/ส่วนหัวมีรูปแบบที่แน่นอน) หากไม่สามารถกู้คืนวันที่ได้จากทั้งสองคอลัมน์ แถวนั้นจะถูกตัดออก แต่หากคอลัมน์วันที่ทั้งสองช่องแสดงวันที่ถูกต้องแต่ *ไม่ตรงกัน* ระบบจะหยุดทำงานและแจ้งเตือนให้ตรวจสอบ
+- **การแยก Vendor ไทย vs พม่า:** ไม่มีการข้าม Vendor ทุกบริษัทคือไทยหรือพม่า โดยสคริปต์จะมีรายการ `THAI_VENDORS` กำหนดไว้ (ปัจจุบันคือ `PPO, WAS, RG, YSL, BigBoom`) **และบริษัทใดก็ตามที่ไม่อยู่ในรายการนี้ จะถูกนับเป็นพม่าทั้งหมด** สรุปผลจะแสดงแถวแยกไทยและพม่าในทุกตาราง หากมี Vendor ใหม่ที่เป็นคนไทย ให้เพิ่มชื่อเข้าไปใน `THAI_VENDORS` ใน Script Properties (ไม่ต้องแก้โค้ด) หากลืมใส่ ระบบจะนับเป็นพม่าไปก่อนจนกว่าคุณจะมาอัปเดต
+- **อ่านเฉพาะข้อมูลตรงปีของไฟล์เท่านั้น:** ไฟล์ `[SOCN 2026]…` จะอ่านเฉพาะแท็บเดือนที่เป็น `… 26` เท่านั้น หากมีแท็บปีอื่นตกค้าง (เช่น `Dec 25`) ระบบจะข้ามไปไม่นำมาอ่าน
 
-## If the daily run fails
+## หากการรันประจำวันล้มเหลว (Failed)
 
-1. Open the Apps Script project → **Executions** (the left sidebar, the "clock/list" icon). A failed run shows up with a red "Failed" status and an error message — the function name tells you which department it was (`syncSOCN`, `syncSOCE`, or `syncSOCW`; each department has its own daily run). Click it to read the full message. The other two departments' runs are independent — one failing doesn't stop the others.
-2. Common causes and what they mean:
-   - *"no raw vendor spreadsheets found"* — the owning account can't see any files. Check the sharing step above.
-   - *"doesn't match … pattern"* — a file was found but its name doesn't exactly follow `[DEPARTMENT YEAR]_Daily name list_VENDOR`. Fix the name.
-   - *"unrecognized department"* — a file's department code isn't one of SOCN/SOCE/SOCW. Check for a typo in the file name.
-   - *"duplicate (name,date)"* — the same worker appears on the same date in two vendor files **for the same department**. A human needs to look at the source data and decide which is right.
-   - a message ending in *"…: <something about a date / team / column>"* prefixed with a file name and tab — a specific bad row in that vendor sheet; the message names the file and tab.
-   - *"The service is currently unavailable"*, HTTP 429/5xx, or a timeout — a temporary Google API problem. The script reads four month tabs at a time, retries the failed chunk, and if the department still fails, schedules up to two automatic department retries 20 minutes apart. Do not edit source data for this error; check the later Executions first.
-3. To test without waiting for the schedule: in the editor, pick the **`dryRun`** function and Run it, then open **Executions** to read its log — it reports what it found (files, row counts) and writes nothing. To do a real run on demand, Run the failed department's function (**`syncSOCN`** / **`syncSOCE`** / **`syncSOCW`**) — one department at a time; running all three at once (`sync`) takes longer than Google's per-run time limit allows on a full year's data.
-4. When escalating to the developer, copy the exact error message from the Executions log — it's specific on purpose.
+1. เปิดโครงการ Apps Script → ไปที่เมนู **Executions (ประวัติการใช้งาน)** (ไอคอนรูปนาฬิกา/รายการที่แถบข้างซ้าย) การรันที่ล้มเหลวจะแสดงสถานะสีแดงว่า "Failed" พร้อมข้อความแจ้งข้อผิดพลาด ชื่อฟังก์ชั่นจะบอกว่ามาจากแผนกใด (`syncSOCN`, `syncSOCE`, หรือ `syncSOCW` เพราะแต่ละแผนกแยกการรันกัน) กดคลิกเพื่ออ่านข้อความเต็ม การล้มเหลวของแผนกหนึ่งจะไม่ส่งผลกระทบต่ออีกสองแผนกที่เหลือ
+2. สาเหตุที่พบบ่อยและความหมาย:
+   - *"no raw vendor spreadsheets found"* — บัญชีเจ้าของสคริปต์มองไม่เห็นไฟล์ ตรวจสอบขั้นตอนการแชร์ไฟล์ข้างต้น
+   - *"doesn't match … pattern"* — พบบางไฟล์ แต่ตั้งชื่อไม่ตรงตามรูปแบบ `[DEPARTMENT YEAR]_Daily name list_VENDOR` ให้แก้ไขชื่อไฟล์ให้ถูกต้อง
+   - *"unrecognized department"* — รหัสแผนกในชื่อไฟล์ไม่ตรงกับ SOCN/SOCE/SOCW ตรวจสอบว่าพิมพ์ชื่อไฟล์ผิดหรือไม่
+   - *"duplicate (name,date)"* — พบพนักงานคนเดียวกัน ซ้ำวันเดียวกัน ในไฟล์ Vendor 2 ไฟล์ **ของแผนกเดียวกัน** ต้องให้คนเข้าไปเช็คข้อมูลต้นทางว่าอันไหนถูกต้อง
+   - ข้อความที่ลงท้ายด้วย *"…: <something about a date / team / column>"* และมีชื่อไฟล์กับชื่อแท็บนำหน้า — แสดงว่ามีแถวข้อมูลเสียเฉพาะจุดในไฟล์ Vendor นั้น ข้อความจะระบุชื่อไฟล์และแท็บชัดเจน
+   - *"The service is currently unavailable"*, HTTP 429/5xx, หรือ Timeout — เกิดจากปัญหาชั่วคราวของ Google API ระบบอ่านข้อมูลครั้งละ 4 แท็บเดือน และจะลองอ่านชุดที่ล้มเหลวใหม่ หากยังล้มเหลว ระบบจะตั้งเวลาลองรันใหม่ให้อัตโนมัติสูงสุด 2 ครั้ง ห่างกันรอบละ 20 นาที ไม่ต้องแก้ไขข้อมูลต้นทางสำหรับข้อผิดพลาดนี้ ให้รอเช็คประวัติใน Executions รอบถัดไปก่อน
+3. **การทดสอบโดยไม่ต้องรอรอบเวลา:** ในหน้าแก้ไขโค้ด ให้เลือกฟังก์ชั่น **`dryRun`** แล้วกด Run จากนั้นเปิดดู **Executions** เพื่ออ่าน Log ระบบจะรายงานสิ่งที่ตรวจพบ (จำนวนไฟล์, จำนวนแถว) โดยไม่มีการเขียนหรือเปลี่ยนแปลงข้อมูลใดๆ หากต้องการรันจริงทันที ให้กด Run ฟังก์ชั่นของแผนกที่ล้มเหลว (**`syncSOCN`** / **`syncSOCE`** / **`syncSOCW`**) ทีละแผนก (ห้ามรัน `sync` รวมทั้งสามแผนกพร้อมกัน เพราะจะใช้เวลานานเกินขีดจำกัดของ Google)
+4. หากต้องการส่งต่อให้ผู้พัฒนา (Developer) แก้ไข ให้คัดลอกข้อความ Error ทั้งหมดจาก Executions log ไปให้ เนื่องจากข้อความถูกออกแบบมาให้ระบุปัญหาไว้เจาะจงแล้ว
 
-## Before the current owner's company account is deactivated
+## สิ่งที่ต้องทำ ก่อนบัญชีบริษัทของเจ้าของคนปัจจุบันจะถูกยกเลิก (Deactivated)
 
-This system keeps working after the person who built it leaves — **but only if the Apps Script project is not owned by a Google account that gets deactivated.** The script, its daily trigger, and its access to the sheets all run as whoever owns the project.
+ระบบนี้จะยังคงทำงานต่อไปได้แม้ผู้สร้างระบบจะลาออกไปแล้ว — **แต่มีเงื่อนไขว่า โครงการ Apps Script ต้องไม่ถูกครอบครองโดยบัญชี Google ที่กำลังจะถูกยกเลิก** สคริปต์, ตัวจุดชนวนรายวัน (Daily trigger) และสิทธิ์การเข้าถึง Sheets ทั้งหมดจะทำงานภายใต้ตัวตนของเจ้าของโครงการ
 
-Do this *before* the original account goes away:
+ให้ดำเนินการตามนี้ *ก่อนที่* บัญชีของเจ้าของเดิมจะถูกปิดใช้งาน:
 
-1. **Move ownership of the Apps Script project** to a durable account — a generic company account, IT's account, or the next operator's personal account. (In Apps Script / Google Drive, transfer ownership of the project, or re-create it under the durable account by copying `engine.gs` + `Code.gs` + the manifest.)
-2. **Re-run `installTrigger`** under that durable account so the daily schedule belongs to it, and **re-run `initProperties`** (or confirm the Script Properties `CENTRAL_FOLDER_ID` and `RAW_DEPARTMENTS` are set).
-3. **Make sure the durable account has Editor access** to the Central folder and every raw vendor sheet (or that those are owned by it).
-4. **GitHub** (where the code is version-controlled): add a second collaborator/owner to the repository.
+1. **โอนย้ายความเป็นเจ้าของโครงการ Apps Script** ไปยังบัญชีที่ใช้งานยาวนาน (Durable account) — เช่น บัญชีกลางของแผนก, บัญชีของฝ่าย IT หรือบัญชีส่วนตัวของผู้ดูแลคนใหม่ (ใน Apps Script / Google Drive ให้ทำเรื่องย้าย Ownership หรือสร้างโครงการขึ้นมาใหม่ภายใต้บัญชีใหม่ แล้วก๊อปปี้โค้ด `engine.gs` + `Code.gs` + ไฟล์ Manifest ไปวาง)
+2. **รันฟังก์ชั่น `installTrigger` อีกครั้ง** ภายใต้บัญชีใหม่ เพื่อให้กำหนดการรันรายวันเปลี่ยนมาผูกกับบัญชีใหม่ และ **รันฟังก์ชั่น `initProperties` อีกครั้ง** (หรือตรวจสอบค่าใน Script Properties ว่า `CENTRAL_FOLDER_ID` และ `RAW_DEPARTMENTS` ถูกตั้งค่าเรียบร้อยแล้ว)
+3. **ตรวจสอบให้แน่ใจว่าบัญชีใหม่มีสิทธิ์เป็น ผู้แก้ไข (Editor)** ในโฟลเดอร์ Central และในทุกๆ ไฟล์ raw ของ Vendor (หรือสิทธิ์ความเป็นเจ้าของไฟล์เหล่านั้นถูกเปลี่ยนเป็นบัญชีใหม่แล้ว)
+4. **GitHub** (ที่เก็บเวอร์ชันของโค้ด): เพิ่มสิทธิ์ผู้ดูแล/ผู้ร่วมพัฒนา (Collaborator/Owner) คนที่สองเข้าไปใน Repository
 
-Once the project is owned by a durable account, nothing about the daily run depends on the departed person's Gmail.
+เมื่อเปลี่ยนเจ้าของโครงการเป็นบัญชีหลักที่ยั่งยืนแล้ว การทำงานประจำวันของระบบก็จะไม่ขึ้นอยู่กับ Gmail ของคนที่ออกไปอีกต่อไป
 
-## Glossary
+## คำศัพท์น่ารู้ (Glossary)
 
-- **Department (SOC)**: one of SOCN, SOCE, SOCW — the three groups this system tracks. Each gets its own results file (`<YEAR>_<DEPT>`) plus one drill-down file per aspect (`<YEAR>_<DEPT>_<ASPECT>_Names`).
-- **Vendor** (a.k.a. "Sub-con"): a staffing agency that supplies workers (BTS, CYD, SPT, DSR, WAS, etc.). Not a physical location — just which agency the worker's file came through. Kept for traceability only; nothing is calculated "per vendor."
-- **Central folder**: the one Drive folder where every year's finished summary spreadsheet lives, and where the script auto-creates each new year's sheet.
-- **Apps Script**: Google's built-in automation tool. Our script is "standalone" (its own project, not attached to a sheet) and runs on a daily timer.
-- **Sync**: the daily process that reads a department's vendor files and rewrites its files in the Central folder. Runs as three scheduled functions, one per department (`syncSOCN`, `syncSOCE`, `syncSOCW`); `sync` (no suffix) does all three in one go and is only for small-data tests.
+- **Department (SOC / แผนก)**: คือ SOCN, SOCE, SOCW — 3 กลุ่มที่ระบบนี้ติดตามผล โดยแต่ละแผนกจะได้ไฟล์สรุปผลลัพธ์ของตัวเอง (`<YEAR>_<DEPT>`) + ไฟล์เจาะลึกรายชื่อตามมุมมองวิเคราะห์ (`<YEAR>_<DEPT>_<ASPECT>_Names`)
+- **Vendor (Sub-con / ซัพพลายเออร์)**: บริษัทผู้สรรหาแรงงานที่ส่งพนักงานมาทำงาน (เช่น BTS, CYD, SPT, DSR, WAS ฯลฯ) ไม่ใช่สถานที่ทำงาน แต่เป็นต้นทางของไฟล์พนักงาน มีไว้เพื่อการตรวจสอบย้อนกลับเท่านั้น ไม่มีคำนวณแยก "ราย Vendor"
+- **Central folder (โฟลเดอร์ส่วนกลาง)**: โฟลเดอร์ใน Google Drive ที่เก็บไฟล์สเปรดชีตสรุปผลของแต่ละปี และเป็นจุดที่สคริปต์จะสร้างไฟล์ปีใหม่ให้อัตโนมัติ
+- **Apps Script**: เครื่องมือสร้างระบบอัตโนมัติของ Google สคริปต์ของเราเป็นแบบ "Standalone" (แยกเป็นโครงการอิสระ ไม่ได้ฝังในไฟล์ Sheet ใด Sheet หนึ่ง) และทำงานตามตัวตั้งเวลาประจำวัน
+- **Sync**: กระบวนการประจำวันในการอ่านไฟล์ Vendor ของแต่ละแผนก และเขียนไฟล์สรุปใหม่ในโฟลเดอร์ Central รันแยกเป็น 3 ฟังก์ชั่นตามแผนก (`syncSOCN`, `syncSOCE`, `syncSOCW`) ส่วนฟังก์ชั่นชื่อ `sync` (ไม่มีคำต่อท้าย) คือการรันรวมทั้ง 3 แผนกพร้อมกัน ซึ่งเหมาะสำหรับการทดสอบข้อมูลขนาดเล็กเท่านั้น
