@@ -872,30 +872,79 @@ function rawRowCells_(r) {
           blank_(r.clockin), blank_(r.shift_name), blank_(r.shift_id), blank_(r.team)];
 }
 
-function namesCollector_(namesFileId, namesGid) {
-  const rows = [['DETAIL -- the people behind each number (opened by clicking a count in a summary tab)']];
-  const keyToRow = {};
+// Safety cap PER Names-file segment, kept under Google's real 10,000,000-cell
+// per-workbook limit -- 9M leaves headroom for the fixed-width padding
+// writeSummaryTab_ adds and avoids landing exactly on the edge. A group is
+// only ever refused a segment it would overflow, never split mid-group (a
+// clicked count must always resolve to ONE contiguous block).
+const NAMES_SEGMENT_CELL_CAP = 9000000;
+
+// The Names tab collector, shared across all 4 aspect tabs of one SOC. Each count
+// registers its group ONCE (header + names, single column) and every summary cell
+// that references it links to the same block. link() returns the HYPERLINK string
+// (or a plain 0 for an empty count, no link). Groups accrue in first-seen order;
+// their Names-tab row is known immediately, so no backfill is needed.
+// one member rendered as the 8 raw columns (same mapping appendRawRows_ uses), so
+// the drill-down shows the full raw context, not a bare name. Members are engine
+// row objects carrying {date, month, vendor, name, clockin, shift_name, shift_id,
+// team} -- the slim slice is widened in sync() to include all of these.
+//
+// AUTO-SPLIT across multiple files when one segment nears the 10M-cell-per-
+// workbook cap (2026-07-21, user request: "if it's almost the limit, split the
+// sheet" -- growth is currently ~2-6% of cap per department/aspect, but weekly
+// grains compound faster than monthly, so this heads off a hard multi-year
+// failure instead of waiting to hit it). firstSeg is the ALREADY-created/prepared
+// "..._Names" file (eager, as before -- the common case never creates a 2nd file).
+// nextSegmentFactory(index) lazily finds-or-creates "..._Names_<index>" ONLY when
+// a group would push the current segment over NAMES_SEGMENT_CELL_CAP; a single
+// group is never split mid-block (an oversized lone group still lands whole in
+// the segment it started, even past the cap -- astronomically unlikely: 9M cells
+// / 8 cols is a ~280,000-member single group).
+function namesCollector_(firstSeg, nextSegmentFactory) {
+  function preamble() {
+    return [['DETAIL -- the people behind each number (opened by clicking a count in a summary tab)']];
+  }
+  const segments = [{
+    ss: firstSeg.ss, id: firstSeg.ss.getId(), gid: firstSeg.gid,
+    rows: preamble(), cells: 1,
+  }];
+  const keyToLoc = {};   // key -> { seg, row }
+  function current() { return segments[segments.length - 1]; }
   // cross-file link: the detail lives in a SEPARATE spreadsheet (its own 10M
-  // budget), so this is a full-URL HYPERLINK to that file's Names tab at the
+  // budget), so this is a full-URL HYPERLINK to that segment's Names tab at the
   // group's row, not an in-workbook "#gid" anchor. Clicking opens the Names file.
-  const base = 'https://docs.google.com/spreadsheets/d/' + namesFileId + '/edit#gid=' + namesGid + '&range=A';
+  function linkBase_(seg) {
+    return 'https://docs.google.com/spreadsheets/d/' + seg.id + '/edit#gid=' + seg.gid + '&range=A';
+  }
   return {
-    rows: rows,
+    segments: segments,
     // members: engine ROW objects (one per counted person), so the row count in
     // the block equals the number clicked. Each group is: a title row (the
     // HYPERLINK target), the raw-column header, one row per member, then 2 blank
     // rows separating it from the next group.
     link: function (count, key, title, members) {
       if (!count) return 0;
-      if (!(key in keyToRow)) {
-        keyToRow[key] = rows.length + 1;           // 1-based title row (the link target)
-        rows.push([title + '  (' + members.length + ')']);
-        rows.push(RAW_TAB_HEADER.slice());
-        members.forEach(function (m) { rows.push(rawRowCells_(m)); });
-        rows.push([]);
-        rows.push([]);
+      if (!(key in keyToLoc)) {
+        const groupRows = 4 + members.length;   // title + header + members + 2 blank
+        const groupCells = groupRows * RAW_TAB_HEADER.length;
+        var seg = current();
+        if (seg.cells + groupCells > NAMES_SEGMENT_CELL_CAP && seg.rows.length > 1) {
+          Logger.log('[names split] segment ' + segments.length + ' (' + seg.ss.getName() +
+            ') reached ' + seg.cells + ' cells -- opening segment ' + (segments.length + 1));
+          const next = nextSegmentFactory(segments.length + 1);
+          seg = { ss: next.ss, id: next.ss.getId(), gid: next.gid, rows: preamble(), cells: 1 };
+          segments.push(seg);
+        }
+        keyToLoc[key] = { seg: seg, row: seg.rows.length + 1 };   // 1-based title row (the link target)
+        seg.rows.push([title + '  (' + members.length + ')']);
+        seg.rows.push(RAW_TAB_HEADER.slice());
+        members.forEach(function (m) { seg.rows.push(rawRowCells_(m)); });
+        seg.rows.push([]);
+        seg.rows.push([]);
+        seg.cells += groupCells;
       }
-      return '=HYPERLINK("' + base + keyToRow[key] + '",' + count + ')';
+      const loc = keyToLoc[key];
+      return '=HYPERLINK("' + linkBase_(loc.seg) + loc.row + '",' + count + ')';
     },
   };
 }
@@ -1920,7 +1969,14 @@ function runSync_(deptFilter) {
     const namesIds = {};
     ASPECT_TABS.forEach(function (tab) {
       const nf = ctx.namesFiles[tab];
-      const nc = namesCollector_(nf.ss.getId(), nf.gid);
+      const suffix = ASPECT_NAME_SUFFIX[tab];
+      // lazily find-or-create "..._Names_<index>" -- only called if the FIRST
+      // segment (nf, already created above) actually overflows NAMES_SEGMENT_CELL_CAP.
+      const nextSegmentFactory = function (index) {
+        const nss = findOrCreateSheet_(conf.folderId, socNamesTitle_(ctx.year, ctx.dept, suffix) + '_' + index);
+        return { ss: nss, gid: prepareNamesSheet_(nss) };
+      };
+      const nc = namesCollector_({ ss: nf.ss, gid: nf.gid }, nextSegmentFactory);
       const tb = Date.now();
       const built = aspectGrids[tab](slim, nc, ctx.dept);   // {grid, formats}; dept -> "All <DEPT>" label
       const buildS = ((Date.now() - tb) / 1000).toFixed(1);
@@ -1931,11 +1987,20 @@ function runSync_(deptFilter) {
       writeSummaryTab_(ctx.ss, ctx.sheetIds[tab], tab, built.grid, 'USER_ENTERED', fmts);
       const sumS = ((Date.now() - tw) / 1000).toFixed(1);
       const tn = Date.now();
-      writeSummaryTab_(nf.ss, nf.gid, NAMES_TAB, nc.rows, 'RAW');
+      var totalNameRows = 0;
+      nc.segments.forEach(function (seg, i) {
+        writeSummaryTab_(seg.ss, seg.gid, NAMES_TAB, seg.rows, 'RAW');
+        totalNameRows += seg.rows.length;
+        if (nc.segments.length > 1) {
+          Logger.log('[t] ' + ctx.dept + '/' + tab + ' names segment ' + (i + 1) + '/' +
+            nc.segments.length + ': ' + seg.rows.length + ' rows, ' + seg.cells + ' cells');
+        }
+      });
       const namesS = ((Date.now() - tn) / 1000).toFixed(1);
       Logger.log('[t] ' + ctx.dept + '/' + tab + ': build=' + buildS + 's write=' +
-        sumS + 's names=' + namesS + 's (' + nc.rows.length + ' name rows) @ ' + since_());
-      namesIds[tab] = nf.ss.getId();
+        sumS + 's names=' + namesS + 's (' + totalNameRows + ' name rows, ' +
+        nc.segments.length + ' file(s)) @ ' + since_());
+      namesIds[tab] = nc.segments.map(function (seg) { return seg.ss.getId(); });
     });
     // filter dropdowns on the raw tab's header row (user request: "filter from
     // the header of the table"). Sheets allows ONE basic filter per tab, so the

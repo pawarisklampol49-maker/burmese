@@ -227,6 +227,31 @@ shape; `findOrCreateSheet_` + `prepareNamesSheet_` build each aspect's Names fil
 `sync` keys its streaming context by `(year, dept)` and holds `ss` + `namesFiles`
 (aspect → `{ss, gid}`).
 
+**Names auto-split (2026-07-21, user request: "if it's almost the limit, split
+the sheet").** Before this, a Names file crossing the real 10M-cell cap was a
+hard, deterministic `batchUpdate` throw with no proactive handling — and since
+it's deterministic (not transient), the department-level auto-retry would just
+fail identically both times rather than recovering. `namesCollector_` (was
+`(namesFileId, namesGid)`) is now `(firstSeg, nextSegmentFactory)` and owns a
+`segments` array instead of one flat `rows` array: `link()` computes each new
+group's cell cost (`(4 + members.length) * RAW_TAB_HEADER.length`) and, only if
+adding it would push the CURRENT segment over `NAMES_SEGMENT_CELL_CAP` (9M — a
+10% safety margin under the real 10M cap) AND the segment already has content,
+lazily opens the next one via `nextSegmentFactory(index)` — found/created as
+`<...>_Names_2`, `_Names_3`, … through the same `findOrCreateSheet_` +
+`prepareNamesSheet_` pair used for segment 1. A group is **never split
+mid-block** (a clicked count must resolve to one contiguous range) — a single
+group that alone exceeds the cap still lands whole in the segment it started
+(effectively impossible: that's a ~280,000-member group). Each `link()` call's
+`=HYPERLINK` targets whichever segment the group actually landed in, so a
+mixed-segment aspect still resolves every count correctly. `runSync_`'s write
+loop now writes **every** populated segment (`nc.segments.forEach`, was a
+single `writeSummaryTab_` call) and logs a `[names split]` line the moment a
+new segment opens. The common case (current usage: ~2–6% of the cap per
+department/aspect after 5 months) is untouched — one segment, one file,
+identical to before; the extra file-creation path only executes once actually
+needed, so this doesn't add risk or overhead to today's normal runs.
+
 **Summaries follow the slide deck**, **grouped by team**. **Every aspect now
 carries day + week + month grains except Consecutive** (month + week — the user's
 explicit "keep it as it is"; added 2026-07-15 per user request). A metric that

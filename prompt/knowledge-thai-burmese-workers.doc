@@ -1,8 +1,8 @@
 # Document: Thai and Burmese Workers (SOC Worker Analysis)
 
 This document explains the SOC worker-attendance data so the chatbot can read the
-four data tables correctly. All figures come from the daily attendance records of
-the three departments; this document defines the terms, and the four tables hold
+eleven data tables correctly. All figures come from the daily attendance records of
+the three departments; this document defines the terms, and the eleven tables hold
 the numbers.
 
 ## Thai vs Burmese (nationality)
@@ -24,13 +24,23 @@ workers, only Burmese rows appear.
 - **Teams (stations), 8 in total:** **IB, CBS, mCBS, MS, OBI, OBC, OBS, OBD**.
 - **`All`** in the Team column = the whole department (all teams combined) for that
   nationality. (Exception: the Rotation table has **no `All` row** — see below.)
-- **Two time grains**, marked by the `Grain` column: **`Month`** and **`Day`**.
-  - For a `Month` row, `Period` is a short month label (e.g. `Jun`).
-  - For a `Day` row, `Period` is a calendar date `YYYY-MM-DD` (e.g. `2026-06-05`).
-  - The `Year` column carries the year (month labels alone don't).
-  - **Consecutive is `Month` only** (there is no daily consecutive metric).
-  - **Daily rows only exist where someone was present**: if a (Team, Nationality,
-    Day) row is absent from a table, the count for that day is **zero**.
+- **Three time grains — `Month`, `Week`, `Day`** — each grain is a **SEPARATE FILE**
+  per aspect (see "How to read the eleven data tables" below), not a column you
+  filter within one shared table.
+  - `Month` file: `Period` is a short month label (e.g. `Jun`).
+  - `Week` file: `Period` is an ISO week label (e.g. `W23`). A week can straddle
+    two months; it is attributed to whichever month contains most of that week's
+    activity in the source data.
+  - `Day` file: `Period` is a calendar date `YYYY-MM-DD` (e.g. `2026-06-05`).
+  - The `Year` column carries the year (month/week labels alone don't).
+  - **Consecutive has no `Day` file** (there is no daily consecutive metric — only
+    `Consecutive Month` and `Consecutive Week` exist).
+  - **`Day`-file rows only exist where someone was present**: if a (Team,
+    Nationality, Day) row is absent from the Day file, the count for that day is
+    **zero**.
+  - **Normalize month references to the short label**: a full month name
+    (`June`), a Thai month word (`มิถุนายน`), or any other variant all mean the
+    same `Period` as `Jun`. Match on the normalized month, not the literal string.
 
 ## Metric definitions (one line each)
 
@@ -38,9 +48,11 @@ workers, only Burmese rows appear.
   month. **Old** (experienced) = one station **and ≥10 working days**; **New**
   (inexperienced) = one station **and <10 days**. Workers who **rotated** between
   stations that month are **excluded** here — they appear in Rotation.
-- **Show Up** — how many days each worker showed up that month, grouped into buckets:
-  **1-5, 6-10, 11-15, 16-20, 21-30** days. Each worker falls in exactly one bucket;
-  the bucket counts sum to that scope's total workers for the month.
+- **Show Up** — how many days each worker showed up in that period, grouped into
+  buckets. **Monthly buckets are `1-5, 6-10, 11-15, 16-20, 21-30`** days.
+  **Weekly buckets are a DIFFERENT, smaller set: `1-2, 3-4, 5-7`** days (a week
+  can't hold a 21-30-day count). Each worker falls in exactly one bucket for that
+  period; the bucket counts sum to that scope's total workers for the period.
 - **3-day Consecutive** — whether a worker worked at least **3 days in a row** at
   least once in the month. Workers are first split by attendance (**<10** vs **>10**
   days), then by streak history (**used to** have a ≥3-day run vs **never** did). The
@@ -54,29 +66,61 @@ workers, only Burmese rows appear.
 A month-over-month change of **≥5 percentage points** is considered **notable**
 (up = improving, down = declining).
 
-## How to read the four data tables
+## How to read the eleven data tables
 
-Each aspect is a separate spreadsheet file, one flat `data` table. Files are named
-plainly: **`New-Old Face`**, **`Show Up`**, **`Consecutive`**, **`Rotation`**. All
-share the first six columns: **Department, Nationality, Team, Year, Grain, Period**
-(one row per combination).
+Each **(aspect × grain)** combination is its own separate spreadsheet file, one flat
+`data` table — **11 files total**, since a metric that doesn't apply at a given grain
+(e.g. Show Up's day-count buckets don't exist for a single day) used to leave BLANK
+cells in a shared table, which broke automated ingestion. Splitting by grain means
+every file has ONLY the columns that are actually populated — no file ever has a
+blank cell. **Picking the right FILE is now part of answering the question — there
+is no single "Show Up" table to filter by a `Grain` column anymore.**
 
-- **New-Old Face** — `... | Old | New | Old% | New%`
-  - `Month` rows: Old/New = classified workers; Old%/New% = their shares.
-  - `Day` rows: Old/New = workers **present that day**, counted by their month
+The 11 files (all share the first six columns: **Department, Nationality, Team,
+Year, Grain, Period** — `Grain` is constant within each file, included for clarity):
+
+| Aspect | Month file | Week file | Day file |
+|---|---|---|---|
+| New-Old Face | `New-Old Face Month` | `New-Old Face Week` | `New-Old Face Day` |
+| Show Up | `Show Up Month` | `Show Up Week` | `Show Up Day` |
+| Consecutive | `Consecutive Month` | `Consecutive Week` | *(none — no daily metric)* |
+| Rotation | `Rotation Month` | `Rotation Week` | `Rotation Day` |
+
+- **New-Old Face** (Month/Week/Day — identical columns in all three)
+  `... | Old | New | Old% | New%`
+  - `Month`/`Week` files: Old/New = classified workers for that period; Old%/New% = their shares.
+  - `Day` file: Old/New = workers **present that day**, counted by their MONTH
     verdict (rotated workers excluded, so Old + New ≤ that day's head count).
-- **Show Up** — `... | 1-5 | 6-10 | 11-15 | 16-20 | 21-30 | Total | 1-5% | 6-10% | 11-15% | 16-20% | 21-30%`
-  - `Month` rows: the five day-count buckets, `Total` = workers that month, each `%`
-    = that bucket's share of Total.
-  - `Day` rows: the buckets and `%` columns are **blank**; `Total` = the **distinct
-    head count** present that day (you can't bucket a single day).
-- **Consecutive** (`Month` grain only) — `... | ShowUp<10 | ShowUp>10 | Active | UsedTo3day<10 | UsedTo3day>10 | Never3day<10 | Never3day>10 | UsedTo3day% | Never3day%`
+- **Show Up Month** — `... | 1-5 | 6-10 | 11-15 | 16-20 | 21-30 | Total | 1-5% | 6-10% | 11-15% | 16-20% | 21-30%`
+  (the five day-count buckets; `Total` = workers that month; each `%` = that bucket's share of Total)
+- **Show Up Week** — `... | 1-2 | 3-4 | 5-7 | Total | 1-2% | 3-4% | 5-7%`
+  (a DIFFERENT, smaller bucket set than Month — do not confuse the two files' columns)
+- **Show Up Day** — `... | Total` only. `Total` = the **distinct head count** present
+  that day (no buckets or percentages exist at daily grain — that's why it's a
+  separate file with just this one column).
+  - **Never open the Day file and sum its `Total` values to answer a monthly
+    question.** Each Day row's `Total` counts everyone present that specific day;
+    the same worker appears in a fresh row every day they show up, so summing
+    several days multiplies people by days present, not a real headcount. If the
+    user asks for a monthly figure, open `Show Up Month` and read the single
+    matching row's `Total` directly — never derive it from `Show Up Day`.
+- **Consecutive Month** — `... | ShowUp<10 | ShowUp>10 | Active | UsedTo3day<10 | UsedTo3day>10 | Never3day<10 | Never3day>10 | UsedTo3day% | Never3day%`
   (Active = ShowUp<10 + ShowUp>10; UsedTo3day% and Never3day% are shares of Active.)
-- **Rotation** — `... | NonRotation | Rotation | Total | OneDay | OneDay%OfNonRot | NonRotation% | Rotation%`  (**No `All` row.**)
-  - `Month` rows: Total = NonRotation + Rotation; OneDay%OfNonRot = OneDay ÷ NonRotation.
-  - `Day` rows: NonRotation/Rotation = workers **present that day** by their month
-    Reading-B status at that team; `OneDay` and `OneDay%OfNonRot` are **blank**.
+- **Consecutive Week** — `... | GreaterEq3Consecutive | Less3NonConsecutive | Active | GreaterEq3% | Less3%`
+  (a DIFFERENT, simpler shape than Month: just two streak categories for that week,
+  not the Month file's ShowUp<10/>10 split. `Active` = GreaterEq3Consecutive + Less3NonConsecutive.)
+- **Rotation Month** / **Rotation Week** (identical columns) — `... | NonRotation | Rotation | Total | OneDay | OneDay%OfNonRot | NonRotation% | Rotation%`
+  (**No `All` row in either** — Rotation is inherently about movement between teams,
+  so a department-wide aggregate would double-count a worker who rotated across
+  several teams. Total = NonRotation + Rotation; OneDay%OfNonRot = OneDay ÷ NonRotation.)
+- **Rotation Day** — `... | NonRotation | Rotation | Total | NonRotation% | Rotation%`
+  (`OneDay` doesn't exist at daily grain, so this file has fewer columns than
+  Month/Week — NonRotation/Rotation = workers **present that day** by their MONTH
+  Reading-B status at that team. No `All` row here either.)
 
-To answer a question, find the row(s) matching the asked Department + Nationality +
-Team + Grain + Period in the relevant table, quote the exact figure, and name that
-scope (and whether it's a monthly or daily figure).
+To answer a question: **first pick the correct (aspect, grain) file** for what's
+being asked, then find the ONE row matching the asked Department + Nationality +
+Team + Period + Year, quote its exact figure, and name that file and scope. If more
+than one row seems to match within a file, that means Period differs somewhere —
+re-check before using either one, and never combine rows into a bigger number, and
+never combine numbers pulled from two different files.
