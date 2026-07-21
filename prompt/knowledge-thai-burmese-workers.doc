@@ -1,9 +1,9 @@
 # Document: Thai and Burmese Workers (SOC Worker Analysis)
 
 This document explains the SOC worker-attendance data so the chatbot can read the
-eleven data tables correctly. All figures come from the daily attendance records of
-the three departments; this document defines the terms, and the eleven tables hold
-the numbers.
+seventeen data tables correctly. All figures come from the daily attendance records
+of the three departments; this document defines the terms, and the seventeen tables
+hold the numbers.
 
 ## Thai vs Burmese (nationality)
 
@@ -25,8 +25,8 @@ workers, only Burmese rows appear.
 - **`All`** in the Team column = the whole department (all teams combined) for that
   nationality. (Exception: the Rotation table has **no `All` row** — see below.)
 - **Three time grains — `Month`, `Week`, `Day`** — each grain is a **SEPARATE FILE**
-  per aspect (see "How to read the eleven data tables" below), not a column you
-  filter within one shared table.
+  per aspect (see "How to read the seventeen data tables" below), not a column you
+  filter within one shared table. Day-grain files are further split one-per-department.
   - `Month` file: `Period` is a short month label (e.g. `Jun`).
   - `Week` file: `Period` is an ISO week label (e.g. `W23`). A week can straddle
     two months; it is attributed to whichever month contains most of that week's
@@ -68,44 +68,53 @@ workers, only Burmese rows appear.
 A month-over-month change of **≥5 percentage points** is considered **notable**
 (up = improving, down = declining).
 
-## How to read the eleven data tables
+## How to read the seventeen data tables
 
 Each **(aspect × grain)** combination is its own separate spreadsheet file, one flat
-`data` table — **11 files total**, since a metric that doesn't apply at a given grain
-(e.g. Show Up's day-count buckets don't exist for a single day) used to leave BLANK
-cells in a shared table, which broke automated ingestion. Splitting by grain means
-every file has ONLY the columns that are actually populated — no file ever has a
-blank cell. **Picking the right FILE is now part of answering the question — there
-is no single "Show Up" table to filter by a `Grain` column anymore.**
+`data` table, since a metric that doesn't apply at a given grain (e.g. Show Up's
+day-count buckets don't exist for a single day) used to leave BLANK cells in a
+shared table, which broke automated ingestion. Splitting by grain means every file
+has ONLY the columns that are actually populated — no file ever has a blank cell.
+**Picking the right FILE is now part of answering the question — there is no single
+"Show Up" table to filter by a `Grain` column anymore.**
 
-The 11 files (all share the first six columns: **Department, Nationality, Team,
+**Day-grain files are further split BY DEPARTMENT** (`SOCN`/`SOCE`/`SOCW` each get
+their own file) for New-Old Face, Show Up, and Rotation — a Day-grain file has one
+row per Department × Nationality × Team × Day across the whole year so far, far more
+rows than Month/Week grain, which made the combined file too large for the RAG
+platform to ingest in one upload. Month and Week files stay combined across all
+three departments in one file (filter by `Department` within them as usual).
+
+17 files total (all share the first six columns: **Department, Nationality, Team,
 Year, Grain, Period** — `Grain` is constant within each file, included for clarity):
 
-| Aspect | Month file | Week file | Day file |
+| Aspect | Month file | Week file | Day file(s) |
 |---|---|---|---|
-| New-Old Face | `New-Old Face Month` | `New-Old Face Week` | `New-Old Face Day` |
-| Show Up | `Show Up Month` | `Show Up Week` | `Show Up Day` |
+| New-Old Face | `New-Old Face Month` | `New-Old Face Week` | `New-Old Face Day SOCN` / `SOCE` / `SOCW` |
+| Show Up | `Show Up Month` | `Show Up Week` | `Show Up Day SOCN` / `SOCE` / `SOCW` |
 | Consecutive | `Consecutive Month` | `Consecutive Week` | *(none — no daily metric)* |
-| Rotation | `Rotation Month` | `Rotation Week` | `Rotation Day` |
+| Rotation | `Rotation Month` | `Rotation Week` | `Rotation Day SOCN` / `SOCE` / `SOCW` |
 
-- **New-Old Face** (Month/Week/Day — identical columns in all three)
+- **New-Old Face** (Month/Week/Day — identical columns in all of them, Day split per department)
   `... | Old | New | Old% | New%`
   - `Month`/`Week` files: Old/New = classified workers for that period; Old%/New% = their shares.
-  - `Day` file: Old/New = workers **present that day**, counted by their MONTH
+  - `Day SOCN`/`SOCE`/`SOCW` files: Old/New = workers **present that day**, counted by their MONTH
     verdict (rotated workers excluded, so Old + New ≤ that day's head count).
 - **Show Up Month** — `... | 1_5 | 6_10 | 11_15 | 16_20 | 21_30 | Total | 1_5% | 6_10% | 11_15% | 16_20% | 21_30%`
   (the five day-count buckets; `Total` = workers that month; each `%` = that bucket's share of Total)
 - **Show Up Week** — `... | 1_2 | 3_4 | 5_7 | Total | 1_2% | 3_4% | 5_7%`
   (a DIFFERENT, smaller bucket set than Month — do not confuse the two files' columns)
-- **Show Up Day** — `... | Total` only. `Total` = the **distinct head count** present
-  that day (no buckets or percentages exist at daily grain — that's why it's a
-  separate file with just this one column).
-  - **Never open the Day file and sum its `Total` values to answer a monthly
+- **Show Up Day SOCN** / **SOCE** / **SOCW** (one file per department) — `... | Total`
+  only. `Total` = the **distinct head count** present that day (no buckets or
+  percentages exist at daily grain — that's why it's a separate file with just this
+  one column). Open the file matching the requested department; if unstated, check
+  the relevant department(s) rather than guessing one.
+  - **Never open a Day file and sum its `Total` values to answer a monthly
     question.** Each Day row's `Total` counts everyone present that specific day;
     the same worker appears in a fresh row every day they show up, so summing
     several days multiplies people by days present, not a real headcount. If the
     user asks for a monthly figure, open `Show Up Month` and read the single
-    matching row's `Total` directly — never derive it from `Show Up Day`.
+    matching row's `Total` directly — never derive it from a `Show Up Day` file.
 - **Consecutive Month** — `... | ShowUp<10 | ShowUp>10 | Active | UsedTo3day<10 | UsedTo3day>10 | Never3day<10 | Never3day>10 | UsedTo3day% | Never3day%`
   (Active = ShowUp<10 + ShowUp>10; UsedTo3day% and Never3day% are shares of Active.)
 - **Consecutive Week** — `... | GreaterEq3Consecutive | Less3NonConsecutive | Active | GreaterEq3% | Less3%`
@@ -115,14 +124,16 @@ Year, Grain, Period** — `Grain` is constant within each file, included for cla
   (**No `All` row in either** — Rotation is inherently about movement between teams,
   so a department-wide aggregate would double-count a worker who rotated across
   several teams. Total = NonRotation + Rotation; OneDay%OfNonRot = OneDay ÷ NonRotation.)
-- **Rotation Day** — `... | NonRotation | Rotation | Total | NonRotation% | Rotation%`
+- **Rotation Day SOCN** / **SOCE** / **SOCW** (one file per department) —
+  `... | NonRotation | Rotation | Total | NonRotation% | Rotation%`
   (`OneDay` doesn't exist at daily grain, so this file has fewer columns than
   Month/Week — NonRotation/Rotation = workers **present that day** by their MONTH
   Reading-B status at that team. No `All` row here either.)
 
-To answer a question: **first pick the correct (aspect, grain) file** for what's
-being asked, then find the ONE row matching the asked Department + Nationality +
-Team + Period + Year, quote its exact figure, and name that file and scope. If more
-than one row seems to match within a file, that means Period differs somewhere —
-re-check before using either one, and never combine rows into a bigger number, and
-never combine numbers pulled from two different files.
+To answer a question: **first pick the correct file** for what's being asked (aspect,
+grain, and — for a Day-grain question — department), then find the ONE row matching
+the asked Department + Nationality + Team + Period + Year, quote its exact figure,
+and name that file and scope. If more than one row seems to match within a file,
+that means Period differs somewhere — re-check before using either one, and never
+combine rows into a bigger number, and never combine numbers pulled from two
+different files.
