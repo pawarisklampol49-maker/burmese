@@ -286,19 +286,36 @@ not stuck text):
     days as columns). (NOT tenure/range — that was a mid-conversation detour
     the user corrected.)
   - **Show up** — day-count buckets 1-5/6-10/11-15/16-20/21-30, **monthly** (with
-    drill-down), PLUS a **weekly bucket table** and a **daily head-count** block.
-    Weekly (`renderShowupWeek_`/`showupWeekMembers`, user-confirmed buckets
-    `WEEK_BUCKETS` = **1-2 / 3-4 / 5-7** days — the monthly buckets can't apply
-    to a ≤7-day week): same per-scope blocks as monthly, ISO weeks as columns,
-    counts clickable, plain `Sum Week` row; every 1..7-day count lands in a
-    bucket, so a week's bucket sum == its distinct head count (self-tested).
-    Daily head count (`renderHeadcount_` — distinct workers present per day, one
-    row per nationality scope) is **PLAIN NUMBERS, not clickable**: a per-person
-    daily drill-down copies ~2× the entire raw log and overflowed even a
-    dedicated Names file; the daily roster is already the `raw` tab filtered by
-    date. `renderHeadcount_` computes distinct names/day straight from the slice
-    (no `attendanceCrosstab`); the engine's `attendanceCrosstab`/
-    `attendanceMembers` remain, self-tested, but are unused by `Code.gs`.
+    drill-down), PLUS a **weekly count row** and TWO **daily** blocks.
+    **Weekly (2026-07-22, changed by user request — was bucketed):** now a PLAIN
+    distinct-worker count per ISO week, NO buckets (`renderShowupWeekCount_`, one
+    row per scope = `All <DEPT>` + each team, nat-split, ISO weeks as columns,
+    not clickable). The old `WEEK_BUCKETS` (1-2/3-4/5-7) weekly bucket table
+    (`renderShowupWeek_`) was removed from the Show Up tab; the engine's
+    `showupWeekMembers` + `WEEK_BUCKETS` stay (self-tested, exported) but are no
+    longer rendered. Dropping the weekly bucket drill-down also removes a top
+    Names-file growth item.
+    **Daily block 1 — head count** (`renderHeadcount_`, unchanged): distinct
+    workers present per day, one row per scope (All + teams + Shift_id sub-rows),
+    PLAIN NUMBERS, not clickable (a per-person daily drill-down copies ~2× the raw
+    log and overflowed even a dedicated Names file; the daily roster is the `raw`
+    tab filtered by date). Computes distinct names/day straight from the slice (no
+    `attendanceCrosstab`; the engine's `attendanceCrosstab`/`attendanceMembers`
+    remain, self-tested, but are unused by `Code.gs`).
+    **Daily block 2 — prior-show-up-days histogram** (2026-07-22, new, user's
+    reference picture; `renderShowupPriorDaysDaily_`): per **(nationality × team)
+    only** — NO `All` row, NO Shift_id sub-rows (the user's picture shows
+    `MM CBS`/`TH CBS` team blocks). Each scope's own row carries the per-day TOTAL
+    (everyone present that day at that team); then rows `0,1,…,9,>=10`
+    (`PRIOR_DAY_BUCKETS`) split those workers by how many days they had shown up
+    EARLIER THAT YEAR AT THAT TEAM — a worker's k-th distinct show-up day (0-based,
+    sorted) has exactly k prior days, bucket = `String(k)` capped at `>=10`
+    (`priorDayBucket_`). Buckets partition the total. PLAIN NUMBERS (same
+    no-daily-drill-down rule). Computed straight from the slice in Code.gs; logic
+    validated in `scratchpad/verify_showup_daily.py` (index-based prior count,
+    bucketing, nat/team filtering, partition invariant). NOTE: New/Old Face daily
+    (`renderFaceDaily_`) already existed and was NOT changed this round (the user
+    confirmed it's what they wanted).
 
     **The combined row is `All <DEPT>`, department-dynamic** (`allLabel_(dept)` →
     `All SOCN`/`All SOCE`/`All SOCW`), NOT a hardcoded `"All SOCN"` — the same code

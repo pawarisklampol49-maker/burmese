@@ -964,7 +964,6 @@ function pctCell_(num, den) { const n = pctNum_(num, den); return n == null ? ''
 // hit live. Same reason every other engine global is read inside functions, never
 // at Code.gs's top level (see the summaries-section comment above).
 function showupBucketLabels_() { return BUCKETS.map(function (b) { return b[0] + '-' + b[1]; }); }
-function weekBucketLabels_() { return WEEK_BUCKETS.map(function (b) { return b[0] + '-' + b[1]; }); }
 
 // per-scope, per-month denominator: total across all buckets for that month
 // (excludes days outside 1-30). Shared by both the by-team and by-bucket tables
@@ -1007,34 +1006,64 @@ function renderShowup_(grid, formats, nc, scope, mem, months) {
   grid.push([]);
 }
 
-// Weekly analog of the by-team table: one block per scope, WEEK_BUCKETS
-// (1-2/3-4/5-7 days) as rows, ISO weeks as columns (counts, then %). Same
-// layout rules as renderShowup_, including the plain (never linked) sum row.
-function renderShowupWeek_(grid, formats, nc, scope, mem, weeks) {
-  const buckets = weekBucketLabels_();
-  const headerRow = grid.length;
-  grid.push([scope]);
-  fmtRange_(formats, headerRow, 0, weeks.length * 2, { bg: isAllScope_(scope) ? FMT.headerAllBg : FMT.headerTeamBg, bold: true });
-  grid.push(['bucket'].concat(weeks, weeks.map(function (w) { return w + ' %'; })));
-  const sums = {};
-  weeks.forEach(function (w) {
-    var s = 0; buckets.forEach(function (bk) { s += ((mem[w] && mem[w][bk]) || []).length; }); sums[w] = s;
-  });
-  buckets.forEach(function (bk) {
-    const row = [bk];
-    weeks.forEach(function (w) {
-      const names = (mem[w] && mem[w][bk]) || [];
-      row.push(nc.link(names.length, scope + '|showupW|' + w + '|' + bk,
-        'Show up (weekly) | ' + w + ' | ' + bk + ' days | ' + scope, names));
-    });
-    weeks.forEach(function (w) { row.push(pctCell_(((mem[w] && mem[w][bk]) || []).length, sums[w])); });
+// Weekly Show Up as a PLAIN distinct-worker count per ISO week -- NO day-count
+// buckets (user request: "you dont have to show in bucket like 1-2 ... just week1
+// how many"). One row per scope (All <DEPT> + each team, split by nationality),
+// ISO weeks as columns, value = distinct workers of that scope who showed up in
+// that week. Not clickable -- a plain count, same treatment as the daily head
+// count (and this drops the weekly-bucket drill-down that was a top Names-file
+// growth item). Superseded the old WEEK_BUCKETS renderer; the engine's
+// showupWeekMembers stays (self-tested, exported) but is no longer rendered.
+function renderShowupWeekCount_(grid, formats, style, scopes, weeks) {
+  section_(grid, formats, style, 'SHOW UP  (weekly -- distinct workers who showed up each ISO week; plain counts, no buckets)');
+  grid.push(['team'].concat(weeks));
+  scopes.forEach(function (sc) {
+    const rows = sc.team == null ? sc.natSlim : sc.natSlim.filter(function (r) { return r.team === sc.team; });
+    const perWeek = {};   // week label -> { name: true }
+    rows.forEach(function (r) { const w = 'W' + r.date.iso.week; (perWeek[w] = perWeek[w] || {})[r.name] = true; });
+    const row = [sc.label];
+    weeks.forEach(function (w) { row.push(perWeek[w] ? Object.keys(perWeek[w]).length : 0); });
     grid.push(row);
   });
-  const sumRow = ['Sum Week'];
-  weeks.forEach(function (w) { sumRow.push(sums[w]); });
-  weeks.forEach(function () { sumRow.push('100%'); });
-  grid.push(sumRow);
   grid.push([]);
+}
+
+// New daily Show Up table matching the user's reference picture: per
+// (nationality x team), with NO Shift_id rows and NO "All <DEPT>" row (the
+// picture shows "MM CBS" / "TH CBS" team-level blocks only). The scope's own row
+// carries the per-day TOTAL (everyone who showed up that day at that team); then
+// rows 0,1,...,9,>=10 split those workers by HOW MANY DAYS they had shown up
+// EARLIER THAT YEAR AT THAT TEAM (0 = first time is today, >=10 = 10+ prior days).
+// A worker's k-th distinct show-up day (0-based, days sorted ascending) has
+// exactly k prior days, so the bucket is String(k) capped at ">=10". The buckets
+// partition the total (verified in scratchpad verify_showup_daily.py). Plain
+// counts -- same no-daily-drill-down rule as the head count.
+const PRIOR_DAY_BUCKETS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '>=10'];
+function priorDayBucket_(k) { return k < 10 ? String(k) : '>=10'; }
+
+function renderShowupPriorDaysDaily_(grid, formats, style, scopes, days) {
+  section_(grid, formats, style, 'SHOW UP  (daily -- workers present each day split by how many days they had shown up earlier that year at that team; team scope only, no Shift_id; plain counts)');
+  grid.push(['team'].concat(days));
+  scopes.forEach(function (sc) {
+    const byName = {};   // name -> { dayKey: true }
+    sc.rows.forEach(function (r) { (byName[r.name] = byName[r.name] || {})[r.date.key] = true; });
+    const total = {}, hist = {};   // dayKey -> count ; dayKey -> { bucket -> count }
+    Object.keys(byName).forEach(function (name) {
+      Object.keys(byName[name]).sort().forEach(function (d, k) {
+        total[d] = (total[d] || 0) + 1;
+        const h = hist[d] || (hist[d] = {});
+        const b = priorDayBucket_(k);
+        h[b] = (h[b] || 0) + 1;
+      });
+    });
+    const headerRow = grid.length;
+    grid.push([sc.label].concat(days.map(function (d) { return total[d] || 0; })));
+    fmtRange_(formats, headerRow, 0, days.length, { bg: FMT.headerTeamBg, bold: true });
+    PRIOR_DAY_BUCKETS.forEach(function (b) {
+      grid.push([b].concat(days.map(function (d) { return (hist[d] && hist[d][b]) || 0; })));
+    });
+    grid.push([]);
+  });
 }
 
 // Generic "label x month" percentage block with a last-two-months trend flag
@@ -1147,16 +1176,20 @@ function showUpTabGrid_(slim, nc, dept) {
   });
   renderShowupByBucket_(grid, formats, bucketScopes, months);
 
-  // weekly day-count buckets (1-2/3-4/5-7 -- a week has at most 7 days), same
-  // scope blocks as the monthly table, ISO weeks as columns, counts clickable.
-  section_(grid, formats, style, 'SHOW UP  (weekly day-count buckets; click a number to see those people)');
-  const weeks = weeksOf_(slim);
-  scopes.forEach(function (sc) {
-    renderShowupWeek_(grid, formats, nc, sc.label, showupWeekMembers(sc.natSlim, sc.team), weeks);
-  });
+  // weekly: plain distinct-worker count per ISO week (no buckets -- user request)
+  renderShowupWeekCount_(grid, formats, style, scopes, weeksOf_(slim));
 
-  // daily head count -- all days present across the SOC, sorted
-  renderHeadcount_(grid, formats, style, scopes, dayOrder_(slim));
+  // daily head count -- all days present across the SOC, sorted (All + teams + shift)
+  const days = dayOrder_(slim);
+  renderHeadcount_(grid, formats, style, scopes, days);
+
+  // NEW daily table (user's reference picture): per (nationality x team), no
+  // Shift_id, no All row -- each scope's total row, then a 0..>=10 split by how
+  // many days the worker had shown up earlier that year at that team.
+  const priorScopes = natTeams_(teams, presentNationalities_(slim)).map(function (nt) {
+    return { label: nt.label, rows: filterNat_(slim, nt.nat).filter(function (r) { return r.team === nt.team; }) };
+  });
+  renderShowupPriorDaysDaily_(grid, formats, style, priorScopes, days);
   return { grid: grid, formats: formats };
 }
 
