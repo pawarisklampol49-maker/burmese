@@ -1821,100 +1821,196 @@ const MAX_TRANSIENT_SYNC_RETRIES = 2;
 const SYNC_RETRY_WINDOW_MINUTES = 90;
 const APPS_SCRIPT_TRIGGER_LIMIT = 20;                 // per user, per script
 
-function syncRetryKey_(dept) { return 'SYNC_RETRY_STATE_' + dept; }
+// SOCN is split across THREE chained executions to stay under the per-execution
+// runtime limit (its single run was ~24 min, near the 30-min cap). All three write
+// the SAME 2026_SOCN sheet: syncSOCN1 reads every vendor + writes the raw tab;
+// syncSOCN2/3 read that raw tab back (fast -- one well-formed sheet, no 503-prone
+// vendor files) and build a HALF of the aspect summaries each. They are ordered by
+// CHAINING (each fires the next via a one-time trigger on success), so the summary
+// phases never start before the raw tab is complete -- deterministic despite Apps
+// Script's +/-15-min trigger jitter. SOCE/SOCW stay single-run (they fit). Which
+// aspects each summary phase owns (Consecutive is the heavy one, kept with lighter
+// company). Re-run installTrigger() after changing this.
+const SOCN_PHASE_ASPECTS = {
+  syncSOCN2: ['New-Old Face', 'Show Up'],
+  syncSOCN3: ['Consecutive', 'Rotation'],
+};
+const CHAIN_DELAY_MS = 90 * 1000;                     // gap before the next chained phase fires
+const LOCK_BUSY_RESCHEDULE_MS = 2 * 60 * 1000;        // if the dept lock is held, retry this phase soon
+// Per-department mutex TTL. Longer than the max execution time (30 min) so a phase
+// that is HARD-killed at the limit (no finally runs) can't deadlock the dept
+// forever; the next 2-hourly window steals the stale lock. A THROWN error releases
+// the lock in finally, so only a timeout-kill relies on this.
+const DEPT_LOCK_TTL_MS = 40 * 60 * 1000;
 
-function scheduleTransientSyncRetry_(dept, error) {
+// retry/lock state keyed by the PHASE FUNCTION name (syncSOCN1/2/3, syncSOCE, ...).
+function syncRetryKey_(fnName) { return 'SYNC_RETRY_STATE_' + fnName; }
+function deptBusyKey_(dept) { return 'SYNC_BUSY_' + dept; }
+
+// delete every trigger bound to `fnName` -- keeps one-time chain/retry triggers from
+// piling up against the 20-trigger limit (each chain/retry re-creates exactly one).
+function deleteTriggersFor_(fnName) {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === fnName) ScriptApp.deleteTrigger(t);
+  });
+}
+
+// schedule `fnName` to fire once after delayMs, replacing any pending trigger for it.
+function chainTrigger_(fnName, delayMs) {
+  deleteTriggersFor_(fnName);
+  ScriptApp.newTrigger(fnName).timeBased().after(Math.max(1000, delayMs)).create();
+}
+
+// on a TRANSIENT Google error, reschedule this phase ~20 min out, capped per window.
+function scheduleTransientPhaseRetry_(fnName, error) {
   const props = PropertiesService.getScriptProperties();
-  const key = syncRetryKey_(dept);
+  const key = syncRetryKey_(fnName);
   const now = Date.now();
   let state = {};
   try { state = JSON.parse(props.getProperty(key) || '{}'); } catch (ignore) { state = {}; }
   // Keep the retry allowance inside one scheduled window. The next regular run
   // (two hours later) receives a fresh allowance even if this window exhausted it.
-  const fresh = state.updatedAt &&
-    now - state.updatedAt < SYNC_RETRY_WINDOW_MINUTES * 60 * 1000;
+  const fresh = state.updatedAt && now - state.updatedAt < SYNC_RETRY_WINDOW_MINUTES * 60 * 1000;
   const count = fresh ? (Number(state.count) || 0) + 1 : 1;
   if (count > MAX_TRANSIENT_SYNC_RETRIES) {
-    Logger.log('[retry sync] ' + dept + ' exhausted ' + MAX_TRANSIENT_SYNC_RETRIES +
+    Logger.log('[retry sync] ' + fnName + ' exhausted ' + MAX_TRANSIENT_SYNC_RETRIES +
       ' automatic retries: ' + googleErrorText_(error));
     return;
   }
   props.setProperty(key, JSON.stringify({ count: count, updatedAt: now }));
-  ScriptApp.newTrigger('sync' + dept).timeBased()
-    .after(SYNC_RETRY_DELAY_MINUTES * 60 * 1000).create();
-  Logger.log('[retry sync] scheduled ' + dept + ' retry ' + count + '/' +
+  chainTrigger_(fnName, SYNC_RETRY_DELAY_MINUTES * 60 * 1000);
+  Logger.log('[retry sync] scheduled ' + fnName + ' retry ' + count + '/' +
     MAX_TRANSIENT_SYNC_RETRIES + ' in ' + SYNC_RETRY_DELAY_MINUTES + ' minutes.');
 }
 
-function runDepartmentSync_(dept) {
+// Per-department mutex so two executions of the SAME dept can never overlap (the
+// crash we hit: one run reset an aspect/Names grid to 1x1 while another was mid-write
+// -> "Range (Names!A50001) exceeds grid limits. Max rows: 1"). The global LockService
+// lock is held only for the brief check-and-set; the real mutex is a timestamped
+// Script Property with a TTL, so a HARD-killed phase (execution timeout, no finally)
+// can't deadlock the dept -- the next window steals the stale lock. Returns true if
+// acquired, false if another execution holds a FRESH lock.
+function acquireDeptLock_(dept) {
+  const lock = LockService.getScriptLock();
+  try { lock.waitLock(30000); } catch (e) { return false; }   // even the brief lock is contended -> treat as busy
   try {
-    const result = runSync_(dept);
-    PropertiesService.getScriptProperties().deleteProperty(syncRetryKey_(dept));
+    const props = PropertiesService.getScriptProperties();
+    const key = deptBusyKey_(dept);
+    const raw = props.getProperty(key);
+    if (raw) {
+      let at = 0;
+      try { at = Number(JSON.parse(raw).at) || 0; } catch (ignore) { at = 0; }
+      if (Date.now() - at < DEPT_LOCK_TTL_MS) return false;    // a fresh lock is held elsewhere
+      Logger.log('[lock] ' + dept + ' stole a STALE lock (age ' +
+        Math.round((Date.now() - at) / 60000) + ' min) -- previous phase likely timed out.');
+    }
+    props.setProperty(key, JSON.stringify({ at: Date.now() }));
+    return true;
+  } finally {
+    lock.releaseLock();
+  }
+}
+function releaseDeptLock_(dept) {
+  PropertiesService.getScriptProperties().deleteProperty(deptBusyKey_(dept));
+}
+
+// Run one phase under the dept lock, with transient-retry and guaranteed release.
+// If the dept is busy (another phase/execution active), reschedule THIS phase soon
+// instead of running -- so a chained phase that fires while the previous still holds
+// the lock simply waits, never corrupts. `work(conf)` performs the actual phase.
+function runPhase_(dept, fnName, work) {
+  const conf = cfg_();
+  if (!acquireDeptLock_(dept)) {
+    chainTrigger_(fnName, LOCK_BUSY_RESCHEDULE_MS);
+    Logger.log('[' + fnName + '] ' + dept + ' is busy -- rescheduled this phase in ' +
+      (LOCK_BUSY_RESCHEDULE_MS / 60000) + ' min.');
+    return;
+  }
+  try {
+    const result = work(conf);
+    PropertiesService.getScriptProperties().deleteProperty(syncRetryKey_(fnName));
     return result;
   } catch (e) {
-    if (isTransientGoogleError_(e)) scheduleTransientSyncRetry_(dept, e);
+    if (isTransientGoogleError_(e)) scheduleTransientPhaseRetry_(fnName, e);
     throw e;
+  } finally {
+    releaseDeptLock_(dept);
   }
 }
 
-function syncSOCN() { return runDepartmentSync_('SOCN'); }
-function syncSOCE() { return runDepartmentSync_('SOCE'); }
-function syncSOCW() { return runDepartmentSync_('SOCW'); }
+// the recurring-trigger entry function per department: SOCN starts its 3-phase chain
+// at syncSOCN1; the other depts run single-shot.
+function entryFn_(dept) { return dept === 'SOCN' ? 'syncSOCN1' : 'sync' + dept; }
 
-// manual all-departments run (smoke tests / small data). The daily schedule uses
-// the per-dept wrappers above -- on full data this one exceeds the execution limit.
+// ---- department entry points --------------------------------------------------
+// SOCN phase 1 = read all vendors + write the raw tab, then chain phase 2.
+function syncSOCN1() {
+  return runPhase_('SOCN', 'syncSOCN1', function (conf) {
+    runRawPhase_(conf, 'SOCN');
+    chainTrigger_('syncSOCN2', CHAIN_DELAY_MS);
+    Logger.log('[syncSOCN1] raw tab done -- chained syncSOCN2.');
+  });
+}
+// SOCN phase 2 = build New-Old + Show Up from the raw tab, then chain phase 3.
+function syncSOCN2() {
+  return runPhase_('SOCN', 'syncSOCN2', function (conf) {
+    runSummaryPhase_(conf, 'SOCN', SOCN_PHASE_ASPECTS.syncSOCN2);
+    chainTrigger_('syncSOCN3', CHAIN_DELAY_MS);
+    Logger.log('[syncSOCN2] summaries done -- chained syncSOCN3.');
+  });
+}
+// SOCN phase 3 = build Consecutive + Rotation from the raw tab (end of the chain).
+function syncSOCN3() {
+  return runPhase_('SOCN', 'syncSOCN3', function (conf) {
+    runSummaryPhase_(conf, 'SOCN', SOCN_PHASE_ASPECTS.syncSOCN3);
+  });
+}
+// back-compat: a lingering pre-split 'syncSOCN' trigger still does the split, never
+// the full over-limit run. installTrigger() replaces it with syncSOCN1.
+function syncSOCN() { return syncSOCN1(); }
+
+// SOCE / SOCW: single-shot (they fit under the limit), under the dept lock + retry.
+function syncSOCE() { return runPhase_('SOCE', 'syncSOCE', function (conf) { return runSync_('SOCE', conf); }); }
+function syncSOCW() { return runPhase_('SOCW', 'syncSOCW', function (conf) { return runSync_('SOCW', conf); }); }
+
+// manual all-departments run (smoke tests / small data), no lock. On full data this
+// exceeds the execution limit -- the daily schedule uses the per-dept entry points.
 function sync() { return runSync_(null); }
 
-function runSync_(deptFilter) {
-  // ---- timing instrumentation: pinpoint where a long run spends its time so the
-  // right lever gets pulled. Measured: read+append dominates (78%), not the Names
-  // writes. Keep until the per-dept split is confirmed comfortably under the limit.
-  const T0 = Date.now();
-  function since_() { return ((Date.now() - T0) / 1000).toFixed(1) + 's'; }
-
-  const conf = cfg_();
+// ---- shared phase building blocks --------------------------------------------
+// Read every vendor file for `deptFilter` (or all if null), dedup one row per
+// (name,date) per file, and APPEND to each (year,dept) sheet's raw tab (resetting
+// the main sheet first). Sets the raw tab's basic filter + header freeze after all
+// appends. Returns socData { "<year>|<dept>": {ss, sheetIds, slim[], year, dept} }
+// with the in-memory slim -- used directly by the single-run path; the SOCN raw
+// phase discards it and relies on the written raw tab (its summary phases read it
+// back). The skip-unservable-vendor tolerance is unchanged (only the infra read
+// failure is tolerated; a data/schema error still throws).
+function readAndAppendRaw_(conf, deptFilter, since_) {
   let files = discoverFiles_(conf.departments, conf.thaiVendors);
   if (deptFilter) {
-    // discovery stays global (cheap, and keeps its strict validation over EVERY
-    // file title); the filter only narrows which files this execution processes.
+    // discovery stays global (cheap, keeps strict title validation over EVERY file);
+    // the filter only narrows which files THIS execution processes.
     files = files.filter(function (f) { return f.dept === deptFilter; });
-    if (!files.length) {
-      throw new Error("no raw vendor spreadsheets found for department '" + deptFilter + "'");
-    }
+    if (!files.length) throw new Error("no raw vendor spreadsheets found for department '" + deptFilter + "'");
   }
   Logger.log('[t] discovery done: ' + files.length + ' files' +
     (deptFilter ? ' for ' + deptFilter : '') + ' @ ' + since_());
 
-  // stream: per file, append its raw rows to that (year, dept) sheet's raw tab and
-  // release; keep only the slim {name,date,team,clockin} slice for the summaries.
-  // One spreadsheet per (year, dept), keyed "<year><dept>".
   const socData = {};
-
+  // main sheet only (raw + 4 aspect tabs reset to baseline). Names files are NOT
+  // prepared here -- writeAspects_ preps each aspect's Names file when it builds it,
+  // so a SOCN summary phase only touches the Names files for the aspects it owns.
   function socCtx_(year, dept) {
     const k = year + SEP + dept;
     if (!socData[k]) {
-      // main file (raw + aspects) and one SEPARATE Names file PER ASPECT (each its
-      // own 10M budget). All created/reset once per (year, dept).
       const ss = findOrCreateSheet_(conf.folderId, socSheetTitle_(year, dept));
       const sheetIds = prepareSocSheet_(ss);
-      const namesFiles = {};   // aspect tab -> { ss, gid }
-      ASPECT_TABS.forEach(function (tab) {
-        const nss = findOrCreateSheet_(conf.folderId, socNamesTitle_(year, dept, ASPECT_NAME_SUFFIX[tab]));
-        namesFiles[tab] = { ss: nss, gid: prepareNamesSheet_(nss) };
-      });
-      socData[k] = { ss: ss, sheetIds: sheetIds, namesFiles: namesFiles,
-        slim: [], year: year, dept: dept };
+      socData[k] = { ss: ss, sheetIds: sheetIds, slim: [], year: year, dept: dept };
     }
     return socData[k];
   }
 
-  // One vendor file that Google's API cannot serve -- persistent 503/500/404 AFTER
-  // the read's own retries, an EXTERNAL backend problem with THAT file, not our logic
-  // (confirmed live for SOCW/PPO, whose identical sibling vendors read fine) -- must
-  // not sink the whole department. Skip it LOUDLY and keep going; the summaries are
-  // built from the vendors that read. A DATA error (schema/parse) still throws below
-  // -- this tolerance is ONLY for the infra read failure. If EVERY file fails we throw
-  // after the loop (systemic outage, not one bad file), so nothing is silently empty.
   const failedFiles = [];
   files.forEach(function (f) {
     const tf = Date.now();
@@ -1984,87 +2080,193 @@ function runSync_(deptFilter) {
     }
   }
 
-  // per (year, dept): dedup the slim slice, then for each aspect write its summary
-  // tab (to the MAIN file; its counts are cross-file links into that aspect's own
-  // Names file) and its Names tab (to that aspect's SEPARATE file). Per-file dedup
-  // above already removes within-vendor overlap; this final dedup guarantees the
-  // engine's one-row-per-(name,date) contract before the summaries. Each aspect
-  // gets its OWN collector so its links target its OWN Names file.
-  const aspectGrids = {
-    'New-Old Face': newOldTabGrid_, 'Show Up': showUpTabGrid_,
-    'Consecutive': consecutiveTabGrid_, 'Rotation': rotationTabGrid_,
-  };
-  Logger.log('[t] all files read + raw appended @ ' + since_());
-  const result = {};
+  // basic filter + header freeze on each raw tab -- belongs to the raw phase (the
+  // raw tab is now fully appended; prepareSocSheet_ already cleared the old filter).
   Object.keys(socData).forEach(function (k) {
     const ctx = socData[k];
-    const slim = dedupByNameDate_(ctx.slim);
-    const namesIds = {};
-    ASPECT_TABS.forEach(function (tab) {
-      const nf = ctx.namesFiles[tab];
-      const suffix = ASPECT_NAME_SUFFIX[tab];
-      // lazily find-or-create "..._Names_<index>" -- only called if the FIRST
-      // segment (nf, already created above) actually overflows NAMES_SEGMENT_CELL_CAP.
-      const nextSegmentFactory = function (index) {
-        const nss = findOrCreateSheet_(conf.folderId, socNamesTitle_(ctx.year, ctx.dept, suffix) + '_' + index);
-        return { ss: nss, gid: prepareNamesSheet_(nss) };
-      };
-      const nc = namesCollector_({ ss: nf.ss, gid: nf.gid }, nextSegmentFactory);
-      const tb = Date.now();
-      const built = aspectGrids[tab](slim, nc, ctx.dept);   // {grid, formats}; dept -> "All <DEPT>" label
-      const buildS = ((Date.now() - tb) / 1000).toFixed(1);
-      const tw = Date.now();
-      // generic decoration (header rows, zebra, shift muting, Sum/Total rules)
-      // is PREPENDED so the grid's own colors (trend flags, scope headers) win.
-      const fmts = decorateFormats_(built.grid).concat(built.formats);
-      writeSummaryTab_(ctx.ss, ctx.sheetIds[tab], tab, built.grid, 'USER_ENTERED', fmts);
-      const sumS = ((Date.now() - tw) / 1000).toFixed(1);
-      const tn = Date.now();
-      var totalNameRows = 0;
-      nc.segments.forEach(function (seg, i) {
-        writeSummaryTab_(seg.ss, seg.gid, NAMES_TAB, seg.rows, 'RAW');
-        totalNameRows += seg.rows.length;
-        if (nc.segments.length > 1) {
-          Logger.log('[t] ' + ctx.dept + '/' + tab + ' names segment ' + (i + 1) + '/' +
-            nc.segments.length + ': ' + seg.rows.length + ' rows, ' + seg.cells + ' cells');
-        }
-      });
-      const namesS = ((Date.now() - tn) / 1000).toFixed(1);
-      Logger.log('[t] ' + ctx.dept + '/' + tab + ': build=' + buildS + 's write=' +
-        sumS + 's names=' + namesS + 's (' + totalNameRows + ' name rows, ' +
-        nc.segments.length + ' file(s)) @ ' + since_());
-      namesIds[tab] = nc.segments.map(function (seg) { return seg.ss.getId(); });
-    });
-    // filter dropdowns on the raw tab's header row (user request: "filter from
-    // the header of the table"). Sheets allows ONE basic filter per tab, so the
-    // aspect tabs (stacks of many small tables) can't have per-table dropdowns
-    // -- the raw tab IS the one big table, and it's where the daily roster is
-    // filtered from. Set AFTER all appends (prepareSocSheet_ cleared the old
-    // one, criteria included, before shrinking the grid); no endRowIndex, so
-    // the range spans every appended row.
     retryWrite_(function () {
       return Sheets.Spreadsheets.batchUpdate({ requests: [
         { setBasicFilter: {
           filter: { range: { sheetId: ctx.sheetIds[RAW_TAB], startRowIndex: 0,
                              startColumnIndex: 0, endColumnIndex: RAW_TAB_HEADER.length } },
         } },
-        // freeze the header so the dropdowns stay visible while scrolling the
-        // log (safe here: at least one data row was appended, so rowCount > 1).
         { updateSheetProperties: {
           properties: { sheetId: ctx.sheetIds[RAW_TAB], gridProperties: { frozenRowCount: 1 } },
           fields: 'gridProperties.frozenRowCount',
         } },
       ] }, ctx.ss.getId());
     });
-    const names = {};
-    slim.forEach(function (r) { names[r.name] = true; });
-    result[socSheetTitle_(ctx.year, ctx.dept)] = {
-      spreadsheetId: ctx.ss.getId(), namesSpreadsheetIds: namesIds,
-      rows: slim.length, workers: Object.keys(names).length };
   });
+  Logger.log('[t] all files read + raw appended @ ' + since_());
+  return socData;
+}
 
+// Build the given aspect tabs for ONE (year,dept) ctx from its (already-populated)
+// slim slice. Preps each aspect's OWN Names file, builds the grid, writes the aspect
+// tab (main sheet) + the Names segments (that aspect's Names file). Only the listed
+// aspects are touched -- so the SOCN summary phases each own a subset and never
+// clobber each other's tabs. Returns { rows, workers, namesIds }.
+function writeAspects_(conf, ctx, aspectTabs, since_) {
+  const aspectGrids = {
+    'New-Old Face': newOldTabGrid_, 'Show Up': showUpTabGrid_,
+    'Consecutive': consecutiveTabGrid_, 'Rotation': rotationTabGrid_,
+  };
+  // final dedup guarantees the engine's one-row-per-(name,date) contract (per-file
+  // dedup already removed within-vendor overlap; this catches cross-vendor).
+  const slim = dedupByNameDate_(ctx.slim);
+  const namesIds = {};
+  aspectTabs.forEach(function (tab) {
+    const suffix = ASPECT_NAME_SUFFIX[tab];
+    const nss0 = findOrCreateSheet_(conf.folderId, socNamesTitle_(ctx.year, ctx.dept, suffix));
+    const firstSeg = { ss: nss0, gid: prepareNamesSheet_(nss0) };
+    // lazily find-or-create "..._Names_<index>" -- only if the first segment
+    // overflows NAMES_SEGMENT_CELL_CAP.
+    const nextSegmentFactory = function (index) {
+      const nss = findOrCreateSheet_(conf.folderId, socNamesTitle_(ctx.year, ctx.dept, suffix) + '_' + index);
+      return { ss: nss, gid: prepareNamesSheet_(nss) };
+    };
+    const nc = namesCollector_(firstSeg, nextSegmentFactory);
+    const tb = Date.now();
+    const built = aspectGrids[tab](slim, nc, ctx.dept);   // {grid, formats}; dept -> "All <DEPT>" label
+    const buildS = ((Date.now() - tb) / 1000).toFixed(1);
+    const tw = Date.now();
+    // generic decoration PREPENDED so the grid's own colors (trend flags, scope
+    // headers) win over the structural ones.
+    const fmts = decorateFormats_(built.grid).concat(built.formats);
+    writeSummaryTab_(ctx.ss, ctx.sheetIds[tab], tab, built.grid, 'USER_ENTERED', fmts);
+    const sumS = ((Date.now() - tw) / 1000).toFixed(1);
+    const tn = Date.now();
+    var totalNameRows = 0;
+    nc.segments.forEach(function (seg, i) {
+      writeSummaryTab_(seg.ss, seg.gid, NAMES_TAB, seg.rows, 'RAW');
+      totalNameRows += seg.rows.length;
+      if (nc.segments.length > 1) {
+        Logger.log('[t] ' + ctx.dept + '/' + tab + ' names segment ' + (i + 1) + '/' +
+          nc.segments.length + ': ' + seg.rows.length + ' rows, ' + seg.cells + ' cells');
+      }
+    });
+    const namesS = ((Date.now() - tn) / 1000).toFixed(1);
+    Logger.log('[t] ' + ctx.dept + '/' + tab + ': build=' + buildS + 's write=' +
+      sumS + 's names=' + namesS + 's (' + totalNameRows + ' name rows, ' +
+      nc.segments.length + ' file(s)) @ ' + since_());
+    namesIds[tab] = nc.segments.map(function (seg) { return seg.ss.getId(); });
+  });
+  const names = {};
+  slim.forEach(function (r) { names[r.name] = true; });
+  return { rows: slim.length, workers: Object.keys(names).length, namesIds: namesIds };
+}
+
+// Single-shot run for a department (or all if deptFilter null): read+append raw,
+// then build ALL FOUR aspects from the in-memory slim. Used by SOCE/SOCW and the
+// manual sync(). SOCN uses the split phases below instead.
+function runSync_(deptFilter, conf) {
+  const T0 = Date.now();
+  function since_() { return ((Date.now() - T0) / 1000).toFixed(1) + 's'; }
+  conf = conf || cfg_();
+  const socData = readAndAppendRaw_(conf, deptFilter, since_);
+  const result = {};
+  Object.keys(socData).forEach(function (k) {
+    const ctx = socData[k];
+    const r = writeAspects_(conf, ctx, ASPECT_TABS, since_);
+    result[socSheetTitle_(ctx.year, ctx.dept)] = {
+      spreadsheetId: ctx.ss.getId(), namesSpreadsheetIds: r.namesIds,
+      rows: r.rows, workers: r.workers };
+  });
   Logger.log(JSON.stringify(result, null, 2));
   return result;
+}
+
+// ---- SOCN split phases (all write the SAME 2026_SOCN sheet) -------------------
+// Phase 1: read every vendor + write the raw tab, NO summaries. The summary phases
+// read that raw tab back (far faster + 503-proof vs re-reading every vendor file).
+function runRawPhase_(conf, dept) {
+  const T0 = Date.now();
+  function since_() { return ((Date.now() - T0) / 1000).toFixed(1) + 's'; }
+  readAndAppendRaw_(conf, dept, since_);   // slim discarded -- a later phase rebuilds it from the raw tab
+}
+
+// Later phases: rebuild the slim slice from the ALREADY-WRITTEN raw tab and build
+// only the assigned aspects. Each aspect's Names file is prepped inside writeAspects_,
+// so phase 2 and phase 3 never touch each other's tabs/files.
+function runSummaryPhase_(conf, dept, aspectTabs) {
+  const T0 = Date.now();
+  function since_() { return ((Date.now() - T0) / 1000).toFixed(1) + 's'; }
+  const files = discoverFiles_(conf.departments, conf.thaiVendors)
+    .filter(function (f) { return f.dept === dept; });
+  if (!files.length) throw new Error("no raw vendor spreadsheets found for department '" + dept + "'");
+  const years = {};
+  files.forEach(function (f) { years[String(f.year)] = true; });
+  const result = {};
+  Object.keys(years).sort().forEach(function (year) {
+    const ss = findOrCreateSheet_(conf.folderId, socSheetTitle_(year, dept));
+    const sheetIds = fetchTabIds_(ss.getId());
+    if (!(RAW_TAB in sheetIds)) {
+      throw new Error(socSheetTitle_(year, dept) + " has no '" + RAW_TAB +
+        "' tab -- run the raw phase (syncSOCN1) first.");
+    }
+    const rawRows = readRawTab_(ss.getId(), RAW_TAB);
+    Logger.log('[t] ' + dept + ' read raw tab (' + socSheetTitle_(year, dept) + '): ' +
+      rawRows.length + ' rows @ ' + since_());
+    const ctx = { ss: ss, sheetIds: sheetIds,
+      slim: rebuildSlimFromRaw_(rawRows, conf.thaiVendors), year: year, dept: dept };
+    const r = writeAspects_(conf, ctx, aspectTabs, since_);
+    result[socSheetTitle_(year, dept)] = {
+      spreadsheetId: ss.getId(), namesSpreadsheetIds: r.namesIds,
+      aspects: aspectTabs, rows: r.rows, workers: r.workers };
+  });
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+// ---- raw-tab read-back (SOCN summary phases) ----------------------------------
+// tab title -> sheetId for a spreadsheet.
+function fetchTabIds_(ssId) {
+  const meta = retryRead_(function () {
+    return Sheets.Spreadsheets.get(ssId, { fields: 'sheets.properties(sheetId,title)' });
+  }, 'tab ids ' + ssId);
+  const ids = {};
+  (meta.sheets || []).forEach(function (s) { ids[s.properties.title] = s.properties.sheetId; });
+  return ids;
+}
+
+// Read all DATA rows (skipping the header) of the raw tab, in row pages. This is OUR
+// central sheet -- well-formed, no formula padding -- so a page past the data just
+// returns fewer rows and we stop. A:H = the 8 raw columns (RAW_TAB_HEADER).
+function readRawTab_(ssId, tabName) {
+  const out = [];
+  const PAGE = 50000;
+  for (var start = 2; ; start += PAGE) {   // row 1 is the header
+    const range = quoted_(tabName) + '!A' + start + ':H' + (start + PAGE - 1);
+    const resp = retryRead_(function () {
+      return Sheets.Spreadsheets.Values.get(ssId, range, { majorDimension: 'ROWS' });
+    }, 'raw tab ' + ssId + ' rows ' + start);
+    const vals = resp.values || [];
+    for (var i = 0; i < vals.length; i++) out.push(vals[i]);
+    if (vals.length < PAGE) break;   // short page -> reached the end of the data
+  }
+  return out;
+}
+
+// Rebuild the slim slice from raw-tab rows -- the exact inverse of appendRawRows_'s
+// column order [date.key, month, vendor, name, clockin, shift_name, shift_id, team].
+// The date object is reconstructed from its "YYYY-MM-DD" key (lossless via makeDate);
+// nationality is recomputed from the vendor. Result is identical to the slim slice a
+// single run holds in memory, so the summaries come out byte-for-byte the same.
+function rebuildSlimFromRaw_(rows, thaiVendors) {
+  const slim = [];
+  rows.forEach(function (r) {
+    const name = r[3];
+    if (name == null || String(name).trim() === '') return;   // no blank-name rows are written, but be safe
+    const date = parseISO(r[0]) || parseDayFirst(r[0]);
+    if (!date) return;   // date.key round-trips via parseISO; skip only genuinely unparseable
+    const vendor = r[2];
+    slim.push({
+      name: name, date: date, team: r[7], clockin: r[4],
+      vendor: vendor, shift_name: r[5], shift_id: r[6], month: date.month,
+      nationality: nationalityOf_(vendor, thaiVendors),
+    });
+  });
+  return slim;
 }
 
 // ------------------------------------------------------------------ ops helpers
@@ -2231,39 +2433,54 @@ function installTrigger() {
     }
   });
 
+  // each dept's recurring entry function must exist. SOCN starts a 3-phase chain at
+  // syncSOCN1 -- its chained phases (syncSOCN2/3) must exist too, or the chain dead-ends.
   conf.departments.forEach(function (d) {
-    const fn = 'sync' + d;
+    const fn = entryFn_(d);
     if (typeof globalThis[fn] !== 'function') {
-      throw new Error("no trigger wrapper '" + fn + "' for department '" + d +
-        "' -- add `function " + fn + "() { return runDepartmentSync_('" + d + "'); }` to Code.gs");
+      throw new Error("no trigger entry function '" + fn + "' for department '" + d +
+        "' -- add it to Code.gs");
     }
   });
+  if (conf.departments.indexOf('SOCN') >= 0) {
+    ['syncSOCN2', 'syncSOCN3'].forEach(function (fn) {
+      if (typeof globalThis[fn] !== 'function') {
+        throw new Error("SOCN phase function '" + fn + "' is missing -- the syncSOCN1 chain would dead-end.");
+      }
+    });
+  }
 
   const existing = ScriptApp.getProjectTriggers();
   const nonSyncCount = existing.filter(function (t) {
     return !/^sync/.test(t.getHandlerFunction());
   }).length;
+  // ONE recurring trigger per dept (SOCN's is syncSOCN1, which chains its phases via
+  // one-time triggers -- those aren't recurring). The reserve covers each dept's
+  // transient-retry one-time trigger PLUS SOCN's 2 chained-phase one-time triggers,
+  // all bounded to <=1 pending each (chainTrigger_ deletes-then-creates).
   const recurringCount = conf.departments.length * uniqueHours.length;
-  const retryReserve = conf.departments.length * MAX_TRANSIENT_SYNC_RETRIES;
+  const chainReserve = conf.departments.indexOf('SOCN') >= 0 ? 2 : 0;   // syncSOCN2, syncSOCN3
+  const retryReserve = conf.departments.length * MAX_TRANSIENT_SYNC_RETRIES + chainReserve;
   if (nonSyncCount + recurringCount + retryReserve > APPS_SCRIPT_TRIGGER_LIMIT) {
     throw new Error('not enough Apps Script trigger slots: ' + nonSyncCount +
       ' non-sync + ' + recurringCount + ' recurring sync + ' + retryReserve +
-      ' retry reserve exceeds ' + APPS_SCRIPT_TRIGGER_LIMIT);
+      ' retry/chain reserve exceeds ' + APPS_SCRIPT_TRIGGER_LIMIT);
   }
 
   existing.forEach(function (t) {
     if (/^sync/.test(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
   });
   conf.departments.forEach(function (d, di) {
-    const fn = 'sync' + d;
+    const fn = entryFn_(d);
     const deptMinute = (SYNC_NEAR_MINUTE + di * SYNC_DEPT_STAGGER_MINUTES) % 60;
     uniqueHours.forEach(function (hour) {
       ScriptApp.newTrigger(fn).timeBased().everyDays(1).atHour(hour)
         .nearMinute(deptMinute).create();
       Logger.log('Daily trigger installed: ' + fn + '() around ' + hour + ':' +
-        ('0' + deptMinute).slice(-2) + ' (project time zone; Apps Script timing is approximate).');
+        ('0' + deptMinute).slice(-2) + ' (project time zone; Apps Script timing is approximate).' +
+        (d === 'SOCN' ? ' Chains syncSOCN2 -> syncSOCN3.' : ''));
     });
   });
   Logger.log('Installed ' + recurringCount + ' recurring sync triggers; reserved ' +
-    retryReserve + ' slots for transient retries.');
+    retryReserve + ' slots for transient retries + SOCN chaining.');
 }

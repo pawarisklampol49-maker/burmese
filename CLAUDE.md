@@ -585,7 +585,9 @@ docs/RUNBOOK.md.
 
 Scaling ceiling is **execution time** (the Apps Script per-run limit — typically
 6 min, or 30 min for some Workspace accounts), not memory. **One department per
-execution** remains mandatory; `sync()` is only a small-data smoke entry. After the
+execution** remains mandatory; `sync()` is only a small-data smoke entry. SOCN grew
+past this and is now split further into **three chained executions** (syncSOCN1/2/3 —
+see the SOCN-split note near the trigger section below); SOCE/SOCW still run single-shot. After the
 2026-07-16 live failures, two measured bottlenecks were fixed: New/Old had repeatedly
 regrouped the entire SOC for every team/Shift_id/grain (755.9s for SOCN), so engine
 validation, nationality/team/shift slices, and monthly New/Old verdicts are now
@@ -703,13 +705,53 @@ residual overlap Apps Script's ~15-min jitter can still cause. All three wrapper
 in every configured hour, producing 12 recurring triggers. **Changing the stagger (or
 any trigger constant) requires re-running `installTrigger()`.** Apps Script timing
 remains approximate (about +/-15 minutes). Transient 429/5xx/timeout failures schedule up
-to two automatic department retries, 20 minutes apart; retry state expires after
-90 minutes so the next regular two-hour window receives a fresh allowance.
-Triggers cannot pass arguments, so wrappers `syncSOCN`/`syncSOCE`/`syncSOCW` call
-`runDepartmentSync_(dept)`, which calls `runSync_(dept)`. A department in
-`RAW_DEPARTMENTS` without a wrapper is a hard install error. The installer keeps
-the 12 recurring triggers plus a six-trigger retry reserve within Apps Script's
-20-trigger per-user/per-script limit.
+to two automatic retries, 20 minutes apart (per PHASE function now); retry state expires
+after 90 minutes so the next regular two-hour window receives a fresh allowance.
+Triggers cannot pass arguments, so wrappers call the department entry points. A
+department in `RAW_DEPARTMENTS` without an entry function is a hard install error.
+
+**Per-department lock (2026-07-22, fixes a real crash).** Two executions of the SAME
+department overlapping corrupted a write: a SOCN run took ~24 min (an RG read 503-storm,
+itself amplified by the overlap), and the 20-min auto-retry fired mid-write, ran
+`prepareNamesSheet_`/`prepareSocSheet_` (which reset a grid to its 1x1 baseline), and the
+first run's next 50k-chunk landed on a 1x1 grid -> `Range (Names!A50001) exceeds grid
+limits. Max rows: 1` (NOT the 10M-cell cap -- that's handled by the Names split; three
+aspects wrote fine, only the 4th hit the reset). Fix: every phase runs inside
+`runPhase_(dept, fnName, work)`, which takes a **per-department mutex** (`acquireDeptLock_`:
+the global `LockService` lock held only for a brief check-and-set of a timestamped
+`SYNC_BUSY_<dept>` Script Property, TTL `DEPT_LOCK_TTL_MS`=40 min so a hard-killed phase
+can't deadlock the dept -- a thrown error releases it in `finally`). If the dept is busy,
+the phase **reschedules itself** shortly (`chainTrigger_`) instead of running -- so a
+retry or stray trigger can never reset a grid another phase is writing.
+
+**SOCN split into three chained phases (2026-07-22, user request; SOCN's single run was
+near the 30-min execution cap).** All three write the SAME `2026_SOCN` sheet:
+- `syncSOCN1` = **raw phase** (`runRawPhase_`): read every vendor, dedup per file, append
+  to the `raw` tab, set the raw filter/freeze. No summaries. On success it **chains**
+  `syncSOCN2`.
+- `syncSOCN2` = build **New-Old Face + Show Up** (`runSummaryPhase_`, `SOCN_PHASE_ASPECTS`);
+  chains `syncSOCN3`.
+- `syncSOCN3` = build **Consecutive + Rotation** (end of chain).
+
+The summary phases **rebuild the slim slice from the already-written `raw` tab**
+(`readRawTab_` pages A:H of our own well-formed central sheet -- fast + 503-proof vs
+re-reading every vendor file; `rebuildSlimFromRaw_` inverts `appendRawRows_`'s column
+order and reconstructs the date object from its `YYYY-MM-DD` key via `parseISO`, nationality
+via `nationalityOf_`), so the summaries are identical to a single run (round-trip validated
+in `scratchpad/verify_showup_daily.py`-style checks). Ordering is by **chaining** (each
+phase fires the next via a one-time trigger on success), so a summary phase never starts
+before the raw tab is complete -- deterministic despite the +/-15-min jitter. Each summary
+phase preps only the Names files for ITS aspects (Names prep moved out of `socCtx_` into
+`writeAspects_`), and writes only its aspect tabs, so phases 2 and 3 never clobber each
+other. `runSync_` was decomposed into shared `readAndAppendRaw_` + `writeAspects_`;
+SOCE/SOCW still run single-shot (`runSync_(dept)`, they fit) under the lock. `entryFn_(dept)`
+gives SOCN's recurring trigger as `syncSOCN1` (the other depts stay `sync<DEPT>`); the
+chained `syncSOCN2/3` fire via one-time triggers, not recurring ones, so the recurring
+count is unchanged (12). The installer reserves retry + 2 SOCN-chain one-time slots
+(bounded to <=1 pending each via `chainTrigger_`'s delete-then-create) within the 20-trigger
+limit. A lingering pre-split `syncSOCN` trigger still does the split (it aliases
+`syncSOCN1`), never a full over-limit run. **Changing `SOCN_PHASE_ASPECTS` or any trigger
+constant requires re-running `installTrigger()`.**
 
 `writeSummaryTab_` writes **50k-row chunks** to stay below the per-request payload
 limit, and fixed-range writes use `retryWrite_`. Discovery stays global (cheap and
